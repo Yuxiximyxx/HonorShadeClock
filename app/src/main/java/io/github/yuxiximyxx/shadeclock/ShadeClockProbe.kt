@@ -31,8 +31,16 @@ import java.util.concurrent.atomic.AtomicInteger
  * 长度 1..40，或类名/id 名含 clock/time/date/shade/header/panel/compose。
  * 以「实例 identityHashCode + 文本」去重，全程只记一次；单轮上限 800 条。
  *
- * 安全红线：遍历与记录全部 try-catch 兜底，任何异常只写一行日志并停掉
- * 后续轮次，绝不能让 SystemUI 崩溃。全程只读，绝不修改任何视图属性。
+ * v0.2.1 热修：真机日志显示 getRootViews() 在 MagicOS 上不存在
+ * （NoSuchMethodError），且该异常被当成致命错误停掉了全部轮次、一轮都没
+ * 扫成。本版兜底补全改为读 WindowManagerGlobal 的 mRoots 字段
+ * （ArrayList<ViewRootImpl>），逐个取 ViewRootImpl.mView；并做错误隔离：
+ * 兜底补全失败只记一行、继续用已收集的根遍历；每个根视图的遍历各自
+ * try-catch，单个根失败不影响其他根与后续轮次；只有调度本身连续出错
+ * 才停。每轮标题行后加一行根视图总数统计，方便判读。
+ *
+ * 安全红线：遍历与记录全部 try-catch 兜底，绝不能让 SystemUI 崩溃。
+ * 全程只读，绝不修改任何视图属性。
  */
 class ShadeClockProbe : IXposedHookLoadPackage {
 
@@ -47,6 +55,8 @@ class ShadeClockProbe : IXposedHookLoadPackage {
         private const val PASS_INTERVAL_MS = 5_000L
         private const val MAX_PASSES = 36
         private const val MAX_HITS_PER_PASS = 800
+        /** 调度本身连续出错达到此数才允许停掉全部轮次 */
+        private const val MAX_CONSECUTIVE_SCHEDULER_ERRORS = 3
         private val KEYWORDS = listOf("clock", "time", "date", "shade", "header", "panel", "compose")
     }
 
@@ -66,6 +76,9 @@ class ShadeClockProbe : IXposedHookLoadPackage {
         Collections.synchronizedSet(HashSet<String>())
 
     private val passCount = AtomicInteger(0)
+
+    /** 调度层连续出错次数（兜底补全与单根遍历的错误已各自隔离，不计入） */
+    private var consecutiveSchedulerErrors = 0
 
     @Volatile
     private var stopped = false
@@ -102,8 +115,8 @@ class ShadeClockProbe : IXposedHookLoadPackage {
         )
         probeLog("probe installed in $TARGET_PACKAGE (TextView.setText hooked)")
 
-        // ---------- v0.2.0：整树遍历探针 ----------
-        fileOnly("$TAG === HonorShadeClock probe v0.2.0 started (tree traversal) ===")
+        // ---------- v0.2.0：整树遍历探针（v0.2.1 热修兜底链路） ----------
+        fileOnly("$TAG === HonorShadeClock probe v0.2.1 started (tree traversal) ===")
         installRootDiscovery(lpparam)
         startTraversalScheduler()
     }
@@ -199,46 +212,79 @@ class ShadeClockProbe : IXposedHookLoadPackage {
     }
 
     /**
-     * 反射调 WindowManagerGlobal.getInstance().getRootViews() 兜底补全根视图。
-     * 返回本轮是否有新根加入。异常向上抛，由调度层统一按红线处理。
+     * 兜底补全根视图：反射拿 WindowManagerGlobal 单例，读其 mRoots 字段
+     * （ArrayList<ViewRootImpl>），逐个读 ViewRootImpl 的 mView 字段得到根视图，
+     * 合并进已收集的根集合。返回本轮是否有新根加入。
+     *
+     * v0.2.1 起不再调 getRootViews()——该方法在 MagicOS 上不存在
+     * （NoSuchMethodError）。本函数由调度层单独 try-catch 调用：失败只记
+     * 一行日志、继续用 addView 已收集的根遍历，绝不中止轮次。
      */
     private fun mergeFallbackRoots(): Boolean {
         val clazz = windowManagerGlobalClass ?: return false
         val instance = XposedHelpers.callStaticMethod(clazz, "getInstance") ?: return false
-        val rootViews = XposedHelpers.callMethod(instance, "getRootViews") as? Iterable<*> ?: return false
+        val mRoots = XposedHelpers.getObjectField(instance, "mRoots") as? Iterable<*> ?: return false
         var addedNew = false
-        for (item in rootViews) {
-            val view = item as? View ?: continue
+        for (rootImpl in mRoots) {
+            if (rootImpl == null) continue
+            val view = try {
+                XposedHelpers.getObjectField(rootImpl, "mView") as? View
+            } catch (t: Throwable) {
+                null
+            } ?: continue
             if (roots.add(view)) addedNew = true
         }
         return addedNew
     }
 
-    /** 主线程 Handler 调度：每 5 秒一轮，最多 36 轮；新根加入重置计数。 */
+    /**
+     * 主线程 Handler 调度：每 5 秒一轮，最多 36 轮；新根加入重置计数。
+     *
+     * 错误隔离（v0.2.1）：兜底补全单独 try-catch，失败只记一行、继续用已
+     * 收集的根遍历；单轮遍历内部再按根隔离。只有调度本身连续出错达到
+     * MAX_CONSECUTIVE_SCHEDULER_ERRORS 次才停掉全部轮次。
+     */
     private fun startTraversalScheduler() {
         try {
             val handler = Handler(Looper.getMainLooper())
             val task = object : Runnable {
                 override fun run() {
                     if (stopped) return
-                    var fatal: Throwable? = null
+                    // 兜底补全：单独隔离，失败不中止轮次
                     try {
                         if (mergeFallbackRoots()) {
                             passCount.set(0)
                         }
+                    } catch (t: Throwable) {
+                        fileOnly(
+                            "$TAG v2 fallback root merge failed (ignored, " +
+                                "continuing with collected roots): " +
+                                "${t.javaClass.name}: ${t.message}"
+                        )
+                    }
+                    var passFailed = false
+                    try {
                         if (passCount.get() < MAX_PASSES) {
                             runPass(passCount.incrementAndGet())
                         }
                     } catch (t: Throwable) {
-                        fatal = t
+                        passFailed = true
+                        consecutiveSchedulerErrors++
+                        fileOnly(
+                            "$TAG v2 scheduler error " +
+                                "($consecutiveSchedulerErrors consecutive): " +
+                                "${t.javaClass.name}: ${t.message}"
+                        )
                     }
-                    if (fatal != null || stopped) {
-                        if (fatal != null) {
-                            fileOnly(
-                                "$TAG probe v2 aborted: ${fatal.javaClass.name}: " +
-                                    "${fatal.message} -- no further passes"
-                            )
-                        }
+                    if (!passFailed) {
+                        consecutiveSchedulerErrors = 0
+                    }
+                    if (stopped) return
+                    if (consecutiveSchedulerErrors >= MAX_CONSECUTIVE_SCHEDULER_ERRORS) {
+                        fileOnly(
+                            "$TAG probe v2 stopped after " +
+                                "$consecutiveSchedulerErrors consecutive scheduler errors"
+                        )
                         stopped = true
                         return
                     }
@@ -258,7 +304,8 @@ class ShadeClockProbe : IXposedHookLoadPackage {
 
     /**
      * 一轮遍历：对每个根视图做迭代式全树遍历（显式栈，禁止递归）。
-     * 全部代码 try-catch 兜底；异常时把已积累内容落盘、写一行中止日志并停掉后续轮次。
+     * 每个根各自 try-catch（v0.2.1 错误隔离）：单个根遍历失败只记一行，
+     * 不影响其他根与后续轮次，本函数自身不因遍历异常向上抛。
      */
     private fun runPass(pass: Int) {
         val header = "=== probe v2 pass $pass ==="
@@ -269,15 +316,14 @@ class ShadeClockProbe : IXposedHookLoadPackage {
         }
         val lines = StringBuilder()
         lines.appendLine("$TAG $header")
+        val rootsSnapshot = synchronized(roots) { roots.toList() }
+        lines.appendLine("$TAG pass $pass roots total=${rootsSnapshot.size}")
         var hits = 0
-        var failure: Throwable? = null
-        try {
-            val rootsSnapshot = synchronized(roots) { roots.toList() }
-            lines.appendLine("$TAG roots=${rootsSnapshot.size}")
-            val stack = ArrayDeque<Pair<View, Int>>()
-            var capReached = false
-            for (root in rootsSnapshot) {
-                if (capReached) break
+        var capReached = false
+        for (root in rootsSnapshot) {
+            if (capReached) break
+            try {
+                val stack = ArrayDeque<Pair<View, Int>>()
                 stack.push(root to 0)
                 while (!stack.isEmpty()) {
                     val (view, depth) = stack.pop()
@@ -306,16 +352,12 @@ class ShadeClockProbe : IXposedHookLoadPackage {
                         }
                     }
                 }
+            } catch (t: Throwable) {
+                lines.appendLine(
+                    "$TAG pass $pass root ${root.javaClass.name} traversal failed " +
+                        "(ignored): ${t.javaClass.name}: ${t.message}"
+                )
             }
-        } catch (t: Throwable) {
-            failure = t
-        }
-        if (failure != null) {
-            lines.appendLine(
-                "$TAG probe v2 pass $pass aborted: ${failure.javaClass.name}: " +
-                    "${failure.message} -- no further passes"
-            )
-            stopped = true
         }
         lines.appendLine("$TAG pass $pass done, hits=$hits")
         fileOnly(lines.toString().trimEnd())

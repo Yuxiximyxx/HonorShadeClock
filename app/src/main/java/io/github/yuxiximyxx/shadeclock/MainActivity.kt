@@ -77,7 +77,7 @@ private fun ProbeHome() {
                 .padding(innerPadding),
         ) {
             Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-                SmallTitle(text = "探针版 v0.2.0", insideMargin = PaddingValues(start = 4.dp))
+                SmallTitle(text = "探针版 v0.2.1", insideMargin = PaddingValues(start = 4.dp))
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     cornerRadius = 20.dp,
@@ -108,7 +108,7 @@ private fun ProbeHome() {
                     insideMargin = PaddingValues(16.dp),
                 ) {
                     Column {
-                        Text("1. 覆盖安装本新版 v0.2.0（直接装，不用先卸载旧版）", fontSize = 14.sp)
+                        Text("1. 覆盖安装本新版 v0.2.1（直接装，不用先卸载旧版）", fontSize = 14.sp)
                         Text("2. 在 LSPosed 里确认模块已启用，作用域仍勾着「系统界面（SystemUI）」", fontSize = 14.sp, modifier = Modifier.padding(top = 8.dp))
                         Text("3. 强停一次系统界面，让探针注入新进程", fontSize = 14.sp, modifier = Modifier.padding(top = 8.dp))
                         Text("4. 下拉通知中心并保持打开约 10 秒，再关掉", fontSize = 14.sp, modifier = Modifier.padding(top = 8.dp))
