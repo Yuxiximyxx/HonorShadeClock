@@ -77,7 +77,7 @@ private fun ProbeHome() {
                 .padding(innerPadding),
         ) {
             Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-                SmallTitle(text = "探针版 v0.2.1", insideMargin = PaddingValues(start = 4.dp))
+                SmallTitle(text = "探针版 v0.3.0", insideMargin = PaddingValues(start = 4.dp))
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     cornerRadius = 20.dp,
@@ -85,7 +85,7 @@ private fun ProbeHome() {
                 ) {
                     Column {
                         Text(
-                            "这个版本不改任何样式，只做一件事：定位荣耀 MagicOS 11 通知中心顶部时钟控件的运行时结构，为正式版把时钟改成居中大时钟提供落点。v0.2.0 改用整棵视图树遍历：每 5 秒把 SystemUI 全部窗口的视图树扫一遍，直接读取控件当前的类名、id、文本、尺寸与位置，不再只依赖 setText。",
+                            "这个版本不改任何样式，只做一件事：定位荣耀 MagicOS 11 通知中心顶部时钟控件的运行时结构，为正式版把时钟改成居中大时钟提供落点。v0.2.0 改用整棵视图树遍历：每 5 秒把 SystemUI 全部窗口的视图树扫一遍，直接读取控件当前的类名、id、文本、尺寸与位置，不再只依赖 setText。v0.3.0 已确认头部是一个 Compose 容器，本版专门给它做一次图纸测绘（类结构与 Compose 语义树），为正式版选改法。",
                             fontSize = 14.sp,
                             color = MiuixTheme.colorScheme.onSurface,
                         )
@@ -108,7 +108,7 @@ private fun ProbeHome() {
                     insideMargin = PaddingValues(16.dp),
                 ) {
                     Column {
-                        Text("1. 覆盖安装本新版 v0.2.1（直接装，不用先卸载旧版）", fontSize = 14.sp)
+                        Text("1. 覆盖安装本新版 v0.3.0（直接装，不用先卸载旧版）", fontSize = 14.sp)
                         Text("2. 在 LSPosed 里确认模块已启用，作用域仍勾着「系统界面（SystemUI）」", fontSize = 14.sp, modifier = Modifier.padding(top = 8.dp))
                         Text("3. 强停一次系统界面，让探针注入新进程", fontSize = 14.sp, modifier = Modifier.padding(top = 8.dp))
                         Text("4. 下拉通知中心并保持打开约 10 秒，再关掉", fontSize = 14.sp, modifier = Modifier.padding(top = 8.dp))

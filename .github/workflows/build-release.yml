@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-0.2.1-release.apk
+          cp "$SRC" dist/HonorShadeClock-0.3.0-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-0.2.1-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-0.3.0-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,30 +68,31 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.2.1
-          name: HonorShadeClock 0.2.1 — 探针版 v2 热修：修兜底补全链路
+          tag_name: v0.3.0
+          name: HonorShadeClock 0.3.0 — 探针版 v3：头部 Compose 图纸测绘
           body: |
-            ## HonorShadeClock 0.2.1（探针版 v2 热修）
+            ## HonorShadeClock 0.3.0（探针版 v3）
 
             本版只定位、不改样式：为正式版「把 MagicOS 11
             通知中心顶部时钟改成居中大时钟」探明落点。
 
-            v0.2.0 真机日志显示：每轮遍历前的兜底补全反射调用
-            WindowManagerGlobal.getRootViews()，该方法在
-            MagicOS 上不存在（NoSuchMethodError），异常又被
-            当成致命错误停掉了全部轮次，一轮都没扫成。
-            本版只修这条链路：兜底补全改读 WindowManagerGlobal
-            的 mRoots 字段（ArrayList<ViewRootImpl>），逐个取
-            ViewRootImpl.mView 得到根视图；同时做错误隔离——
-            兜底补全失败只记一行、继续用已收集的根遍历，每个
-            根的遍历各自 try-catch，只有调度本身连续出错才停。
-            每轮标题行后新增一行本轮根视图总数统计。
-            其余探针逻辑（setText hook、遍历命中条件、记录
-            字段、去重、输出文件）与 v0.2.0 完全一致。
+            v0.2.1 已定位到通知中心头部控件
+            HnNotificationCenterHeader（id=
+            notification_center_header），它唯一的子视图是
+            AndroidComposeView——整个头部（大时钟+日期+
+            流量行）是 Jetpack Compose 绘制的，没有原生
+            TextView。本版在 v0.2.1 全部探针逻辑之上纯增量
+            加「图纸测绘」：遍历时遇到该头部实例（每个实例
+            全程只测绘一次）即 dump 它及父类链（到 ViewGroup
+            为止）与全部内部类的方法、字段签名，并尽力反射
+            dump 其 Compose 语义树（含文本属性与窗口坐标），
+            为正式版选改法提供图纸。仍然纯读取、全程
+            try-catch，不改任何视图属性，输出文件仍是
+            /sdcard/Download/shadeclock_probe.log（明细只写
+            文件，搜 v3 header blueprint）。
 
-            用法：覆盖安装新版 → LSPosed 确认模块启用、作用域
-            仍是系统界面 → 强停一次系统界面 → 下拉通知中心并
-            保持打开约 10 秒 → 关掉后取回
-            /sdcard/Download/shadeclock_probe.log 发回
-            （LSPosed 日志只记每轮标题行，明细在文件里）。
+            用法与上一版相同：覆盖安装新版 → LSPosed 确认
+            模块启用、作用域仍是系统界面 → 强停一次系统
+            界面 → 下拉通知中心并保持打开约 10 秒 → 关掉后
+            取回 shadeclock_probe.log 发回。
           files: dist/*.apk

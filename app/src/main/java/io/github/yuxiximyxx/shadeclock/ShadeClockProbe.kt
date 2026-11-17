@@ -39,6 +39,15 @@ import java.util.concurrent.atomic.AtomicInteger
  * try-catch，单个根失败不影响其他根与后续轮次；只有调度本身连续出错
  * 才停。每轮标题行后加一行根视图总数统计，方便判读。
  *
+ * v0.3.0：v0.2.1 已定位到通知中心头部控件 HnNotificationCenterHeader
+ * （id=notification_center_header），它唯一的子视图是 AndroidComposeView
+ * ——整个头部（大时钟+日期+流量行）是 Jetpack Compose 绘制的，没有原生
+ * TextView。本版为纯增量：遍历时遇到该头部实例（每个实例全程只测绘
+ * 一次）即做「图纸测绘」——dump 它及父类链（到 ViewGroup 为止）与内部类
+ * 的方法/字段签名，并尽力反射 dump 其 Compose 语义树（含 Text 属性与
+ * boundsInWindow），为正式版选改法提供图纸。语义 dump 独立 try-catch，
+ * 失败只记一行，绝不影响既有 pass 轮次。
+ *
  * 安全红线：遍历与记录全部 try-catch 兜底，绝不能让 SystemUI 崩溃。
  * 全程只读，绝不修改任何视图属性。
  */
@@ -58,6 +67,16 @@ class ShadeClockProbe : IXposedHookLoadPackage {
         /** 调度本身连续出错达到此数才允许停掉全部轮次 */
         private const val MAX_CONSECUTIVE_SCHEDULER_ERRORS = 3
         private val KEYWORDS = listOf("clock", "time", "date", "shade", "header", "panel", "compose")
+
+        // ---- v0.3.0 图纸测绘参数 ----
+        private const val HEADER_CLASS_NAME =
+            "com.android.systemui.statusbar.notification.header.HnNotificationCenterHeader"
+        private const val COMPOSE_VIEW_CLASS_NAME =
+            "androidx.compose.ui.platform.AndroidComposeView"
+        /** 单个类的方法/字段签名各最多 dump 条数 */
+        private const val MAX_MEMBERS_PER_CLASS = 120
+        private const val MAX_SEMANTICS_DEPTH = 12
+        private const val MAX_SEMANTICS_NODES = 200
     }
 
     /** 已 dump 过的 TextView 实例（弱引用，避免长期持有视图） */
@@ -74,6 +93,10 @@ class ShadeClockProbe : IXposedHookLoadPackage {
     /** v2 去重键：identityHashCode + 文本 */
     private val seenNodes: MutableSet<String> =
         Collections.synchronizedSet(HashSet<String>())
+
+    /** v0.3.0：已测绘过的头部实例（弱引用），每个实例全程只测绘一次 */
+    private val mappedHeaders: MutableSet<View> =
+        Collections.newSetFromMap(WeakHashMap<View, Boolean>())
 
     private val passCount = AtomicInteger(0)
 
@@ -116,7 +139,7 @@ class ShadeClockProbe : IXposedHookLoadPackage {
         probeLog("probe installed in $TARGET_PACKAGE (TextView.setText hooked)")
 
         // ---------- v0.2.0：整树遍历探针（v0.2.1 热修兜底链路） ----------
-        fileOnly("$TAG === HonorShadeClock probe v0.2.1 started (tree traversal) ===")
+        fileOnly("$TAG === HonorShadeClock probe v0.3.0 started (tree traversal + header blueprint) ===")
         installRootDiscovery(lpparam)
         startTraversalScheduler()
     }
@@ -340,6 +363,11 @@ class ShadeClockProbe : IXposedHookLoadPackage {
                             }
                         }
                     }
+                    // v0.3.0：遇到通知中心头部实例就顺带做一次图纸测绘（每实例一次，
+                    // 自带 try-catch，失败不影响本根其余遍历）
+                    if (view.javaClass.name == HEADER_CLASS_NAME) {
+                        maybeBlueprintHeader(view, lines)
+                    }
                     if (view is ViewGroup) {
                         val childCount = view.childCount
                         var i = childCount - 1
@@ -425,5 +453,290 @@ class ShadeClockProbe : IXposedHookLoadPackage {
             .replace("\n", "\\n")
             .replace("\r", "\\r")
             .replace("\"", "\\\"")
+    }
+
+    // ================= v0.3.0 头部图纸测绘 =================
+
+    /**
+     * 若该实例是通知中心头部且未测绘过，做一次「图纸测绘」：类结构 dump +
+     * Compose 语义树 dump，结果追加到本轮 pass 的输出（只写文件）。
+     * 全程 try-catch，失败只记一行，绝不影响 pass 其余逻辑；纯读取。
+     */
+    private fun maybeBlueprintHeader(view: View, lines: StringBuilder) {
+        val isNew = synchronized(mappedHeaders) { mappedHeaders.add(view) }
+        if (!isNew) return
+        try {
+            lines.appendLine("$TAG === v3 header blueprint start: ${view.javaClass.name} ===")
+            dumpHeaderClassStructure(view.javaClass, lines)
+            dumpHeaderComposeSemantics(view, lines)
+            lines.appendLine("$TAG === v3 header blueprint end ===")
+        } catch (t: Throwable) {
+            lines.appendLine(
+                "$TAG v3 header blueprint failed (ignored): ${t.javaClass.name}: ${t.message}"
+            )
+        }
+    }
+
+    /**
+     * dump 目标类及父类链（到 android.view.ViewGroup 为止，含 ViewGroup）
+     * 各自的方法/字段签名，再 dump 目标类的全部内部类。
+     */
+    private fun dumpHeaderClassStructure(clazz: Class<*>, lines: StringBuilder) {
+        var current: Class<*>? = clazz
+        while (current != null) {
+            dumpClassMembers(current, lines)
+            if (current == ViewGroup::class.java) break
+            current = current.superclass
+        }
+        val inners = try {
+            clazz.declaredClasses
+        } catch (t: Throwable) {
+            lines.appendLine(
+                "$TAG [v3] getDeclaredClasses failed: ${t.javaClass.name}: ${t.message}"
+            )
+            emptyArray<Class<*>>()
+        }
+        lines.appendLine("$TAG [v3] inner classes of ${clazz.name}: ${inners.size}")
+        for (inner in inners) {
+            dumpClassMembers(inner, lines)
+        }
+    }
+
+    /** dump 单个类的 declared methods / fields 签名（各上限 MAX_MEMBERS_PER_CLASS 条）。 */
+    private fun dumpClassMembers(clazz: Class<*>, lines: StringBuilder) {
+        lines.appendLine("$TAG [v3] class ${clazz.name}")
+        try {
+            val methods = clazz.declaredMethods
+            lines.appendLine("$TAG [v3]  methods (${methods.size}):")
+            var count = 0
+            for (m in methods) {
+                if (count >= MAX_MEMBERS_PER_CLASS) {
+                    lines.appendLine("$TAG [v3]  ... methods truncated at $MAX_MEMBERS_PER_CLASS")
+                    break
+                }
+                val sig = try {
+                    val params = m.parameterTypes.joinToString(", ") { it.name }
+                    "${m.name}($params) -> ${m.returnType.name}"
+                } catch (t: Throwable) {
+                    "${m.name}(<signature error: ${t.javaClass.simpleName}>)"
+                }
+                lines.appendLine("$TAG [v3]   m: $sig")
+                count++
+            }
+        } catch (t: Throwable) {
+            lines.appendLine("$TAG [v3]  methods dump failed: ${t.javaClass.name}: ${t.message}")
+        }
+        try {
+            val fields = clazz.declaredFields
+            lines.appendLine("$TAG [v3]  fields (${fields.size}):")
+            var count = 0
+            for (f in fields) {
+                if (count >= MAX_MEMBERS_PER_CLASS) {
+                    lines.appendLine("$TAG [v3]  ... fields truncated at $MAX_MEMBERS_PER_CLASS")
+                    break
+                }
+                val sig = try {
+                    "${f.name}: ${f.type.name}"
+                } catch (t: Throwable) {
+                    "${f.name}: <type error: ${t.javaClass.simpleName}>"
+                }
+                lines.appendLine("$TAG [v3]   f: $sig")
+                count++
+            }
+        } catch (t: Throwable) {
+            lines.appendLine("$TAG [v3]  fields dump failed: ${t.javaClass.name}: ${t.message}")
+        }
+    }
+
+    /**
+     * 对头部里的 AndroidComposeView 直接子视图做 Compose 语义树 dump
+     * （尽力而为）：全程字符串反射，不引入 compose 依赖；独立 try-catch，
+     * 失败只写一行原因，绝不影响其他逻辑。
+     */
+    private fun dumpHeaderComposeSemantics(header: View, lines: StringBuilder) {
+        try {
+            val composeView = findComposeChild(header)
+            if (composeView == null) {
+                lines.appendLine("$TAG [v3] semantics dump skipped: no AndroidComposeView direct child")
+                return
+            }
+            val owner = callMethodOrNull(composeView, "getSemanticsOwner")
+                ?: getFieldOrNull(composeView, "semanticsOwner")
+            if (owner == null) {
+                lines.appendLine("$TAG [v3] semantics dump failed: semanticsOwner not found")
+                return
+            }
+            val rootNode = callMethodOrNull(owner, "getRootSemanticsNode")
+                ?: getFieldOrNull(owner, "rootSemanticsNode")
+            if (rootNode == null) {
+                lines.appendLine("$TAG [v3] semantics dump failed: rootSemanticsNode not found")
+                return
+            }
+            lines.appendLine("$TAG [v3] compose semantics tree:")
+            val counter = AtomicInteger(0)
+            dumpSemanticsNode(rootNode, 0, lines, counter)
+            lines.appendLine("$TAG [v3] semantics nodes dumped: ${counter.get()}")
+        } catch (t: Throwable) {
+            lines.appendLine(
+                "$TAG [v3] semantics dump failed (ignored): ${t.javaClass.name}: ${t.message}"
+            )
+        }
+    }
+
+    /** 在头部的直接子级里找 AndroidComposeView（类名精确匹配）。 */
+    private fun findComposeChild(header: View): View? {
+        val group = header as? ViewGroup ?: return null
+        for (i in 0 until group.childCount) {
+            val child = group.getChildAt(i) ?: continue
+            if (child.javaClass.name == COMPOSE_VIEW_CLASS_NAME) return child
+        }
+        return null
+    }
+
+    /** 递归 dump 一个 SemanticsNode：id、boundsInWindow、layoutNode 包围盒、Text 属性。 */
+    private fun dumpSemanticsNode(
+        node: Any,
+        depth: Int,
+        lines: StringBuilder,
+        counter: AtomicInteger
+    ) {
+        if (depth > MAX_SEMANTICS_DEPTH) return
+        if (counter.incrementAndGet() > MAX_SEMANTICS_NODES) return
+        try {
+            val id = (callMethodOrNull(node, "getId")
+                ?: getFieldOrNull(node, "id"))?.toString() ?: "?"
+            val bounds = rectDesc(
+                callMethodOrNull(node, "getBoundsInWindow")
+                    ?: getFieldOrNull(node, "boundsInWindow")
+            )
+            val sb = StringBuilder()
+            sb.append("$TAG [v3]  sem depth=").append(depth)
+            sb.append(" id=").append(id)
+            if (bounds != null) sb.append(" boundsInWindow=").append(bounds)
+            val layoutBounds = layoutNodeBoundsDesc(node)
+            if (layoutBounds != null) sb.append(" layoutBounds=").append(layoutBounds)
+            val texts = semanticsTexts(node)
+            if (texts.isNotEmpty()) {
+                sb.append(" text=")
+                    .append(texts.joinToString(" | ") { "\"${escapeText(it)}\"" })
+            }
+            lines.appendLine(sb.toString())
+        } catch (t: Throwable) {
+            lines.appendLine(
+                "$TAG [v3]  sem node dump failed at depth $depth: " +
+                    "${t.javaClass.name}: ${t.message}"
+            )
+        }
+        if (depth >= MAX_SEMANTICS_DEPTH) return
+        val children = semanticsChildren(node) ?: return
+        for (child in children) {
+            dumpSemanticsNode(child, depth + 1, lines, counter)
+        }
+    }
+
+    /** 取 SemanticsNode 的子节点列表（getChildren / children 字段），取不到返回 null。 */
+    private fun semanticsChildren(node: Any): List<Any>? {
+        val raw = callMethodOrNull(node, "getChildren")
+            ?: getFieldOrNull(node, "children")
+            ?: return null
+        val iterable = raw as? Iterable<*> ?: return null
+        return iterable.filterNotNull()
+    }
+
+    /**
+     * 从 SemanticsNode 的 config 里取 Text 属性值：遍历 config 的 entries，
+     * 按 key 的 name 匹配 "Text"，其值（通常是 AnnotatedString 列表）逐个
+     * toString 记录。取不到返回空表。
+     */
+    private fun semanticsTexts(node: Any): List<String> {
+        val config = callMethodOrNull(node, "getConfig")
+            ?: getFieldOrNull(node, "config")
+            ?: return emptyList()
+        val entries: Iterable<*> = when {
+            config is Map<*, *> -> config.entries
+            else -> (callMethodOrNull(config, "entrySet") as? Iterable<*>)
+                ?: return emptyList()
+        }
+        val result = mutableListOf<String>()
+        for (entry in entries) {
+            if (entry == null) continue
+            try {
+                val key: Any?
+                val value: Any?
+                if (entry is Map.Entry<*, *>) {
+                    key = entry.key
+                    value = entry.value
+                } else {
+                    key = callMethodOrNull(entry, "getKey")
+                    value = callMethodOrNull(entry, "getValue")
+                }
+                val k = key ?: continue
+                val keyName = (callMethodOrNull(k, "getName")
+                    ?: getFieldOrNull(k, "name"))?.toString()
+                if (keyName == "Text" && value != null) {
+                    if (value is Iterable<*>) {
+                        for (item in value) {
+                            if (item != null) result.add(item.toString())
+                        }
+                    } else {
+                        result.add(value.toString())
+                    }
+                }
+            } catch (t: Throwable) {
+                // 单条 entry 失败忽略
+            }
+        }
+        return result
+    }
+
+    /** 取 SemanticsNode.layoutNode 的包围盒文本，取不到返回 null（跳过该项）。 */
+    private fun layoutNodeBoundsDesc(node: Any): String? {
+        val layoutNode = callMethodOrNull(node, "getLayoutNode")
+            ?: getFieldOrNull(node, "layoutNode")
+            ?: return null
+        val coords = callMethodOrNull(layoutNode, "getCoordinates")
+            ?: getFieldOrNull(layoutNode, "coordinates")
+        if (coords != null) {
+            val rect = callMethodOrNull(coords, "boundsInWindow")
+            val desc = rectDesc(rect)
+            if (desc != null) return desc
+        }
+        val w = (callMethodOrNull(layoutNode, "getWidth")
+            ?: getFieldOrNull(layoutNode, "width"))?.toString()
+        val h = (callMethodOrNull(layoutNode, "getHeight")
+            ?: getFieldOrNull(layoutNode, "height"))?.toString()
+        return if (w != null && h != null) "size=${w}x$h" else null
+    }
+
+    /** 把 androidx.compose.ui.geometry.Rect 反射读成 [left,top,right,bottom]，失败返回 null。 */
+    private fun rectDesc(rect: Any?): String? {
+        if (rect == null) return null
+        val left = callMethodOrNull(rect, "getLeft") ?: getFieldOrNull(rect, "left")
+            ?: return null
+        val top = callMethodOrNull(rect, "getTop") ?: getFieldOrNull(rect, "top")
+            ?: return null
+        val right = callMethodOrNull(rect, "getRight") ?: getFieldOrNull(rect, "right")
+            ?: return null
+        val bottom = callMethodOrNull(rect, "getBottom") ?: getFieldOrNull(rect, "bottom")
+            ?: return null
+        return "[$left,$top,$right,$bottom]"
+    }
+
+    /** 反射调无参方法，失败返回 null（测绘专用，不抛异常）。 */
+    private fun callMethodOrNull(obj: Any, name: String): Any? {
+        return try {
+            XposedHelpers.callMethod(obj, name)
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    /** 反射读字段，失败返回 null（测绘专用，不抛异常）。 */
+    private fun getFieldOrNull(obj: Any, name: String): Any? {
+        return try {
+            XposedHelpers.getObjectField(obj, name)
+        } catch (t: Throwable) {
+            null
+        }
     }
 }
