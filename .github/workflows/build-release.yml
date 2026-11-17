@@ -1,0 +1,90 @@
+name: Build & Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Android SDK packages
+        run: |
+          SDKMANAGER=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1)
+          echo "sdkmanager=$SDKMANAGER ANDROID_HOME=$ANDROID_HOME"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          yes | "$SDKMANAGER" "platform-tools" "platforms;android-36" "build-tools;36.0.0" 2>&1 | tail -3
+          ls "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools"
+
+      - name: Prepare keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.SHADECLOCK_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then echo "SHADECLOCK_KEYSTORE_BASE64 未配置"; exit 1; fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/shadeclock.jks"
+          ls -lh "$RUNNER_TEMP/shadeclock.jks"
+
+      - name: Build release
+        env:
+          SHADECLOCK_KEYSTORE_FILE: ${{ runner.temp }}/shadeclock.jks
+          SHADECLOCK_STORE_PASSWORD: ${{ secrets.SHADECLOCK_STORE_PASSWORD }}
+          SHADECLOCK_KEY_ALIAS: ${{ secrets.SHADECLOCK_KEY_ALIAS }}
+          SHADECLOCK_KEY_PASSWORD: ${{ secrets.SHADECLOCK_KEY_PASSWORD }}
+        run: bash ./gradlew :app:assembleRelease --stacktrace
+
+      - name: Collect APK
+        run: |
+          mkdir -p dist
+          SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          echo "release apk: $SRC"
+          cp "$SRC" dist/HonorShadeClock-0.1.0-release.apk
+          ls -lh dist
+
+      - name: Verify signature
+        run: |
+          SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-0.1.0-release.apk
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shadeclock-apk
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.0
+          name: HonorShadeClock 0.1.0 — 探针版：定位通知中心时钟控件
+          body: |
+            ## HonorShadeClock 0.1.0（探针版）
+
+            本版只定位、不改样式：为正式版「把 MagicOS 11
+            通知中心顶部时钟改成居中大时钟」探明落点。
+
+            探针 hook SystemUI 里 TextView.setText 的两个
+            CharSequence 重载，文本是时钟格式（HH:mm /
+            HH:mm:ss）的实例只 dump 一次：运行时类名、
+            id/资源名、字号（px/sp）、向上 8 层父链的类名、
+            尺寸与 LayoutParams 类型。全程只读，不改任何
+            视图属性。
+
+            用法：LSPosed 启用模块并勾选 SystemUI 作用域 →
+            强停一次 SystemUI → 下拉一次通知中心、等时钟跳
+            过一分钟 → 取回 /sdcard/Download/shadeclock_probe.log
+            （LSPosed 日志里搜 ShadeClockProbe 也有一份）。
+          files: dist/*.apk

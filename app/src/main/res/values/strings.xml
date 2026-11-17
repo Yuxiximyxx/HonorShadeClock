@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">通知中心大时钟</string>
+    <string name="app_subtitle">定位 MagicOS 通知中心时钟控件，为居中大时钟做准备</string>
+
+    <!-- 作用域：只需要 SystemUI（通知中心时钟所在进程） -->
+    <string-array name="xposedscope">
+        <item>com.android.systemui</item>
+    </string-array>
+</resources>

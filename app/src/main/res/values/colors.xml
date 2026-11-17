@@ -1,0 +1,4 @@
+<resources>
+    <!-- 哑光中性黑（与用户既有夜间图标定版一致） -->
+    <color name="ic_launcher_background">#171717</color>
+</resources>
