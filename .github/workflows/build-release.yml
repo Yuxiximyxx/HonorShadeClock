@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-0.1.0-release.apk
+          cp "$SRC" dist/HonorShadeClock-0.2.0-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-0.1.0-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-0.2.0-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,23 +68,28 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.1.0
-          name: HonorShadeClock 0.1.0 — 探针版：定位通知中心时钟控件
+          tag_name: v0.2.0
+          name: HonorShadeClock 0.2.0 — 探针版 v2：整棵视图树遍历定位时钟
           body: |
-            ## HonorShadeClock 0.1.0（探针版）
+            ## HonorShadeClock 0.2.0（探针版 v2）
 
             本版只定位、不改样式：为正式版「把 MagicOS 11
             通知中心顶部时钟改成居中大时钟」探明落点。
 
-            探针 hook SystemUI 里 TextView.setText 的两个
-            CharSequence 重载，文本是时钟格式（HH:mm /
-            HH:mm:ss）的实例只 dump 一次：运行时类名、
-            id/资源名、字号（px/sp）、向上 8 层父链的类名、
-            尺寸与 LayoutParams 类型。全程只读，不改任何
-            视图属性。
+            v0.1.0 回传日志证明头部大时钟不是靠 TextView.setText
+            更新的普通文本控件。本版改用整棵视图树遍历：hook
+            WindowManagerGlobal.addView 收集窗口根视图（另有
+            getRootViews() 反射兜底），主线程每 5 秒一轮、最多
+            36 轮，迭代式遍历全部视图，直接读控件当前的类名、
+            id、文本、尺寸、可见性与屏幕位置。命中条件：
+            TextView 且文本长度 1..40，或类名/id 含
+            clock/time/date/shade/header/panel/compose。
+            遍历全程 try-catch 兜底，异常只记一行并停轮次，
+            绝不让 SystemUI 崩溃。v0.1.0 的 setText hook 保留。
 
-            用法：LSPosed 启用模块并勾选 SystemUI 作用域 →
-            强停一次 SystemUI → 下拉一次通知中心、等时钟跳
-            过一分钟 → 取回 /sdcard/Download/shadeclock_probe.log
-            （LSPosed 日志里搜 ShadeClockProbe 也有一份）。
+            用法：覆盖安装新版 → LSPosed 确认模块启用、作用域
+            仍是系统界面 → 强停一次系统界面 → 下拉通知中心并
+            保持打开约 10 秒 → 关掉后取回
+            /sdcard/Download/shadeclock_probe.log 发回
+            （LSPosed 日志只记每轮标题行，明细在文件里）。
           files: dist/*.apk
