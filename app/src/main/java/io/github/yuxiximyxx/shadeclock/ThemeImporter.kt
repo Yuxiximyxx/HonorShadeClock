@@ -233,6 +233,8 @@ object ThemeStore {
     const val KEY_SHOW_WIDGETS = "show_widgets"
     const val KEY_OFFSET_DP = "offset_dp"
     const val KEY_OFFSETS_JSON = "offsets_by_theme_json"
+    const val KEY_OFFSETS_X_JSON = "offsets_x_by_theme_json"
+    const val KEY_WEEKDAY_JSON = "weekday_by_theme_json"
     const val KEY_HIDE_CARRIER = "hide_carrier"
 
     // ---- 垂直偏移按主题记（v2.0.21）----
@@ -289,6 +291,91 @@ object ThemeStore {
         val map = loadOffsetMap(prefs)
         map[themeId] = value.coerceIn(StampStore.OFFSET_DP_MIN, StampStore.OFFSET_DP_MAX)
         saveOffsetMap(prefs, map)
+    }
+
+    // ---- 水平偏移按主题记（v2.0.23）----
+    // 与垂直偏移并列：另一张按 themeId 的映射（独立键，值域
+    // 对称 -120～+120dp），写戳记时一并取当前主题的那一份
+    // 下发到戳记第 9 行；旧版没有这张映射、缺省 0。
+
+    fun loadOffsetXMap(prefs: SharedPreferences): MutableMap<String, Int> {
+        val out = mutableMapOf<String, Int>()
+        val raw = prefs.getString(KEY_OFFSETS_X_JSON, null) ?: return out
+        return try {
+            val obj = JSONObject(raw)
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                out[k] = obj.optInt(k, 0)
+                    .coerceIn(StampStore.OFFSET_X_DP_MIN, StampStore.OFFSET_X_DP_MAX)
+            }
+            out
+        } catch (t: Throwable) {
+            out
+        }
+    }
+
+    fun saveOffsetXMap(prefs: SharedPreferences, map: Map<String, Int>) {
+        val obj = JSONObject()
+        for ((k, v) in map) obj.put(k, v)
+        prefs.edit().putString(KEY_OFFSETS_X_JSON, obj.toString()).apply()
+    }
+
+    /** 某主题的水平偏移（dp）；没调过返回 0。 */
+    fun offsetXForTheme(prefs: SharedPreferences, themeId: String): Int =
+        loadOffsetXMap(prefs)[themeId] ?: 0
+
+    fun setOffsetXForTheme(prefs: SharedPreferences, themeId: String, value: Int) {
+        val map = loadOffsetXMap(prefs)
+        map[themeId] = value.coerceIn(StampStore.OFFSET_X_DP_MIN, StampStore.OFFSET_X_DP_MAX)
+        saveOffsetXMap(prefs, map)
+    }
+
+    // ---- 星期编号模式按主题记（v2.0.23）----
+    // 主题的星期图集编号口径写在著者脑子里、XML 里不声明
+    // （两边都只有 srcid="#day_of_week"）：.hwt 样本按周日=1
+    // 编（w_1=SUN…w_5=THU，与荣耀引擎 #day_of_week 的
+    // Calendar 原口径一致）、云镜按周一=1 编。渲染器无法自
+    // 动分辨，只能按 themeId 存一份模式：true=周一起算、
+    // false=周日起算（默认，与引擎口径一致，AAA 装上即
+    // 对）；写戳记时取当前主题的那一份下发到戳记第 10 行。
+    // 存量不迁移、不预置任何主题的特殊值——云镜需在设置里
+    // 对该主题手动切一次「周一起算」，切完按主题记住。
+
+    fun loadWeekdayMap(prefs: SharedPreferences): MutableMap<String, Boolean> {
+        val out = mutableMapOf<String, Boolean>()
+        val raw = prefs.getString(KEY_WEEKDAY_JSON, null) ?: return out
+        return try {
+            val obj = JSONObject(raw)
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                out[k] = obj.optBoolean(k, false)
+            }
+            out
+        } catch (t: Throwable) {
+            out
+        }
+    }
+
+    fun saveWeekdayMap(prefs: SharedPreferences, map: Map<String, Boolean>) {
+        val obj = JSONObject()
+        for ((k, v) in map) obj.put(k, v)
+        prefs.edit().putString(KEY_WEEKDAY_JSON, obj.toString()).apply()
+    }
+
+    /** 某主题的星期编号是否按周一起算；没设过返回 false（周日起算）。 */
+    fun weekdayMondayStartForTheme(prefs: SharedPreferences, themeId: String): Boolean =
+        loadWeekdayMap(prefs)[themeId] ?: false
+
+    fun setWeekdayMondayStartForTheme(
+        prefs: SharedPreferences,
+        themeId: String,
+        mondayStart: Boolean,
+    ) {
+        val map = loadWeekdayMap(prefs)
+        map[themeId] = mondayStart
+        saveWeekdayMap(prefs, map)
     }
 
     fun loadThemes(prefs: SharedPreferences): List<ThemeEntry> {
@@ -364,10 +451,14 @@ object ThemeStore {
         // 已搬进映射。
         migrateLegacyOffset(prefs)
         val offsetDp = offsetForTheme(prefs, selected)
+        val offsetXDp = offsetXForTheme(prefs, selected)
+        // 星期编号模式同样按主题下发（v2.0.23，戳记第 10 行）
+        val weekdayMondayStart = weekdayMondayStartForTheme(prefs, selected)
         val hideCarrier = prefs.getBoolean(KEY_HIDE_CARRIER, true)
         val content = StampStore.formatStamp(
             selected, System.currentTimeMillis(), heightMode, topStyle,
-            showBackground, showWidgets, offsetDp, hideCarrier,
+            showBackground, showWidgets, offsetDp, hideCarrier, offsetXDp,
+            weekdayMondayStart,
         )
         val bytes = content.toByteArray(Charsets.UTF_8)
         deleteOwnCandidates(context, STAMP_FILE_NAME)
@@ -403,9 +494,14 @@ object ThemeStore {
         PublicStore.deleteTree(context, "${StampStore.THEMES_REL_DIR}/$id")
         val themes = loadThemes(prefs).filter { it.id != id }
         saveThemes(prefs, themes)
-        // 该主题的偏移记录一并清掉（v2.0.21），免得映射里留孤儿
+        // 该主题的按主题记录一并清掉（偏移 v2.0.21、水平偏移
+        // 与星期编号模式 v2.0.23），免得映射里留孤儿
         val offsets = loadOffsetMap(prefs)
         if (offsets.remove(id) != null) saveOffsetMap(prefs, offsets)
+        val offsetsX = loadOffsetXMap(prefs)
+        if (offsetsX.remove(id) != null) saveOffsetXMap(prefs, offsetsX)
+        val weekday = loadWeekdayMap(prefs)
+        if (weekday.remove(id) != null) saveWeekdayMap(prefs, weekday)
         if (prefs.getString(KEY_SELECTED_THEME, "") == id) {
             prefs.edit().putString(KEY_SELECTED_THEME, "").apply()
         }

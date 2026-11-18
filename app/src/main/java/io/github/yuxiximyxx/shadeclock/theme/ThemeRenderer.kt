@@ -28,13 +28,31 @@ class RenderEnv(
     val screenWidthPx: Int,
     /** 设备屏幕高度 px（= #screen_height，取面板所在窗口高度）。 */
     val screenHeightPx: Int,
+    /**
+     * 当前主题的星期编号是否按周一起算（按主题设置下发，
+     * v2.0.23）：false=周日起算（默认，#day_of_week 喂引擎原
+     * 口径 Calendar 周日=1）；true=周一起算（喂之前换算
+     * ((dow+5)%7)+1）。主题 XML 不声明编号口径、无法自动
+     * 分辨，只能按主题存一份，见 EvalContext。
+     */
+    val weekdayMondayStart: Boolean = false,
 )
 
 /**
  * 变量解析上下文（每次绘制新建）：内建变量 → Weather.* 真实值 →
  * 主题 Var/VarArray（懒求值 + 本轮缓存）→ 未知一律 0。
- * month 按引擎惯例 0 起（VarArray 月份表靠它索引）；day_of_week 为
- * 周一=1…周日=7（两份样本的星期图集实测：x_1=周一、x_7=周日）。
+ * month 按引擎惯例 0 起（VarArray 月份表靠它索引）；day_of_week 的
+ * 基线是 Java Calendar 口径周日=1…周六=7（荣耀引擎 #day_of_week
+ * 原口径，v2.0.23 改回——此前按周一=1 喂，.hwt 样本的星期图集
+ * 是周日=1 编号（亲读 w_1=SUN、w_4=WED、w_5=THU），周四被喂
+ * 4 选中 WED、差一天）。但编号口径是著者约定、XML 里不声明
+ * （两个已知主题都只有 srcid="#day_of_week" 一句），云镜图集
+ * 恰是按周一=1 编的（其在真锁屏上本就快一天，是著者偏差；
+ * 旧喂法凑巧替它抵消过）。故 v2.0.23 起按主题存一份模式
+ * （env.weekdayMondayStart，设置页按主题切）：周一起算的主题
+ * 喂之前换算 ((dow+5)%7)+1（周日→7、周一→1、周四→4）；默认
+ * 周日起算、原值直喂，AAA 这类主题装上即对，云镜需在设置
+ * 里对该主题切一次「周一起算」。
  */
 class EvalContext(
     private val model: ThemeModel,
@@ -52,7 +70,11 @@ class EvalContext(
 
     init {
         val cal = env.now
-        val isoDow = (cal.get(Calendar.DAY_OF_WEEK) + 5) % 7 + 1
+        // 基线：Calendar 原值即周日=1…周六=7，与引擎
+        // #day_of_week 一致；当前主题若按周一起算编号，换算
+        // 后再喂（(dow+5)%7)+1：周日 1→7、周一 2→1、周四 5→4
+        val dowRaw = cal.get(Calendar.DAY_OF_WEEK)
+        val dow = if (env.weekdayMondayStart) (dowRaw + 5) % 7 + 1 else dowRaw
         builtins = mapOf(
             "hour24" to EVal.Num(cal.get(Calendar.HOUR_OF_DAY).toDouble()),
             "hour" to EVal.Num(cal.get(Calendar.HOUR).toDouble()),
@@ -61,7 +83,7 @@ class EvalContext(
             "year" to EVal.Num(cal.get(Calendar.YEAR).toDouble()),
             "month" to EVal.Num(cal.get(Calendar.MONTH).toDouble()),
             "date" to EVal.Num(cal.get(Calendar.DAY_OF_MONTH).toDouble()),
-            "day_of_week" to EVal.Num(isoDow.toDouble()),
+            "day_of_week" to EVal.Num(dow.toDouble()),
             "battery_level" to EVal.Num(env.batteryLevel.toDouble()),
             "battery_state" to EVal.Num(env.batteryState.toDouble()),
             "screen_width" to EVal.Num(env.screenWidthPx.toDouble()),
@@ -134,12 +156,31 @@ class ThemeRenderer(private val log: (String) -> Unit) {
         private set
 
     /**
+     * 最近一次绘制的内容簇最左/最右缘（根坐标 px，统计口径与
+     * [contentTopPx] 同——整屏级背景与屏幕底部区域的元素不计）。
+     * 无可统计元素时 left 为 [Float.MAX_VALUE]、right 为 0。
+     * 水平偏移的钳制用（簇不许移出画布左右，v2.0.23）。
+     */
+    var contentLeftPx: Float = Float.MAX_VALUE
+        private set
+    var contentRightPx: Float = 0f
+        private set
+
+    /**
      * 覆盖层垂直偏移（px，负值上移）：draw 时整体加到根 y 上，
      * 所有元素连同内容顶/底统计一起平移（v2.0.7）。由
      * HeaderOverlay 按 stamp 的 offsetDp 换算并钳制后赋值。
      */
     @Volatile
     var offsetYPx: Float = 0f
+
+    /**
+     * 覆盖层水平偏移（px，负值左移、正值右移）：与 [offsetYPx]
+     * 同机制，draw 时整体加到根 x 上（v2.0.23）。由
+     * HeaderOverlay 按 stamp 的 offsetXDp 换算并钳制后赋值。
+     */
+    @Volatile
+    var offsetXPx: Float = 0f
 
     /** 最近一次 draw 实际绘制的可见元素数（覆盖层诊断用）。 */
     var lastDrawnElements: Int = 0
@@ -299,6 +340,8 @@ class ThemeRenderer(private val log: (String) -> Unit) {
         backgroundSkipLogged = false
         contentBottomPx = other.contentBottomPx
         contentTopPx = other.contentTopPx
+        contentLeftPx = other.contentLeftPx
+        contentRightPx = other.contentRightPx
     }
 
     /**
@@ -361,10 +404,12 @@ class ThemeRenderer(private val log: (String) -> Unit) {
         val ctx = EvalContext(m, env)
         contentBottomPx = 0f
         contentTopPx = Float.MAX_VALUE
+        contentLeftPx = Float.MAX_VALUE
+        contentRightPx = 0f
         drawnCounter = 0
         backgroundHandled = false
         for (root in m.roots) {
-            drawNode(root, canvas, ctx, env, 0f, offsetYPx, 1f, 1f)
+            drawNode(root, canvas, ctx, env, offsetXPx, offsetYPx, 1f, 1f)
         }
         lastDrawnElements = drawnCounter
     }
@@ -550,13 +595,16 @@ class ThemeRenderer(private val log: (String) -> Unit) {
         if (!showBackgroundImage && !backgroundHandled) {
             val cw = env.screenWidthPx.toFloat()
             val ch = env.screenHeightPx.toFloat()
-            // 覆盖判定用偏移前的坐标（v2.0.7）：整体上移后 dst 顶/底
-            // 都平移了，不还原会漏判整幅背景图（开关关时被误画）。
+            // 覆盖判定用偏移前的坐标（v2.0.7 垂直、v2.0.23 水平）：
+            // 整体平移后 dst 四边都动了，不还原会漏判整幅背景图
+            // （开关关时被误画）。
+            val rawLeft = dst.left - offsetXPx
+            val rawRight = dst.right - offsetXPx
             val rawTop = dst.top - offsetYPx
             val rawBottom = dst.bottom - offsetYPx
             if (cw > 0f && ch > 0f &&
-                dst.left <= cw * 0.05f && rawTop <= ch * 0.05f &&
-                dst.right >= cw * 0.95f && rawBottom >= ch * 0.95f
+                rawLeft <= cw * 0.05f && rawTop <= ch * 0.05f &&
+                rawRight >= cw * 0.95f && rawBottom >= ch * 0.95f
             ) {
                 backgroundHandled = true
                 drawnCounter--
@@ -582,7 +630,7 @@ class ThemeRenderer(private val log: (String) -> Unit) {
         } else {
             canvas.drawBitmap(bmp, null, dst, paint)
         }
-        trackContent(env, top, top + rh, rh)
+        trackContent(env, dst.left, top, dst.right, top + rh, rh)
     }
 
     // ---------- Text / DateTime ----------
@@ -710,7 +758,7 @@ class ThemeRenderer(private val log: (String) -> Unit) {
         // 约半行——云镜三小模块文字（y=888、size 15）下缘实际约 906、
         // 旧口径只算到约 898，文字被盒子下缘切掉一半（真机实证）。
         val lineHeight = fm.descent - fm.ascent
-        trackContent(env, anchorY, anchorY + lineHeight, lineHeight)
+        trackContent(env, drawX, anchorY, drawX + textWidth, anchorY + lineHeight, lineHeight)
     }
 
     private fun makeTypeface(bold: Boolean): Typeface {
@@ -786,6 +834,7 @@ class ThemeRenderer(private val log: (String) -> Unit) {
         paint.reset()
         paint.isAntiAlias = true
         paint.alpha = (alpha * 255).roundToInt().coerceIn(0, 255)
+        val startX = curX
         digits.forEachIndexed { idx, d ->
             if (idx == 2 && dotBmp != null) {
                 val dst = RectF(curX, top, curX + dotW * s, top + cellH * s)
@@ -797,7 +846,7 @@ class ThemeRenderer(private val log: (String) -> Unit) {
             canvas.drawBitmap(bmp, null, dst, paint)
             curX += cellW * s
         }
-        trackContent(env, top, top + cellH * s, cellH * s)
+        trackContent(env, startX, top, curX, top + cellH * s, cellH * s)
     }
 
     /** 按 Image 的锚点规则画一张位图（Time 的 srcid 单图模式复用）。 */
@@ -841,19 +890,29 @@ class ThemeRenderer(private val log: (String) -> Unit) {
         paint.isAntiAlias = true
         paint.alpha = (alpha * 255).roundToInt().coerceIn(0, 255)
         canvas.drawBitmap(bmp, null, RectF(left, top, left + rw, top + rh), paint)
-        trackContent(env, top, top + rh, rh)
+        trackContent(env, left, top, left + rw, top + rh, rh)
     }
 
     /**
-     * 内容顶/下缘统计（「跟随内容」高度与垂直偏移钳制用）：整屏级
+     * 内容四缘统计（「跟随内容」高度与垂直/水平偏移钳制用）：整屏级
      * 背景（高 ≥ 屏高一半）与屏幕底部区域的元素（锁屏底部按钮等）
-     * 不计入——簇顶取时钟簇的最高元素，而不是整幅背景的 0。
+     * 不计入——簇顶取时钟簇的最高元素，而不是整幅背景的 0；
+     * 左右缘同口径（全屏画布图被高度规则先排除）。
      */
-    private fun trackContent(env: RenderEnv, top: Float, bottom: Float, height: Float) {
+    private fun trackContent(
+        env: RenderEnv,
+        left: Float,
+        top: Float,
+        right: Float,
+        bottom: Float,
+        height: Float,
+    ) {
         if (height >= env.screenHeightPx * 0.5f) return
         if (top >= env.screenHeightPx * 0.75f) return
         if (bottom > contentBottomPx) contentBottomPx = bottom
         if (top < contentTopPx) contentTopPx = top
+        if (left < contentLeftPx) contentLeftPx = left
+        if (right > contentRightPx) contentRightPx = right
     }
 
     companion object {
@@ -873,7 +932,8 @@ class ThemeRenderer(private val log: (String) -> Unit) {
             val hour12 = if (hour12raw == 0) 12 else hour12raw
             val minute = cal.get(Calendar.MINUTE)
             val second = cal.get(Calendar.SECOND)
-            val isoDow = (cal.get(Calendar.DAY_OF_WEEK) + 5) % 7 + 1
+            // WEEKDAY_CN 是周一起表：Calendar 值（周日=1）换算成它的下标
+            val cnDowIdx = (cal.get(Calendar.DAY_OF_WEEK) + 5) % 7
             val sb = StringBuilder()
             var i = 0
             fun two(v: Int) = v.toString().padStart(2, '0')
@@ -886,14 +946,14 @@ class ThemeRenderer(private val log: (String) -> Unit) {
                     format.startsWith("hh", i) -> { sb.append(two(hour12)); i += 2 }
                     format.startsWith("mm", i) -> { sb.append(two(minute)); i += 2 }
                     format.startsWith("ss", i) -> { sb.append(two(second)); i += 2 }
-                    format.startsWith("EE", i) -> { sb.append(WEEKDAY_CN[isoDow - 1]); i += 2 }
+                    format.startsWith("EE", i) -> { sb.append(WEEKDAY_CN[cnDowIdx]); i += 2 }
                     format[i] == 'M' -> { sb.append(month); i++ }
                     format[i] == 'd' -> { sb.append(day); i++ }
                     format[i] == 'H' -> { sb.append(hour24); i++ }
                     format[i] == 'h' -> { sb.append(hour12); i++ }
                     format[i] == 'm' -> { sb.append(minute); i++ }
                     format[i] == 's' -> { sb.append(second); i++ }
-                    format[i] == 'E' -> { sb.append(WEEKDAY_CN[isoDow - 1]); i++ }
+                    format[i] == 'E' -> { sb.append(WEEKDAY_CN[cnDowIdx]); i++ }
                     format[i] == 'a' -> { sb.append(if (hour24 < 12) "上午" else "下午"); i++ }
                     else -> { sb.append(format[i]); i++ }
                 }

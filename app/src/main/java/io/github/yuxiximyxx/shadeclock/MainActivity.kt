@@ -158,6 +158,26 @@ private fun SettingsScreen() {
             )
         )
     }
+    // 水平偏移同样按主题记（v2.0.23）：与垂直并列的一张映射，
+    // 滑杆同样只编当前选中主题的那一份。
+    var offsetXDp by remember {
+        mutableIntStateOf(
+            ThemeStore.offsetXForTheme(
+                prefs,
+                prefs.getString(ThemeStore.KEY_SELECTED_THEME, "") ?: "",
+            )
+        )
+    }
+    // 星期编号模式同样按主题记（v2.0.23）：默认周日起算，
+    // 开关只编当前选中主题的那一份。
+    var weekdayMondayStart by remember {
+        mutableStateOf(
+            ThemeStore.weekdayMondayStartForTheme(
+                prefs,
+                prefs.getString(ThemeStore.KEY_SELECTED_THEME, "") ?: "",
+            )
+        )
+    }
     var importStatus by remember { mutableStateOf("") }
     var importing by remember { mutableStateOf(false) }
 
@@ -249,11 +269,27 @@ private fun SettingsScreen() {
         syncStamp()
     }
 
+    fun saveOffsetXDp(value: Int) {
+        if (value == offsetXDp) return
+        offsetXDp = value
+        ThemeStore.setOffsetXForTheme(prefs, selectedThemeId, value)
+        syncStamp()
+    }
+
+    fun saveWeekdayMondayStart(value: Boolean) {
+        if (value == weekdayMondayStart) return
+        weekdayMondayStart = value
+        ThemeStore.setWeekdayMondayStartForTheme(prefs, selectedThemeId, value)
+        syncStamp()
+    }
+
     fun selectTheme(id: String) {
         selectedThemeId = id
         prefs.edit().putString(ThemeStore.KEY_SELECTED_THEME, id).apply()
         // 滑杆跟随主题：切过去就显示那个主题自己记着的偏移
         offsetDp = ThemeStore.offsetForTheme(prefs, id)
+        offsetXDp = ThemeStore.offsetXForTheme(prefs, id)
+        weekdayMondayStart = ThemeStore.weekdayMondayStartForTheme(prefs, id)
         syncStamp()
     }
 
@@ -265,6 +301,8 @@ private fun SettingsScreen() {
                 if (selectedThemeId == id) {
                     selectedThemeId = ""
                     offsetDp = ThemeStore.offsetForTheme(prefs, "")
+                    offsetXDp = ThemeStore.offsetXForTheme(prefs, "")
+                    weekdayMondayStart = ThemeStore.weekdayMondayStartForTheme(prefs, "")
                 }
                 importStatus = "已删除主题"
             }
@@ -292,6 +330,9 @@ private fun SettingsScreen() {
                             .apply()
                         // 新主题的偏移从它自己那份起算（没调过是 0）
                         offsetDp = ThemeStore.offsetForTheme(prefs, result.entry.id)
+                        offsetXDp = ThemeStore.offsetXForTheme(prefs, result.entry.id)
+                        weekdayMondayStart =
+                            ThemeStore.weekdayMondayStartForTheme(prefs, result.entry.id)
                         importStatus = "已导入并选中「${result.entry.name}」"
                         syncStamp()
                     }
@@ -428,8 +469,22 @@ private fun SettingsScreen() {
                             max = StampStore.OFFSET_DP_MAX,
                             onValueChange = { saveOffsetDp(it) },
                         )
+                        SizeSliderRow(
+                            title = "左右偏移",
+                            value = offsetXDp,
+                            min = StampStore.OFFSET_X_DP_MIN,
+                            max = StampStore.OFFSET_X_DP_MAX,
+                            onValueChange = { saveOffsetXDp(it) },
+                            modifier = Modifier.padding(top = 12.dp),
+                        )
+                        SuperSwitch(
+                            title = "星期编号按周一起算",
+                            summary = "关（默认）：星期图按周日=1 编号（AAA 这类）；开：按周一=1 编号（云镜这类）。主题文件不声明编号口径、星期差一天时切它；同样按主题各记各的。",
+                            checked = weekdayMondayStart,
+                            onCheckedChange = { saveWeekdayMondayStart(it) },
+                        )
                         Text(
-                            "负数上移、正数下移。每个主题单独记自己的偏移：滑杆调的是当前选中的主题，切到别的主题显示的是那个主题的值。主题顶部的留白是给锁屏天空的，在通知中心里显空时往上调；最多上移到时钟簇贴顶。",
+                            "垂直：负数上移、正数下移；左右：负数左移、正数右移。每个主题单独记自己的偏移：滑杆调的是当前选中的主题，切到别的主题显示的是那个主题的值。主题顶部的留白是给锁屏天空的，在通知中心里显空时往上调；偏移最多把时钟簇推到贴边，不会移出画面。",
                             fontSize = 13.sp,
                             color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                             modifier = Modifier.padding(top = 8.dp),
@@ -635,7 +690,7 @@ private fun SettingsScreen() {
                 ) {
                     Column {
                         Text(
-                            "切换主题、改区域高度、调垂直偏移、开关锁屏主题样式、主题背景图与隐藏运营商文字：下次下拉通知栏即生效（约 1 秒内自动刷新），不用强停系统界面。",
+                            "切换主题、改区域高度、调垂直/左右偏移、开关锁屏主题样式、主题背景图与隐藏运营商文字：下次下拉通知栏即生效（约 1 秒内自动刷新），不用强停系统界面。",
                             fontSize = 14.sp,
                             color = MiuixTheme.colorScheme.onSurface,
                         )

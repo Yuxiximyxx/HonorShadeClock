@@ -644,6 +644,10 @@ object HeaderOverlay {
         var layoutListener: View.OnLayoutChangeListener? = null
         /** 帧频断言监听（v2.0.11）：头部 OnPreDraw——同框纠正 + 首绘补 invalidate + 跟随兜底采样。 */
         var preDrawListener: ViewTreeObserver.OnPreDrawListener? = null
+        /** 预抽监听当前登记在哪个观察者上（v2.0.23）：头部重挂载会换观察者，登记要跟上，见 ensurePreDrawListener。 */
+        var preDrawObserver: ViewTreeObserver? = null
+        /** 头部 detach 监听（v2.0.23，只装一次）：detach 时清 preDrawObserver，逼下次 ensure 重新登记。 */
+        var headerAttachListener: View.OnAttachStateChangeListener? = null
         /** Compose 子视图被宿主改回可见后、我们重新压回的纠正次数（有界日志用，v2.0.11）。 */
         var childCorrectionLogCount = 0
         var diagTicks = 0
@@ -674,6 +678,9 @@ object HeaderOverlay {
         /** 已成功应用到渲染器的垂直偏移（dp）与对应主题（v2.0.7）；null=尚未应用。 */
         var appliedOffsetDp: Int? = null
         var offsetThemeId: String? = null
+        /** 已成功应用到渲染器的水平偏移（dp）与对应主题（v2.0.23）；与垂直分开记，钳制随主题簇宽变、不能共用主题标记。 */
+        var appliedOffsetXDp: Int? = null
+        var offsetXThemeId: String? = null
         /**
          * 栈顶写回重入保护（v2.0.5）：置位期间拦截/兜底一律跳过——
          * 我们调用的系统更新组会同步再触发写入口 hook，不挡住就
@@ -789,6 +796,12 @@ object HeaderOverlay {
         }
         st.gateClosed = closed
         val want = if (closed) View.GONE else View.VISIBLE
+        if (want == View.VISIBLE && wrapper.visibility != View.VISIBLE) {
+            // 开门同帧断言（v2.0.23）：wrapper 亮相的这一帧，
+            // 原头部子视图必须先已是 INVISIBLE——宿主在场景
+            // 激活时改回可见的窗口与开门同帧，先压再亮。
+            hideComposeChildren(st.header, st, "gate")
+        }
         if (wrapper.visibility != want) {
             wrapper.visibility = want
             if (st.gateLogCount < 20) {
@@ -1109,6 +1122,23 @@ object HeaderOverlay {
                             // 原因（标志本身照常即时跟踪，砸到
                             // wrapper 上的跳变由斜率封顶吸收）。
                             logFn("header container visible -> $v")
+                        }
+                        if (v) {
+                            // 场景激活同步断言（v2.0.23）：宿主正是
+                            // 在这次翻转前后把原头部子视图重新置
+                            // 可见（下拉头两帧同框漏出的源头）——
+                            // 不等预抽/布局，在翻转的同一调用栈里
+                            // 先压回去，再让跟随变换把 wrapper 亮
+                            // 出来。
+                            val snapshot = synchronized(states) { states.values.toList() }
+                            for (s in snapshot) {
+                                if (s.suspended) continue
+                                try {
+                                    hideComposeChildren(s.header, s, "funnel")
+                                } catch (t: Throwable) {
+                                    // 断言失败不许影响宿主动画
+                                }
+                            }
                         }
                         applyComposedToAllStates()
                     }
@@ -1854,6 +1884,8 @@ object HeaderOverlay {
             // 垂直偏移同步（v2.0.7）：先于 applyHeight，跟随高度按
             // 含偏移的内容下缘算（量不到环境时留待布局回调补）
             applyVerticalOffset(st, stamp)
+            // 水平偏移同步（v2.0.23）：与垂直同批应用
+            applyHorizontalOffset(st, stamp)
             applyHeight(header, st, stamp)
             // 避让补账（v2.0.7）：门控恢复与每次 attach 完成时主动
             // reconcile 一次——挂起期系统写过的栈顶值（挂起中拦截
@@ -1949,6 +1981,14 @@ object HeaderOverlay {
                 ) {
                     header.post {
                         if (st.wrapper != null) {
+                            // 布局帧断言（v2.0.23）：场景激活伴随
+                            // 布局，被改回可见的子视图在这里同帧
+                            // 压回；顺带核对预抽登记还跟在当前观
+                            // 察者上（头部重挂载会换观察者）。
+                            if (!st.suspended) {
+                                hideComposeChildren(header, st, "layout")
+                            }
+                            ensurePreDrawListener(header, st)
                             // 垂直偏移补同步（v2.0.7）：首次 attach 时
                             // 头部还没布局、量不到环境定不了偏移，
                             // 布局完成后在这里补；(主题, offsetDp)
@@ -1957,6 +1997,7 @@ object HeaderOverlay {
                             val stampNow = st.appliedStamp
                             if (stampNow != null && !st.suspended) {
                                 applyVerticalOffset(st, stampNow)
+                                applyHorizontalOffset(st, stampNow)
                                 applyHeight(header, st, stampNow)
                             }
                             alignOverlay(st)
@@ -1975,56 +2016,101 @@ object HeaderOverlay {
             header.addOnLayoutChangeListener(listener)
             st.layoutListener = listener
         }
-        // 帧频断言（v2.0.11）：每帧绘制前在头部的绘制通道上做
-        // 轻活（挂起期全跳过——挂起时原头部本就该可见）：
-        // ①重断言 Compose 子视图 INVISIBLE：宿主在下拉展开/
-        // 场景激活时会在帧频上把子视图重新置可见（或重建），
-        // 旧对策只有 attach 与 1 秒 tick 两次隐藏、闪烁最长达
-        // 一拍 tick；预抽在绘制前纠正，被改回的子视图根本不会
-        // 被画出来，不是轮询硬压（无帧就不跑、只在真不对时写）；
-        // ②二值收尾门联动 + 位图新鲜度（v2.0.21）：关落定同
-        // 帧藏 wrapper；位图过期先离屏重渲再贴，首显不等
-        // tick；③动画跟随的帧级采样（v2.0.12）：合成
-        // 变换里头部 View 自身的 translationX/Y 没有漏斗 hook
-        // 可抄（引擎直接写 View 属性），靠预抽逐帧采样补齐——
-        // 漏斗 hook 负责 alpha/容器偏移的即时同步，预抽负责
-        // View 平移的同帧对齐，两者写的都是同一组合成（见
-        // applyComposedTransform）；主 hook 没装上时退回
-        // v2.0.11 的比例换算兜底（仅页面切换）。
-        if (st.preDrawListener == null) {
-            val listener = ViewTreeObserver.OnPreDrawListener {
-                try {
-                    // teardown 已摘状态的监听必须失效（观察者合并
-                    // 后 remove 可能落空，靠注册校验兜底 inert）。
-                    val registered = synchronized(states) { states[header] === st }
-                    if (registered && !st.suspended && st.wrapper != null) {
-                        hideComposeChildren(header, st, fromPreDraw = true)
-                        // 二值收尾门帧频联动（v2.0.21）：宿主把头
-                        // 部本体撤下场景的那一帧，wrapper 同帧
-                        // GONE，不留收尾残影帧。
-                        applyWrapperVisibility(st)
-                        // 位图新鲜度（v2.0.21）：过期（>900ms 或
-                        // 尺寸不符）就在绘制前同步离屏重渲，本帧
-                        // 贴出的必然是完整成品；未过期零开销。
-                        val tv = st.themeView
-                        if (tv != null && header.width > 0 && tv.refreshContent()) {
-                            tv.invalidate()
-                        }
-                        if (animFollowHookActive) {
-                            applyComposedTransform(st)
-                        } else if (pageSwitching) {
-                            applyFallbackFollow(st)
-                        }
-                    }
-                } catch (t: Throwable) {
-                    // 断言失败不许影响宿主绘制
-                }
-                true
-            }
-            header.viewTreeObserver.addOnPreDrawListener(listener)
-            st.preDrawListener = listener
-        }
+        // 帧频断言（v2.0.11；登记方式 v2.0.23 改，见
+        // ensurePreDrawListener）：每帧绘制前在头部的绘制通道
+        // 上做轻活（挂起期全跳过——挂起时原头部本就该可见）：
+        // ①重断言 Compose 子视图 INVISIBLE；②二值收尾门联动
+        // + 位图新鲜度（v2.0.21）；③动画跟随的帧级采样
+        // （v2.0.12，头部 View 自身平移靠预抽逐帧采样补齐；
+        // 主 hook 没装上时退回 v2.0.11 的比例换算兜底）。
+        ensurePreDrawListener(header, st)
         mountOverlay(header, st)
+    }
+
+    /** 预抽监听本体（职责见 ensureWrapper 里的登记点注释）。 */
+    private fun createPreDrawListener(
+        header: ViewGroup,
+        st: State,
+    ): ViewTreeObserver.OnPreDrawListener {
+        return ViewTreeObserver.OnPreDrawListener {
+            try {
+                // teardown 已摘状态的监听必须失效（观察者合并
+                // 后 remove 可能落空，靠注册校验兜底 inert）。
+                val registered = synchronized(states) { states[header] === st }
+                if (registered && !st.suspended && st.wrapper != null) {
+                    hideComposeChildren(header, st, "predraw")
+                    // 二值收尾门帧频联动（v2.0.21）：宿主把头
+                    // 部本体撤下场景的那一帧，wrapper 同帧
+                    // GONE，不留收尾残影帧。
+                    applyWrapperVisibility(st)
+                    // 位图新鲜度（v2.0.21）：过期（>900ms 或
+                    // 尺寸不符）就在绘制前同步离屏重渲，本帧
+                    // 贴出的必然是完整成品；未过期零开销。
+                    val tv = st.themeView
+                    if (tv != null && header.width > 0 && tv.refreshContent()) {
+                        tv.invalidate()
+                    }
+                    if (animFollowHookActive) {
+                        applyComposedTransform(st)
+                    } else if (pageSwitching) {
+                        applyFallbackFollow(st)
+                    }
+                }
+            } catch (t: Throwable) {
+                // 断言失败不许影响宿主绘制
+            }
+            true
+        }
+    }
+
+    /**
+     * 预抽监听的登记与跟随（v2.0.23）：旧版只在 attach 时往
+     * 当时的 header.viewTreeObserver 上登记一次——头部被宿主
+     * 重挂载/重排父级后，当前窗口观察者可能已经换人，旧登记
+     * 落在被弃置的观察者上、监听静默失效（v2.0.21 真机日志
+     * 里 re-hidden 全程零出现、录屏却有实打实的同框漏出，
+     * 与此互为印证）。本版：登记时记下观察者实例；每次调用
+     * 时若当前观察者与登记不符（或头部刚 detach 过、引用被
+     * 清），就把同一监听迁到当前观察者上。调用点：attach、
+     * 布局回调、tick——都是头部确定在窗内的时机。
+     */
+    private fun ensurePreDrawListener(header: ViewGroup, st: State) {
+        if (st.headerAttachListener == null) {
+            val al = object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(v: View) {}
+                override fun onViewDetachedFromWindow(v: View) {
+                    st.preDrawObserver = null
+                }
+            }
+            try {
+                header.addOnAttachStateChangeListener(al)
+                st.headerAttachListener = al
+            } catch (t: Throwable) {
+                // 装不上就靠布局/tick 的观察者比对兜底
+            }
+        }
+        val observer = try {
+            header.viewTreeObserver
+        } catch (t: Throwable) {
+            return
+        }
+        if (st.preDrawListener != null && st.preDrawObserver === observer) return
+        val listener = st.preDrawListener
+            ?: createPreDrawListener(header, st).also { st.preDrawListener = it }
+        val old = st.preDrawObserver
+        if (old != null && old !== observer) {
+            try {
+                old.removeOnPreDrawListener(listener)
+            } catch (t: Throwable) {
+                // 旧观察者已失效就算了
+            }
+        }
+        try {
+            observer.addOnPreDrawListener(listener)
+            st.preDrawObserver = observer
+        } catch (t: Throwable) {
+            // 登记失败不致命：漏斗/门/布局三处同步断言兜底
+        }
     }
 
     /**
@@ -2185,10 +2271,27 @@ object HeaderOverlay {
         }
     }
 
+    /**
+     * 把头部本体（Compose 子视图）压回 INVISIBLE。[path] 标记
+     * 本次纠正是哪条断言路径抓到的（predraw/layout/funnel/
+     * gate）：带 path 的调用会留证——那是帧频上被宿主改回可见
+     * 的实锤；attach/tick 的常规隐藏（path=null）含首次挂载与
+     * 挂起恢复等正常场景，不计数、免得挤占留证名额。覆盖层已
+     * 完整挂载过（appliedStamp 非空）才算数，有界记前 10 次。
+     *
+     * v2.0.23 为什么加这么多路径：v2.0.11 起的预抽断言在真机
+     * 日志里「compose child re-hidden」全程零出现，而 v2.0.20
+     * 与 v2.0.21 两份录屏里原头部时钟都在下拉头两帧实打实
+     * 漏出——断言要么没在跑、要么抓不到那一帧。故本版把断言
+     * 铺到场景激活的每个同步点（漏斗翻转、收尾门开门、布局
+     * 回调、预抽），并给预抽登记加观察者跟随（头部重挂载会
+     * 换 ViewTreeObserver，旧登记可能落在弃置的观察者上）；
+     * 哪条路径抓到、日志里带 path 一看便知。
+     */
     private fun hideComposeChildren(
         header: ViewGroup,
         st: State,
-        fromPreDraw: Boolean = false,
+        path: String? = null,
     ) {
         val wrapper = st.wrapper ?: return
         for (i in 0 until header.childCount) {
@@ -2196,18 +2299,12 @@ object HeaderOverlay {
             if (child !== wrapper && child.visibility != View.INVISIBLE) {
                 val was = child.visibility
                 child.visibility = View.INVISIBLE
-                // 同框核查留证（v2.0.11）：只记预抽路径纠正到的
-                // ——那是帧频上被宿主改回可见的实锤（attach/tick
-                // 的隐藏含首次挂载与挂起恢复等正常场景，不计数，
-                // 免得挤占留证名额）；覆盖层已完整挂载过
-                // （appliedStamp 非空）才算数，有界记前 10 次
-                // （子视图类名与原可见性），供真机日志定案。
-                if (fromPreDraw && st.appliedStamp != null &&
+                if (path != null && st.appliedStamp != null &&
                     st.childCorrectionLogCount < 10
                 ) {
                     st.childCorrectionLogCount++
                     logFn(
-                        "compose child re-hidden #${st.childCorrectionLogCount}: " +
+                        "compose child re-hidden #${st.childCorrectionLogCount} via $path: " +
                             "${child.javaClass.name} was vis=$was"
                     )
                 }
@@ -2283,6 +2380,47 @@ object HeaderOverlay {
         logFn(
             "overlay vertical offset: setting=${stamp.offsetDp}dp " +
                 "want=${wantPx}px applied=$dy rawTop=$rawTop"
+        )
+    }
+
+    /**
+     * 水平偏移同步（v2.0.23）：与垂直偏移同构。把 stamp 的
+     * offsetXDp 换算成 px 写入渲染器：先以 offsetX=0 量一遍
+     * 内容簇的左/右缘，生效值钳制为簇不移出画布——左移不超
+     * 簇左缘（左缘 ≥ 0）、右移不超画布宽减簇右缘（右缘 ≤
+     * 画布宽）；簇比画布还宽时右界收敛到左界、优先保左缘。
+     * 只在 (主题, offsetXDp) 变化或尚未成功应用时才量测。
+     */
+    private fun applyHorizontalOffset(st: State, stamp: StampStore.Stamp) {
+        if (st.appliedOffsetXDp == stamp.offsetXDp &&
+            st.offsetXThemeId == stamp.themeId
+        ) {
+            return
+        }
+        val r = st.renderer
+        if (!r.isLoaded) return
+        val env = buildEnv(st) ?: return
+        val density = st.header.resources.displayMetrics.density
+        val wantPx = stamp.offsetXDp * density
+        r.offsetXPx = 0f
+        r.measureContentBottom(env)
+        val rawLeft = r.contentLeftPx
+        val rawRight = r.contentRightPx
+        val canvasW = env.screenWidthPx.toFloat()
+        val dx = if (rawLeft == Float.MAX_VALUE || canvasW <= 0f) {
+            wantPx
+        } else {
+            val minDx = -rawLeft
+            val maxDx = (canvasW - rawRight).coerceAtLeast(minDx)
+            wantPx.coerceIn(minDx, maxDx)
+        }
+        r.offsetXPx = dx
+        r.measureContentBottom(env)
+        st.appliedOffsetXDp = stamp.offsetXDp
+        st.offsetXThemeId = stamp.themeId
+        logFn(
+            "overlay horizontal offset: setting=${stamp.offsetXDp}dp " +
+                "want=${wantPx}px applied=$dx rawLeft=$rawLeft rawRight=$rawRight"
         )
     }
 
@@ -2703,6 +2841,10 @@ object HeaderOverlay {
             weather = WeatherSource.vars(),
             screenWidthPx = w,
             screenHeightPx = screenHeightPx(st.header),
+            // 星期编号模式按主题下发（v2.0.23，戳记第 10 行）：
+            // 当前主题在设置里切了「周一起算」才换算，默认周日
+            // 起算与引擎原口径一致。
+            weekdayMondayStart = st.appliedStamp?.weekdayMondayStart ?: false,
         )
     }
 
@@ -2815,6 +2957,7 @@ object HeaderOverlay {
                         attach(st.header)
                     } else {
                         hideComposeChildren(st.header, st)
+                        ensurePreDrawListener(st.header, st)
                         st.appliedStamp?.let { applyHeight(st.header, st, it) }
                         // 每秒把覆盖层 bounds 与头部重新对齐一次
                         alignOverlay(st)

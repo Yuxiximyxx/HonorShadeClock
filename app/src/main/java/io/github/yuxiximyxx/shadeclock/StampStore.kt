@@ -15,7 +15,7 @@ import java.util.zip.ZipFile
  * （manifest.xml + 资产 + fonts/）在设置页迁移打包前仍可经
  * [themeEntry] 兜底读取。目录根放 .nomedia 兜底防图库扫描。
  *
- * stamp.txt 格式（8 行）：themeId / stamp / heightMode / topStyle /
+ * stamp.txt 格式（10 行）：themeId / stamp / heightMode / topStyle /
  * showBackground（1=画主题整幅背景图、0=不画，v2.0.3 加；旧 4 行
  * 文件缺此行时按 0 处理，与设置页开关默认关一致）/
  * showWidgets（1=画温度/风向/电量数据小模块、0=不画，v2.0.5 加；
@@ -23,7 +23,17 @@ import java.util.zip.ZipFile
  * offsetDp（覆盖层垂直偏移，整数 dp，负值上移，v2.0.7 加；
  * 旧 6 行文件缺此行时按 0 处理）/
  * hideCarrier（1=隐藏运营商文字、0=不隐藏，v2.0.8 加；设置页
- * 开关默认开，旧 7 行文件缺此行时按 1 处理，与默认一致）。
+ * 开关默认开，旧 7 行文件缺此行时按 1 处理，与默认一致）/
+ * offsetXDp（覆盖层水平偏移，整数 dp，负值左移、正值右移，
+ * v2.0.23 加；旧 8 行文件缺此行时按 0 处理）/
+ * weekdayMondayStart（选中主题的星期编号模式，1=周一起算、
+ * 0=周日起算，v2.0.23 加；按主题记，设置侧写戳记时取当前
+ * 选中主题的那一份下发。两个已知主题的 XML 都只有
+ * srcid="#day_of_week" 一句、不声明编号口径，渲染器无法
+ * 自动分辨，只能按主题存一份；旧 9 行文件缺此行时按 0
+ * 处理，即引擎原口径周日=1，AAA 这类周日=1 编号的主题
+ * 默认即对）。前 9 行与旧版逐行同义，新行只追加在末尾
+ * ——新旧两版交叉读写不串位。
  * SystemUI 侧每次覆盖层挂载与每秒 tick 比对文件 mtime 与内容，
  * 变了就重解析主题、重载位图——切换主题免强停系统界面。
  *
@@ -47,6 +57,10 @@ object StampStore {
     /** 覆盖层垂直偏移范围（dp）：负值上移、正值下移（v2.0.7）。 */
     const val OFFSET_DP_MIN = -120
     const val OFFSET_DP_MAX = 40
+
+    /** 覆盖层水平偏移范围（dp）：负值左移、正值右移，对称（v2.0.23）。 */
+    const val OFFSET_X_DP_MIN = -120
+    const val OFFSET_X_DP_MAX = 120
 
     /** MediaStore 相对目录（无首尾斜杠）。 */
     const val STAMP_REL_DIR = "Download/HonorShadeClock"
@@ -76,6 +90,10 @@ object StampStore {
         val offsetDp: Int = 0,
         /** 是否隐藏运营商文字（锁屏/控制中心/通知中心三处）；默认 true（设置页开关默认开，v2.0.8）。 */
         val hideCarrier: Boolean = true,
+        /** 覆盖层水平偏移（dp，负值左移、正值右移）；默认 0（v2.0.23）。 */
+        val offsetXDp: Int = 0,
+        /** 选中主题的星期编号是否按周一起算；默认 false=周日起算（引擎原口径，v2.0.23）。 */
+        val weekdayMondayStart: Boolean = false,
     )
 
     fun themeDir(id: String): File = File(THEMES_DIR, id)
@@ -117,11 +135,15 @@ object StampStore {
         showWidgets: Boolean,
         offsetDp: Int,
         hideCarrier: Boolean,
+        offsetXDp: Int = 0,
+        weekdayMondayStart: Boolean = false,
     ): String =
         "$themeId\n$stamp\n$heightMode\n$topStyle\n" +
             "${if (showBackground) 1 else 0}\n${if (showWidgets) 1 else 0}\n" +
             "${offsetDp.coerceIn(OFFSET_DP_MIN, OFFSET_DP_MAX)}\n" +
-            "${if (hideCarrier) 1 else 0}\n"
+            "${if (hideCarrier) 1 else 0}\n" +
+            "${offsetXDp.coerceIn(OFFSET_X_DP_MIN, OFFSET_X_DP_MAX)}\n" +
+            "${if (weekdayMondayStart) 1 else 0}\n"
 
     // ---- 戳记多候选取胜（v2.0.19）----
     // 设置 App 经 MediaStore 写 stamp.txt：应用被卸载重装后，
@@ -162,6 +184,12 @@ object StampStore {
             // 第 8 行缺失（v2.0.7 及更旧 stamp）按开处理，与开关默认开一致；
             // 只有明确写 0 才是不隐藏
             hideCarrier = lines.getOrNull(7) != "0",
+            // 第 9 行缺失（v2.0.22 及更旧 stamp）按 0 处理
+            offsetXDp = (lines.getOrNull(8)?.toIntOrNull() ?: 0)
+                .coerceIn(OFFSET_X_DP_MIN, OFFSET_X_DP_MAX),
+            // 第 10 行缺失（v2.0.22 及更旧 stamp）按周日起算处理，
+            // 与引擎原口径一致；只有明确写 1 才是周一起算
+            weekdayMondayStart = lines.getOrNull(9) == "1",
         )
     }
 
