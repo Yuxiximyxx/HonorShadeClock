@@ -693,22 +693,79 @@ object HeaderOverlay {
         var gateLogCount = 0
         /** 二值收尾门上次应用的判定（null=尚未应用），翻转才记日志/刷新。 */
         var gateClosed: Boolean? = null
+        /** 面板本体（头部祖先 NotificationPanelView）与展开比例字段句柄（v2.0.22 收尾门用，懒定位、定位失败保持 null 走旧口径）。 */
+        var panelView: View? = null
+        var panelFractionField: java.lang.reflect.Field? = null
+        var panelFractionLookupDone = false
     }
 
     /**
-     * 二值收尾门（v2.0.21）：面板是否已「关落定」。判据取宿主
-     * 自己的两个落定事实——容器可见标志已被写 false（关闭动
-     * 画落定的收尾信号，v2.0.16 反编译核实其 false 写入点只
-     * 在关闭落定），且头部本体已非 VISIBLE（关闭态 diag 实
-     * 证 vis=4）。单用任一条都不可靠：可见标志在过渡期会翻
-     * 转（v2.0.14/17 实证），但那些翻转段里头部本体是
-     * VISIBLE 的（面板开着），合取后不会误关；页面切换期整
-     * 门豁免（横滑跟随是 v2.0.11 确认好的行为，落定到控制
-     * 中心由控制中心门控挂起、不靠这道门）。
+     * 面板展开比例（v2.0.22）：头部祖先 NotificationPanelView
+     * 的祖类 PanelView 字段 mExpandedFraction（反编译核实存
+     * 在：PanelView 是 HwPanelView 的父类、NotificationPanelView
+     * 的祖父类）——0=面板完全收起、>0=展开中/已展开。它是物
+     * 理量：宿主在关落定后给下次打开做的状态复位（容器可见
+     * 标志写回 true、两路 alpha 写回 1）不会动它。祖先或字段
+     * 读不到时返回 null，收尾门退回 v2.0.21 口径（fail-open、
+     * 不劣化）。
      */
-    private fun shadeSettledClosed(st: State): Boolean =
-        !pageSwitching && !shadeContainerVisible &&
+    private fun panelExpandedFraction(st: State): Float? {
+        return try {
+            var panel = st.panelView
+            if (panel == null) {
+                var v: View? = st.header.parent as? View
+                while (v != null) {
+                    if (v.javaClass.name == PANEL_CLASS_NAME) {
+                        panel = v
+                        break
+                    }
+                    v = v.parent as? View
+                }
+                if (panel == null) return null
+                st.panelView = panel
+            }
+            if (!st.panelFractionLookupDone) {
+                st.panelFractionLookupDone = true
+                st.panelFractionField = try {
+                    XposedHelpers.findField(panel.javaClass, "mExpandedFraction")
+                } catch (t: Throwable) {
+                    null
+                }
+            }
+            val field = st.panelFractionField ?: return null
+            (field.get(panel) as? Number)?.toFloat()
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * 二值收尾门（v2.0.21 立、v2.0.22 换判据）：面板是否已
+     * 「关落定」。v2.0.21 的判据是宿主两个落定事实的合取
+     * （容器可见标志=false 且头部本体非 VISIBLE），真机日志
+     * （v2.0.21 会话）证明它被宿主的关后复位击穿：每次关闭
+     * 落定后宿主都把容器可见标志写回 true（给下次打开备的
+     * 初值，alpha 同步复位 1），门随即按「open」把 wrapper
+     * 顶回 VISIBLE——面板已关、样式却以 VISIBLE+alpha=1 留
+     * 在通知栏窗口里，窗口收尾合成未完的那几帧就直接闪到
+     * 桌面上（真机录屏：桌面已干净一帧后时钟簇原位全不透
+     * 明重现约 6 帧、随后随窗口隐藏消失）。v2.0.22 改判物
+     * 理量：展开比例读得到时，收尾门只认它——比例为 0 即
+     * 关落定，复位写什么都不许重开；比例 >0（下拉第一帧面
+     * 板已开始展开、窗口才会被合成）即按开处理，与
+     * v2.0.21「第一帧就是成品」的开侧口径衔接（重开时
+     * applyWrapperVisibility 照旧先刷新位图）。读不到比例
+     * 时退回 v2.0.21 合取口径。页面切换期整门豁免（横滑跟
+     * 随是 v2.0.11 确认好的行为，落定到控制中心由控制中
+     * 心门控挂起、不靠这道门）。
+     */
+    private fun shadeSettledClosed(st: State): Boolean {
+        if (pageSwitching) return false
+        val fraction = panelExpandedFraction(st)
+        if (fraction != null) return fraction <= 0f
+        return !shadeContainerVisible &&
             st.header.visibility != View.VISIBLE
+    }
 
     /**
      * 按二值收尾门应用 wrapper 可见性（预抽帧频、漏斗 hook、
@@ -738,7 +795,8 @@ object HeaderOverlay {
                 st.gateLogCount++
                 logFn(
                     "overlay gate: ${if (closed) "settled-closed -> wrapper GONE" else "open -> wrapper VISIBLE"} " +
-                        "(visFlag=$shadeContainerVisible, headerVis=${st.header.visibility})"
+                        "(visFlag=$shadeContainerVisible, headerVis=${st.header.visibility}, " +
+                        "expF=${panelExpandedFraction(st)})"
                 )
             }
         }
@@ -2844,6 +2902,7 @@ object HeaderOverlay {
                 "alpha=${tv?.alpha} drawCalls=${tv?.drawCalls} " +
                 "renders=${tv?.renderCount} " +
                 "gate=${if (shadeSettledClosed(st)) "closed" else "open"} " +
+                "expF=${panelExpandedFraction(st)} " +
                 "drawn=${tv?.lastDrawnElements} envNull=${tv?.lastEnvMissing} | " +
                 "bgShown=${st.appliedStamp?.showBackground} | " +
                 "mountBounds=${st.mountBounds?.joinToString(",")}"

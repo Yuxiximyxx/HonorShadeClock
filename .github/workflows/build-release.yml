@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.21-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.22-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.21-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.22-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,36 +68,26 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.21
-          name: HonorShadeClock 2.0.21 — 改名「通知中心主题」+ 偏移按主题记 + 进出闪烁修（位图呈现与收尾门）
+          tag_name: v2.0.22
+          name: HonorShadeClock 2.0.22 — 返回时残余闪烁修（收尾门改认面板展开量）
           body: |
-            ## HonorShadeClock 2.0.21
+            ## HonorShadeClock 2.0.22
 
-            改名：模块显示名改为「通知中心主题」（包名不变，
-            原有设置与主题都不受影响）。另修两件事：
-
-            - 垂直偏移按主题记：以前偏移是全局一个值，各主
-              题的时钟簇位置不同套不住。现改为每个主题单独
-              记自己的偏移，设置页滑杆显示/修改的是当前选
-              中主题的那一份，切换主题时下发的就是那个主
-              题的值；旧的全局偏移已自动搬给当前主题作初
-              始值，不会丢。
-            - 进出通知中心闪烁：2.0.20 的日志定案——全部
-              采样里覆盖层 alpha 恒为 1.0，录屏也是整幅
-              有/无的跳变，闪烁不是 alpha 的问题。开侧是
-              内容没画好：首绘靠布局/每秒刷新链驱动，下拉
-              太快时跟不上，落定后才整幅跳出；关侧是宿主
-              关完把原头部藏了、覆盖层没跟着藏，最后几帧
-              独自压在桌面上。本版：内容改为先离屏渲成成
-              品图、显示时只贴图，下拉第一帧就是加载好的
-              完整样式；关闭落定时覆盖层与原头部同帧撤
-              下，不再残留。横滑切换通知/控制中心的跟随
-              与三道门控（锁屏/控制中心/横幅）未动。
+            只修一件事：从通知中心返回（收起面板）时还残
+            余的那一下闪烁。2.0.21 的日志定案：每次关闭落
+            定后，系统都会把头部状态复位成下次打开的初值
+            （可见标志写回 true、透明度写回 1），上一版的
+            收尾门把这当成「打开」，又把样式顶回可见——
+            面板明明关了，样式却留在通知栏窗口里，窗口收
+            尾的那几帧就闪到了桌面上。本版收尾门改认面板
+            的实际展开量：面板完全收起就是关，复位写什么
+            都不许重开；下拉时展开量一动就照常第一帧出成
+            品图。打开侧呈现、横滑切换跟随、三道门控、通
+            知避让、主题与偏移逻辑全部未动。
 
             生效方式：覆盖安装 → 打开一次设置页 → 用
-            「重启系统界面」按钮重载 → 连续下拉多次确认
-            时钟第一帧就在、收起后桌面干净；两个主题各
-            调一次偏移、来回切换确认各自记住。
+            「重启系统界面」按钮重载 → 反复下拉、收起多
+            次，确认收起后桌面不再闪出时钟样式。
             关闭办法：在 LSPosed 里停用模块再重启一次
             系统界面，即恢复原样。
           files: dist/*.apk
