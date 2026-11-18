@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.25-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.26-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.25-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.26-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,36 +68,33 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.25
-          name: HonorShadeClock 2.0.25 — 返回闪烁再修（开门时间确认） + 设置页改 MIUI 式二级页面
+          tag_name: v2.0.26
+          name: HonorShadeClock 2.0.26 — 紧急热修：v2.0.25 覆盖层全不显示（开门确认死锁）
           body: |
-            ## HonorShadeClock 2.0.25
+            ## HonorShadeClock 2.0.26
 
-            两件事：
+            紧急热修：v2.0.25 装上后覆盖层任何主题都不
+            显示、通知中心只剩原头部。本版只修这一处，
+            其余行为与 2.0.25 完全一致。
 
-            1. 返回（收起）闪烁再修：v2.0.24 的日志定
-            案——上一版的「收尾早关」其实触发成功了（在
-            面板还没收完时就与原头部同刻撤下），但面板
-            完全收起后系统做状态复位时把展开比例一次性
-            打回了满值，模块把这一瞬间的读数误判成「手
-            势反转重开」，又把整簇贴回了桌面约一帧。本
-            版给开门加了时间确认：重新打开的判定须持续
-            成立约半帧才算数，一次性的读数尖峰等不到确
-            认就回落；真实下拉与收起中途反手再拉都是持
-            续过程，只迟约一帧、第一帧仍是加载好的成品
-            图。打开侧其余行为、横滑跟随、三道门控、通
-            知避让均未动。
+            根因（日志+代码定案）：2.0.25 给开门加的时
+            间确认有个自清零的写法——确认起点刚记下，
+            同一次判定末尾就被一句无条件清零抹掉，每次
+            判定都从零重记，永远等不到「持续成立约半
+            帧」的第二发，面板一关上、门就再也打不开
+            （其余环节——挂载、主题加载、设置——都正
+            常，所以设置页看着一切正常、通知中心却没
+            有样式）。
 
-            2. 设置页改 MIUI 式二级页面：上一版的自研
-            折叠分组撤掉（miuix 本身也没有官方折叠组
-            件）。主页只留说明卡、一列分组入口与常显的
-            「重启系统界面」；主题管理、位置、显示与开
-            关、原系统头部、说明各自点进独立子页（顶部
-            返回、卡片分组、全套 miuix 组件）。所有设置
-            项与原有行为不变。
+            本版修法：清零只认判定本身回到「关」，确
+            认被摁住的那一发不再自清起点；同时确认起
+            点一落就排一发约半帧后的自动复评，确认的
+            完成由时间驱动、不依赖下一次判定何时自然
+            到来。防一次性读数尖峰的本意保留：尖峰回
+            落时确认即作废，不会误开。
 
-            生效方式：覆盖安装 → 打开一次设置页 → 用
-            「重启系统界面」按钮重载 → 下拉确认。
+            生效方式：覆盖安装 → 打开一次设置页 →
+            用「重启系统界面」按钮重载 → 下拉确认。
             关闭办法：在 LSPosed 里停用模块再重启一次
             系统界面，即恢复原样。
           files: dist/*.apk
