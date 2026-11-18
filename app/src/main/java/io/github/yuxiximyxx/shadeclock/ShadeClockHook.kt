@@ -1,6 +1,9 @@
 package io.github.yuxiximyxx.shadeclock
 
 import android.content.res.XResources
+import android.os.Handler
+import android.os.Looper
+import android.os.Process
 import android.util.TypedValue
 import android.view.View
 import de.robv.android.xposed.IXposedHookInitPackageResources
@@ -150,11 +153,67 @@ class ShadeClockHook : IXposedHookLoadPackage, IXposedHookInitPackageResources {
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != TARGET_PACKAGE) return
-        diag("=== HonorShadeClock v2.0.11 loaded in $TARGET_PACKAGE ===")
+        diag("=== HonorShadeClock v2.0.12 loaded in $TARGET_PACKAGE ===")
         installDimenDiagnostic(lpparam)
         HeaderOverlay.install(lpparam) { message -> diag(message) }
         // 隐藏运营商文字（v2.0.8）：与覆盖层相互独立，原头部模式下同样生效
         CarrierHider.install(lpparam) { message -> diag(message) }
+        // 设置页「重启系统界面」按钮的看守（v2.0.12）：进程级轮询
+        // restart.txt，与覆盖层是否挂载无关（原头部模式下字号改动
+        // 正是最需要重启的场景）。
+        installRestartWatcher()
+    }
+
+    /**
+     * 重启看守（v2.0.12）：SystemUI 进程主线程每 800ms 瞄一眼
+     * restart.txt。设置页点「重启系统界面」时把请求时刻（epoch
+     * 毫秒）写进该文件；看守只认**本进程启动之后**的请求（进程
+     * 启动时刻在看守安装时记下）——上一代进程没来得及消费的残
+     * 留时间戳必然早于本进程启动，不会把新进程再杀一遍。命中
+     * 后先把文件覆写为已消费（双保险），记一行日志，再结束
+     * 自己进程：SystemUI 是常驻应用、会被系统立即拉起，模块
+     * 随新进程重新加载，等同强停系统界面，全程不依赖 root。
+     * 检查本身只是一次小文件读，失败只记一行、不停看守。
+     */
+    private fun installRestartWatcher() {
+        try {
+            val processStartMs = System.currentTimeMillis()
+            val handler = Handler(Looper.getMainLooper())
+            var handledMs = 0L
+            var staleCleaned = false
+            val watcher = object : Runnable {
+                override fun run() {
+                    try {
+                        val reqMs = StampStore.readRestartRequestMs()
+                        if (reqMs != null && reqMs > 0L && reqMs != handledMs) {
+                            if (reqMs > processStartMs) {
+                                handledMs = reqMs
+                                StampStore.consumeRestartRequest()
+                                diag(
+                                    "restart requested from settings (ts=$reqMs), " +
+                                        "killing SystemUI process now"
+                                )
+                                Process.killProcess(Process.myPid())
+                                return
+                            }
+                            if (!staleCleaned) {
+                                // 残留的旧请求：清掉，免得每 800ms 重读
+                                staleCleaned = true
+                                StampStore.consumeRestartRequest()
+                                diag("stale restart request ignored and cleared (ts=$reqMs)")
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        diag("restart watcher check failed: ${t.javaClass.name}: ${t.message}")
+                    }
+                    handler.postDelayed(this, 800L)
+                }
+            }
+            handler.postDelayed(watcher, 800L)
+            diag("restart watcher installed (settings -> restart.txt -> self kill)")
+        } catch (t: Throwable) {
+            diag("restart watcher install failed: ${t.javaClass.name}: ${t.message}")
+        }
     }
 
     /**

@@ -55,7 +55,10 @@ import top.yukonga.miuix.kmp.theme.ThemeController
  * 管理（导入/切换/删除）、区域高度三档、字号滑杆（原头部模式）；
  * v2.0.7 加「垂直偏移」滑杆（-120dp～+40dp，覆盖层整体上下移，
  * 经 stamp 第 7 行传 SystemUI 侧）；v2.0.8 加「隐藏运营商文字」
- * 开关（默认开，stamp 第 8 行，锁屏/控制中心/通知中心三处统管）。
+ * 开关（默认开，stamp 第 8 行，锁屏/控制中心/通知中心三处统管）；
+ * v2.0.12 加「重启系统界面」按钮（写 restart.txt 请求标记，
+ * SystemUI 侧看守读到后结束自己进程被系统拉起，等同强停、
+ * 不依赖 root，省得每次验版手动强停）。
  * 覆盖层相关设置经 stamp.txt（公共 Download 目录）传给 SystemUI
  * 侧，切换免强停；字号仍走 SharedPreferences「settings」，由 hook
  * 侧在 SystemUI 进程启动时经 XSharedPreferences 读取。
@@ -144,6 +147,7 @@ private fun SettingsScreen() {
                 .coerceIn(StampStore.OFFSET_DP_MIN, StampStore.OFFSET_DP_MAX)
         )
     }
+    var restartStatus by remember { mutableStateOf("") }
     var themes by remember { mutableStateOf(ThemeStore.loadThemes(prefs)) }
     var selectedThemeId by remember {
         mutableStateOf(prefs.getString(ThemeStore.KEY_SELECTED_THEME, "") ?: "")
@@ -256,6 +260,30 @@ private fun SettingsScreen() {
         }
     }
 
+    /**
+     * 「重启系统界面」（v2.0.12）：把请求时刻写进 restart.txt，
+     * SystemUI 侧看守在 1 秒内读到后结束自己进程、被系统拉起，
+     * 模块随之重新加载——等同强停系统界面，不依赖 root。点了
+     * 立即给反馈、不弹确认框：动作只影响系统界面本身、一两秒
+     * 自行恢复，符合少打扰口径。
+     */
+    fun requestRestart() {
+        restartStatus = "已发送重启请求，系统界面马上会重启（通知栏会闪断一两秒）"
+        scope.launch(Dispatchers.IO) {
+            val ok = PublicStore.writeFile(
+                context,
+                StampStore.STAMP_REL_DIR,
+                StampStore.RESTART_NAME,
+                System.currentTimeMillis().toString().toByteArray(Charsets.UTF_8),
+            )
+            if (!ok) {
+                withContext(Dispatchers.Main) {
+                    restartStatus = "发送失败，请再点一次"
+                }
+            }
+        }
+    }
+
     fun saveClockSize(value: Int) {
         if (value == clockSize) return
         clockSize = value
@@ -286,7 +314,7 @@ private fun SettingsScreen() {
                 .padding(innerPadding),
         ) {
             Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-                SmallTitle(text = "正式版 v2.0.8", insideMargin = PaddingValues(start = 4.dp))
+                SmallTitle(text = "正式版 v2.0.12", insideMargin = PaddingValues(start = 4.dp))
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     cornerRadius = 20.dp,
@@ -508,6 +536,52 @@ private fun SettingsScreen() {
                 }
 
                 SmallTitle(
+                    text = "系统界面",
+                    insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
+                )
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    cornerRadius = 20.dp,
+                    insideMargin = PaddingValues(vertical = 4.dp),
+                ) {
+                    Column {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { requestRestart() }
+                                .padding(horizontal = 16.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    "重启系统界面",
+                                    fontSize = 15.sp,
+                                    color = MiuixTheme.colorScheme.onSurface,
+                                )
+                                Text(
+                                    "等同强停系统界面：字号等需要重载的改动点它即可生效，不用去设置里强停",
+                                    fontSize = 13.sp,
+                                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                )
+                            }
+                            Text(
+                                "›",
+                                fontSize = 20.sp,
+                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            )
+                        }
+                        if (restartStatus.isNotEmpty()) {
+                            Text(
+                                restartStatus,
+                                fontSize = 13.sp,
+                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                            )
+                        }
+                    }
+                }
+
+                SmallTitle(
                     text = "说明",
                     insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
                 )
@@ -525,7 +599,7 @@ private fun SettingsScreen() {
                             color = MiuixTheme.colorScheme.onSurface,
                         )
                         Text(
-                            "字号滑杆只对原系统头部模式有效，改完需强停一次系统界面（或重启手机）。",
+                            "字号滑杆只对原系统头部模式有效，改完点上方「重启系统界面」即可生效（等同强停，不用重启手机）。",
                             fontSize = 14.sp,
                             color = MiuixTheme.colorScheme.onSurface,
                             modifier = Modifier.padding(top = 8.dp),

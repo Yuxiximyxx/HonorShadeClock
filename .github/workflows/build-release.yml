@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.11-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.12-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.11-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.12-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,37 +68,37 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.11
-          name: HonorShadeClock 2.0.11 — 下拉首显即时化 + 页面切换跟随
+          tag_name: v2.0.12
+          name: HonorShadeClock 2.0.12 — 面板开合跟随 + 重启系统界面按钮
           body: |
-            ## HonorShadeClock 2.0.11
+            ## HonorShadeClock 2.0.12
 
-            修 v2.0.10 真机录屏三点：下拉首显迟滞、
-            切换去程样式消失太突兀、回程要等落定才出现。
+            修 v2.0.11 真机剩余一点（通知中心↔控制
+            中心切换已确认做好）：通知中心与桌面之间
+            的开合过渡不跟随；另加设置页「重启系统
+            界面」按钮。
 
-            - 首显即时：模块加载阶段就在后台把主题
-              解析与整套图片预解码做完，下拉挂载时
-              零 IO 直接采纳；首轮刷新不再延迟 1 秒，
-              挂载完成当帧就排首绘。
-            - 切换跟随（撤掉 v2.0.10 的开始即整组
-              隐藏）：过渡期间覆盖层跟随通知页的逐帧
-              透明度与平移同步淡出/淡入——滑向控制
-              中心时随通知页一起淡出，滑回时一起淡
-              入；落定控制中心仍整组隐藏、落定回通
-              知页恢复完全不透明（终态门控不变）。
-            - 同框闪烁：原头部内容在下拉展开时会被
-              系统重新置可见、与覆盖层同框一帧——改
-              为每帧绘制前同频断言隐藏，闪烁不再
-              依赖 1 秒轮询纠正。
+            - 面板开合跟随：覆盖层改为常时抄原头部
+              的整套动画通道（两路透明度、容器可见
+              标志、容器根偏移），与页面切换共用同一
+              套合成——下拉打开时随面板一起淡入/就
+              位，上滑关闭时随面板一起淡出/离场，
+              面板全关后绝不残留在桌面上、全开时全
+              不透明。
+            - 设置页新增「重启系统界面」按钮（在
+              「系统界面」一节）：点一下系统界面在
+              一两秒内自动重启、模块重新加载，等同
+              强停，不依赖 root——改完字号等需要重
+              载的设置不用再去系统设置里强停了。
 
-            通知避让、运营商隐藏、铃铛删除、三道
-            终态门控（锁屏/控制中心落定/横幅）、
+            页面切换跟随、通知避让、运营商隐藏、
+            三道终态门控（锁屏/控制中心落定/横幅）、
             垂直偏移、主题背景图与小模块开关保持
             不变。
 
-            生效方式：覆盖安装 → 强停一次系统界面 →
-            下拉通知中心查看（主题与设置沿用已导入
-            状态，无需重导）。
+            生效方式：覆盖安装 → 强停一次系统界面
+            （这一次仍需手动，之后可用设置页里的
+            重启按钮）→ 下拉通知中心查看。
             关闭办法：在 LSPosed 里停用模块再强停一次
             系统界面，即恢复原样。
           files: dist/*.apk

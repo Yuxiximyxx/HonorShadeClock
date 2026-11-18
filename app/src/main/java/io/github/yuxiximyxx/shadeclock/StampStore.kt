@@ -21,6 +21,14 @@ import java.io.File
  * 开关默认开，旧 7 行文件缺此行时按 1 处理，与默认一致）。
  * SystemUI 侧每次覆盖层挂载与每秒 tick 比对文件 mtime 与内容，
  * 变了就重解析主题、重载位图——切换主题免强停系统界面。
+ *
+ * 同目录还有一个一次性标记文件 restart.txt（v2.0.12）：设置页
+ * 「重启系统界面」按钮把请求时刻（epoch 毫秒）写进去；SystemUI
+ * 侧的看守（ShadeClockHook 进程级轮询，与覆盖层是否挂载无关）
+ * 读到「本进程启动之后」的新请求就先把文件内容覆写为已消费，
+ * 再结束自己进程——SystemUI 是常驻应用、会被系统拉起，模块
+ * 随新进程重新加载，等同强停系统界面，不依赖 root。消费后
+ * 覆写 + 只认本进程启动后的时间戳，双保险防重启后重复触发。
  */
 object StampStore {
 
@@ -39,10 +47,12 @@ object StampStore {
     const val STAMP_REL_DIR = "Download/HonorShadeClock"
     const val THEMES_REL_DIR = "Download/HonorShadeClock/themes"
     const val STAMP_NAME = "stamp.txt"
+    const val RESTART_NAME = "restart.txt"
 
     val BASE_DIR = File("/sdcard/Download/HonorShadeClock")
     val THEMES_DIR = File(BASE_DIR, "themes")
     val STAMP_FILE = File(BASE_DIR, "stamp.txt")
+    val RESTART_FILE = File(BASE_DIR, "restart.txt")
 
     data class Stamp(
         val themeId: String,
@@ -107,5 +117,34 @@ object StampStore {
         if (STAMP_FILE.isFile) STAMP_FILE.lastModified() else 0L
     } catch (t: Throwable) {
         0L
+    }
+
+    /**
+     * SystemUI 侧读取重启请求（v2.0.12）：restart.txt 内容是设置页
+     * 写入的请求时刻（epoch 毫秒）；文件不存在/内容不是数字返回
+     * null（已消费的文件内容被覆写为 "0"，同样返回 null 语义的
+     * 0 值由调用方按「不晚于进程启动」判废）。
+     */
+    fun readRestartRequestMs(): Long? {
+        return try {
+            if (!RESTART_FILE.isFile) return null
+            RESTART_FILE.readText().trim().toLongOrNull()
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * SystemUI 侧消费重启请求：把 restart.txt 内容覆写为 "0"。
+     * 在结束进程之前调用——新进程读到的就是已消费内容，配合
+     * 「只认本进程启动之后的时间戳」双保险防重复触发。覆写失败
+     * 不抛（调用方该重启还是重启，时间戳判定仍能挡住新进程）。
+     */
+    fun consumeRestartRequest() {
+        try {
+            RESTART_FILE.writeText("0")
+        } catch (t: Throwable) {
+            // 尽力而为
+        }
     }
 }

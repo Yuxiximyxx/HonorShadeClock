@@ -23,6 +23,7 @@ import java.lang.ref.WeakReference
 import java.util.Calendar
 import java.util.WeakHashMap
 import kotlin.math.abs
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
@@ -291,6 +292,34 @@ import kotlin.math.roundToInt
  * ThemeView 尚无有效首绘（drawCalls=0 或 env 曾缺失）时顺手
  * invalidate，不用任何轮询硬压。
  *
+ * v2.0.12 修 v2.0.11 真机剩余一点：通知中心↔桌面的开合过渡
+ * 不跟随（打开时面板背景还没铺满、时钟簇已全不透明浮在桌面
+ * 时钟组件上方；关闭时面板往上收、时钟簇滞留原位全显压在桌
+ * 面上、直到面板收完才消失）。反编译定案（SystemUI 17.0.0.1
+ * 全量 jadx + 定点类核对）：头部动画的全部驱动最后都汇聚到
+ * NotifCenterHeaderInteractorImpl 的同一组漏斗——页面切换
+ * （setViewAlpha 同帧同值写 common+time 两路 alpha）、面板
+ * 开合 fling（HnStatusBarPullAnimImpl 的头部动画集：200ms
+ * 两路 alpha 开→1/关→0、448/360ms 写 containerTransitionY
+ * 内容根偏移）、卷帘跟踪与面板控制器动画器（两路 alpha 分
+ * 写、收尾靠 updateContainerVisible(false) 藏头部且 alpha
+ * 复位 1）。v2.0.11 只 hook 了 commonAlpha 一路且只在页面
+ * 切换期应用，开合通道全程被忽略、稳态自愈还把 alpha 拉回
+ * 1——这正是开合不跟随的成因。本版把跟随扩为常时统一合成：
+ * hook 五个漏斗方法跟踪 (commonAlpha, timeAlpha, visible,
+ * containerX, containerY)，wrapper 变换恒为：alpha＝
+ * visible ? min(两路 alpha) : 0（取小是保守合成：两路同写
+ * 时相等、分写时覆盖层永不比原头部任一元素更显眼；面板全
+ * 关后靠 visible=false 或 alpha=0 保证零残留）、translation
+ * ＝头部 View 自身平移＋容器根偏移（头部 View 平移无漏斗可
+ * 抄、由既有 OnPreDraw 逐帧采样补齐）。页面切换与面板开合
+ * 写的是同一组通道、合成只有一套，不存在两路打架；稳态跟
+ * 踪值恒为恒等变换。resetAnimState 内部即调两路 alpha 写 1、
+ * 方法级 hook 自然覆盖，不单独 hook。时钟单独的 timeScale/
+ * pivot（卷帘里状态栏时钟形变用）与 date/mgeBtn 分元素偏移
+ * 不抄：覆盖层是整簇单 View、原头部那是分元素形变，量级与
+ * 场景都对不上。
+ *
  * 设置经 StampStore 的 stamp.txt 跨进程传递；覆盖层挂载时与每秒
  * tick 比对戳记，变了就重解析重载——切换主题免强停。
  * 全路径 try-catch：构建/渲染任何异常都卸下覆盖层、恢复原头部、
@@ -371,7 +400,7 @@ object HeaderOverlay {
      * （notifySwipeStart / 引擎 swipeTo*）置位、落定信号
      * （notifyControlCenterPanelChange / notifySwipeCanceled）
      * 清位。v2.0.11 起置位期间不再挂起——覆盖层走跟随（逐帧
-     * alpha/平移同步，见 [installHeaderAlphaFollow]），本标志
+     * alpha/平移同步，见 [installHeaderAnimFollow]），本标志
      * 改作跟随窗口与终态门控（控制中心落定才硬挂起）的判定。
      * 落定页态仍以 controlCenterExpand 为准。
      */
@@ -386,25 +415,56 @@ object HeaderOverlay {
     @Volatile
     private var swipeControllerRef: WeakReference<Any>? = null
 
-    // 切换跟随（v2.0.11）：类名经反编译核实——通知头部的逐帧
-    // alpha 不走 View.alpha，而是 HnSwipeSwitchControllerImpl
-    // .setViewAlpha 对头部调 NotifCenterHeaderInteractor
-    // .updateAnimValueCommonAlpha(f) 驱动 Compose 状态（随指
-    // tracking 与松手 AnimatorSet 每一帧都经此 funnel）。
+    // 动画跟随（v2.0.11 切换跟随、v2.0.12 扩到面板开合）：类名
+    // 经反编译核实——通知头部的全部逐帧动画量都不走 View 属性，
+    // 而是经 NotifCenterHeaderInteractor 写进 Compose 状态：
+    // 页面切换引擎 HnSwipeSwitchControllerImpl.setViewAlpha、
+    // 下拉动画集 HnStatusBarPullAnimImpl、卷帘跟踪与面板控制器
+    // 的动画器，最后一律汇聚到该 interactor 的几个漏斗方法
+    // （updateAnimValueCommonAlpha / updateAnimValueTimeAlpha /
+    // updateContainerVisible / updateContainerTransitionX/Y）。
     private const val HEADER_INTERACTOR_IMPL_CLASS =
         "com.android.systemui.statusbar.notification.panelheader.NotifCenterHeaderInteractorImpl"
 
     /**
-     * 通知头部最近一帧的切换 alpha（[installHeaderAlphaFollow]
-     * 的 hook 逐帧更新；1=通知页完全在位）。只在 [pageSwitching]
-     * 期间被应用到 wrapper，其余时刻 wrapper 恒为不透明。
+     * 头部动画通道的跟踪值（[installHeaderAnimFollow] 的 hook 逐
+     * 帧更新，与 interactor 内 CombineAlpha 的初值对齐）：
+     * common/time 两路 alpha、容器可见标志、容器根偏移（px）。
+     * 覆盖层是普通 View、不在 Compose 状态里，靠抄这组值合成
+     * 与原头部一致的逐帧变换（见 [effectiveShadeAlpha] 与
+     * [applyComposedTransform]）。
      */
     @Volatile
-    private var headerAnimAlpha = 1f
+    private var shadeCommonAlpha = 1f
 
-    /** 跟随主路径（interactor alpha hook）是否装上；没装上时 OnPreDraw 走 translationX 采样兜底。 */
     @Volatile
-    private var followAlphaHookActive = false
+    private var shadeTimeAlpha = 1f
+
+    @Volatile
+    private var shadeContainerVisible = true
+
+    @Volatile
+    private var shadeContainerX = 0f
+
+    @Volatile
+    private var shadeContainerY = 0f
+
+    /** 跟随主路径（interactor 漏斗 hook）是否装上；没装上时 OnPreDraw 走 v2.0.11 的 translationX 采样兜底（仅页面切换）。 */
+    @Volatile
+    private var animFollowHookActive = false
+
+    /**
+     * 覆盖层应有的有效 alpha：容器不可见时恒 0（宿主收尾态就是
+     * 靠 visible=false 藏头部、alpha 反而复位 1——只抄 alpha 会
+     * 在面板全关后残留在桌面上）；可见时取两路 alpha 的较小者
+     * ——两路同写的场合（页面切换、下拉动画集）两者相等；卷帘
+     * 跟踪等只写一路的场合，取小保证覆盖层永不比原头部任一
+     * 元素更显眼（时钟与日期在原头部本就分路淡变，单 View 的
+     * 覆盖层只能取保守合成）。
+     */
+    private fun effectiveShadeAlpha(): Float =
+        if (!shadeContainerVisible) 0f
+        else min(shadeCommonAlpha, shadeTimeAlpha).coerceIn(0f, 1f)
 
     /** 预热好的主题（install 阶段后台线程 load + 位图预解码完成），attach 时按 (themeId, stamp) 吻合采纳。 */
     private class PreheatedTheme(
@@ -555,7 +615,7 @@ object HeaderOverlay {
         installPageSwitchGate(lpparam, log)
         installHeadsUpGate(lpparam, log)
         installStackWriteInterceptor(lpparam, log)
-        installHeaderAlphaFollow(lpparam, log)
+        installHeaderAnimFollow(lpparam, log)
         // 首显预热（v2.0.11）：进程启动就在后台把 stamp 读取与
         // 主题加载（解析/字体/位图预解码）做完，attach 零 IO。
         startPreheat()
@@ -600,64 +660,139 @@ object HeaderOverlay {
     }
 
     /**
-     * 切换跟随的逐帧进度源（v2.0.11）：hook
-     * NotifCenterHeaderInteractorImpl.updateAnimValueCommonAlpha
-     * (float)——反编译定案：HnSwipeSwitchControllerImpl 的
-     * setViewAlpha 对通知头部不设 View.alpha、只调这个方法把
-     * 每帧 alpha 写进 Compose 状态（随指 tracking() 里逐 MOVE
-     * 调、松手 AnimatorSet 的 update 监听里逐帧调，动画结束的
-     * onAnimationEnd 还会以终值各调一次）。after 里记录该值，
-     * 过渡期（[pageSwitching]）逐帧同步给各 State 的 wrapper：
-     * alpha＝该值、translationX＝头部本体当前 translationX
-     * （头部在切换中被引擎平移，覆盖层是同级视图、不跟随父级
-     * 以外的变换，须自己抄）。挂起中的 State 跳过（终态门控
-     * 优先）。hook 在宿主 UI 线程回调（动画/触摸都在主线程），
-     * 写 View 属性即同帧生效。装失败只记一行，OnPreDraw 的
-     * translationX 采样兜底自动接管（见 ensureWrapper）。
+     * 动画跟随的逐帧进度源（v2.0.11 切换跟随、v2.0.12 扩到面板
+     * 开合）：hook NotifCenterHeaderInteractorImpl 的五个漏斗
+     * 方法——反编译定案（SystemUI 17.0.0.1）：
+     * - 页面切换：HnSwipeSwitchControllerImpl.setViewAlpha 对
+     *   头部同帧同值写 common+time 两路 alpha；
+     * - 面板开合（fling/程序化）：HnStatusBarPullAnimImpl
+     *   .createNotificationCenterHeaderAnimatorSet 的 200ms 动画
+     *   器同帧同值写两路 alpha（开→1、关→0），448/360ms 动画器
+     *   写 updateContainerTransitionY（内容根偏移，px）；
+     * - 卷帘跟踪/手势收合：两路 alpha 分别被单独写，收尾靠
+     *   updateContainerVisible(false) 藏头部（alpha 反而复位
+     *   1）；HnPanelViewControllerImpl 的展开动画器也写两路。
+     * 即所有驱动最后都过这组漏斗——hook 漏斗本身、常时跟踪，
+     * 就不用逐个驱动去猜信号。after 里更新跟踪值并立即把合成
+     * 变换（见 [applyComposedTransform]）同步给各 State 的
+     * wrapper；挂起中的 State 跳过（终态门控优先，其 wrapper
+     * 是 GONE，恢复时 attach 会按当前跟踪值接上）。hook 在宿
+     * 主 UI 线程回调（动画/触摸都在主线程），写 View 属性即
+     * 同帧生效。任一 hook 装失败只记一行；全没装上时
+     * OnPreDraw 的 v2.0.11 采样兜底接管页面切换（见
+     * ensureWrapper），面板开合跟随随之失效但不影响其余功能。
+     * resetAnimState 不单独 hook：它内部就是调上面两个 alpha
+     * 方法写 1，方法级 hook 自然覆盖。
      */
-    private fun installHeaderAlphaFollow(
+    private fun installHeaderAnimFollow(
         lpparam: XC_LoadPackage.LoadPackageParam,
         log: (String) -> Unit,
     ) {
+        val implClass = try {
+            XposedHelpers.findClass(HEADER_INTERACTOR_IMPL_CLASS, lpparam.classLoader)
+        } catch (t: Throwable) {
+            log(
+                "header anim follow unavailable (interactor class missing), " +
+                    "pre-draw fallback only: ${t.javaClass.name}: ${t.message}"
+            )
+            return
+        }
+        var installed = 0
+
+        fun hookFloat(method: String, apply: (Float) -> Unit) {
+            try {
+                XposedHelpers.findAndHookMethod(
+                    implClass, method, Float::class.javaPrimitiveType,
+                    object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            val f = (param.args.getOrNull(0) as? Float) ?: return
+                            apply(f)
+                            applyComposedToAllStates()
+                        }
+                    }
+                )
+                installed++
+            } catch (t: Throwable) {
+                log("header anim follow hook failed for $method: ${t.javaClass.name}: ${t.message}")
+            }
+        }
+
+        hookFloat("updateAnimValueCommonAlpha") { f ->
+            shadeCommonAlpha = f.coerceIn(0f, 1f)
+        }
+        hookFloat("updateAnimValueTimeAlpha") { f ->
+            shadeTimeAlpha = f.coerceIn(0f, 1f)
+        }
+        hookFloat("updateContainerTransitionX") { f -> shadeContainerX = f }
+        hookFloat("updateContainerTransitionY") { f -> shadeContainerY = f }
         try {
-            val implClass = XposedHelpers.findClass(HEADER_INTERACTOR_IMPL_CLASS, lpparam.classLoader)
             XposedHelpers.findAndHookMethod(
-                implClass, "updateAnimValueCommonAlpha",
-                Float::class.javaPrimitiveType,
+                implClass, "updateContainerVisible", Boolean::class.javaPrimitiveType,
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        val f = (param.args.getOrNull(0) as? Float) ?: return
-                        headerAnimAlpha = f.coerceIn(0f, 1f)
-                        if (!pageSwitching) return
-                        val snapshot = synchronized(states) { states.values.toList() }
-                        for (st in snapshot) {
-                            if (st.suspended) continue
-                            try {
-                                applyFollowTransform(st)
-                            } catch (t: Throwable) {
-                                // 跟随失败不许影响宿主动画
-                            }
+                        val v = (param.args.getOrNull(0) as? Boolean) ?: return
+                        if (v != shadeContainerVisible) {
+                            shadeContainerVisible = v
+                            // 可见标志翻转是低频事件（开合起止/收尾
+                            // 藏头部），逐次记一行供真机核对跟随链
+                            logFn("header container visible -> $v")
                         }
+                        applyComposedToAllStates()
                     }
                 }
             )
-            followAlphaHookActive = true
-            log("header alpha follow hook installed (NotifCenterHeaderInteractorImpl.updateAnimValueCommonAlpha)")
+            installed++
         } catch (t: Throwable) {
             log(
-                "header alpha follow hook failed, pre-draw translationX sampling fallback: " +
+                "header anim follow hook failed for updateContainerVisible: " +
                     "${t.javaClass.name}: ${t.message}"
             )
         }
+        if (installed > 0) {
+            animFollowHookActive = true
+            log("header anim follow hooks installed ($installed/5 on NotifCenterHeaderInteractorImpl)")
+        } else {
+            log("header anim follow hooks all failed, pre-draw translationX sampling fallback")
+        }
     }
 
-    /** 把当前跟随帧同步给一个 State 的 wrapper：alpha＝头部逐帧 alpha、translationX＝头部本体平移。 */
-    private fun applyFollowTransform(st: State) {
+    /** 把合成变换同步给全部未挂起的 State（漏斗 hook 与落定复位共用）。 */
+    private fun applyComposedToAllStates() {
+        val snapshot = synchronized(states) { states.values.toList() }
+        for (st in snapshot) {
+            if (st.suspended) continue
+            try {
+                applyComposedTransform(st)
+            } catch (t: Throwable) {
+                // 跟随失败不许影响宿主动画
+            }
+        }
+    }
+
+    /**
+     * 合成变换（v2.0.12，两路过渡的统一合成口径）：原头部的
+     * 视觉变换 = 头部 View 自身变换 ∘ Compose 内容变换——
+     * 页面切换引擎把平移写在头部 View 的 translationX 上、
+     * alpha 写进 interactor；面板开合把 alpha 与内容根偏移都
+     * 写进 interactor、卷帘另把收尾平移写在头部 View 上。
+     * 覆盖层是同级普通 View，两层都得自己抄：
+     * - alpha ＝ [effectiveShadeAlpha]（两路 alpha 的保守合成，
+     *   与驱动无关——谁在写漏斗就跟谁，页面切换与面板开合
+     *   不会互相打架，因为它们写的是同一组通道）；
+     * - translationX ＝ 头部 View 平移 + 容器根偏移 X；
+     * - translationY ＝ 头部 View 平移 + 容器根偏移 Y。
+     * 稳态（面板全开、无切换）下跟踪值恒为 alpha 通道 1、
+     * 可见、偏移 0、头部平移 0，合成结果就是恒等变换，与
+     * v2.0.11 以前稳态强制复位的口径一致。只在值真变化时写。
+     */
+    private fun applyComposedTransform(st: State) {
         val wrapper = st.wrapper ?: return
-        val a = headerAnimAlpha
+        val a = effectiveShadeAlpha()
         if (wrapper.alpha != a) wrapper.alpha = a
-        val tx = st.header.translationX
+        val tx = st.header.translationX + shadeContainerX
         if (wrapper.translationX != tx) wrapper.translationX = tx
+        val ty = st.header.translationY + shadeContainerY
+        if (wrapper.translationY != ty) wrapper.translationY = ty
     }
 
     /**
@@ -665,13 +800,17 @@ object HeaderOverlay {
      * 没装上时，按头部 translationX 占面板宽的比例换算通知页
      * alpha——引擎自带的 calculateNotificationCenterAlpha 就是
      * (面板宽 − |位移|) / 面板宽，与方向无关、双向对称。面板
-     * 宽取头部父容器宽（即两页滑动的总行程量级）。
+     * 宽取头部父容器宽（即两页滑动的总行程量级）。v2.0.12 起
+     * 兜底范围仍只限页面切换（面板开合的通道在 interactor 里、
+     * 采样 View 属性拿不到），但顺带抄头部 translationY。
      */
     private fun applyFallbackFollow(st: State) {
         val wrapper = st.wrapper ?: return
         val header = st.header
         val tx = header.translationX
         if (wrapper.translationX != tx) wrapper.translationX = tx
+        val ty = header.translationY
+        if (wrapper.translationY != ty) wrapper.translationY = ty
         val panelW = (header.parent as? View)?.width?.takeIf { it > 0 }
             ?: header.width.takeIf { it > 0 }
             ?: return
@@ -679,15 +818,16 @@ object HeaderOverlay {
         if (wrapper.alpha != a) wrapper.alpha = a
     }
 
-    /** 落定复位（v2.0.11）：过渡结束（notify/取消/防卡死清位）时把跟随变换收回稳态——alpha=1、translationX=0；挂起中的不动（其 wrapper 是 GONE）。 */
+    /**
+     * 落定复位（v2.0.11 原语义为强制 alpha=1/平移 0；v2.0.12 改
+     * 按合成变换重对齐）：页面切换落定/取消/防卡死清位时调——
+     * 此时 interactor 通道已在终值（回通知页 alpha 通道为 1、
+     * 去控制中心则紧接着被终态门控整组挂起），头部 View 平移
+     * 也已归位，重跑一遍合成即收回稳态，不再写死恒等值（写死
+     * 会把面板开合进行中的合成一并抹掉、两路打架）。
+     */
     private fun resetFollowTransforms() {
-        val snapshot = synchronized(states) { states.values.toList() }
-        for (st in snapshot) {
-            if (st.suspended) continue
-            val wrapper = st.wrapper ?: continue
-            if (wrapper.alpha != 1f) wrapper.alpha = 1f
-            if (wrapper.translationX != 0f) wrapper.translationX = 0f
-        }
+        applyComposedToAllStates()
     }
 
     /**
@@ -1023,7 +1163,7 @@ object HeaderOverlay {
      * 挂起原因：null=可挂载；优先级 锁屏 > 控制中心 > 横幅
      * （可同时成立，取先者记日志）。
      * v2.0.11 起页面切换过渡不再是挂起原因：过渡期走跟随
-     * （见 [installHeaderAlphaFollow]），整组 GONE 太突兀；
+     * （见 [installHeaderAnimFollow]），整组 GONE 太突兀；
      * 控制中心也只在**落定**（!pageSwitching）时才硬挂起——
      * 回程拖动中 isControlCenterExpand 仍为 true，但覆盖层要
      * 随通知页 alpha 一起淡入，故切换中放行、由 applyGate 把
@@ -1180,18 +1320,11 @@ object HeaderOverlay {
             ensureStackAdjusted(st)
             scheduleStackReconcile(st)
             startTicker(st)
-            // 跟随变换对齐（v2.0.11）：过渡中恢复挂载的，按当前
-            // 逐帧 alpha/头部平移接上跟随；稳态则确保变换复位
-            // （防上次跟随的残值把覆盖层留在半透明/偏移位）。
-            if (pageSwitching) {
-                applyFollowTransform(st)
-            } else {
-                val w = st.wrapper
-                if (w != null) {
-                    if (w.alpha != 1f) w.alpha = 1f
-                    if (w.translationX != 0f) w.translationX = 0f
-                }
-            }
+            // 跟随变换对齐（v2.0.11 切换跟随、v2.0.12 统一合成）：
+            // 挂载/恢复时按当前跟踪值把合成变换接上——过渡中恢
+            // 复挂载的接上当前帧；稳态跟踪值恒为恒等变换，等同
+            // 复位（防上次跟随的残值把覆盖层留在半透明/偏移位）。
+            applyComposedTransform(st)
             // 首显即时（v2.0.11）：挂载完成不等 tick——本帧就把
             // 首绘排上（面板当前可见才有意义，不可见时预抽断言
             // 与首轮 tick 会在可见首帧补上）。
@@ -1290,7 +1423,7 @@ object HeaderOverlay {
             st.layoutListener = listener
         }
         // 帧频断言（v2.0.11）：每帧绘制前在头部的绘制通道上做
-        // 三件轻活（挂起期全跳过——挂起时原头部本就该可见）：
+        // 轻活（挂起期全跳过——挂起时原头部本就该可见）：
         // ①重断言 Compose 子视图 INVISIBLE：宿主在下拉展开/
         // 场景激活时会在帧频上把子视图重新置可见（或重建），
         // 旧对策只有 attach 与 1 秒 tick 两次隐藏、闪烁最长达
@@ -1298,8 +1431,13 @@ object HeaderOverlay {
         // 被画出来，不是轮询硬压（无帧就不跑、只在真不对时写）；
         // ②ThemeView 还没有效首绘（没画过、或首绘时 env 未
         // 就绪只录了空帧）且头部已有宽度时补一发 invalidate，
-        // 首显不等 tick；③跟随主 hook 没装上时按帧采样头部
-        // translationX 换算 alpha 兜底（applyFallbackFollow）。
+        // 首显不等 tick；③动画跟随的帧级采样（v2.0.12）：合成
+        // 变换里头部 View 自身的 translationX/Y 没有漏斗 hook
+        // 可抄（引擎直接写 View 属性），靠预抽逐帧采样补齐——
+        // 漏斗 hook 负责 alpha/容器偏移的即时同步，预抽负责
+        // View 平移的同帧对齐，两者写的都是同一组合成（见
+        // applyComposedTransform）；主 hook 没装上时退回
+        // v2.0.11 的比例换算兜底（仅页面切换）。
         if (st.preDrawListener == null) {
             val listener = ViewTreeObserver.OnPreDrawListener {
                 try {
@@ -1314,7 +1452,9 @@ object HeaderOverlay {
                         ) {
                             tv.invalidate()
                         }
-                        if (pageSwitching && !followAlphaHookActive) {
+                        if (animFollowHookActive) {
+                            applyComposedTransform(st)
+                        } else if (pageSwitching) {
                             applyFallbackFollow(st)
                         }
                     }
@@ -1461,20 +1601,23 @@ object HeaderOverlay {
     }
 
     /**
-     * 可见性/z 序自愈：wrapper 被改 INVISIBLE/透明或别的子视图后加进来盖住它时恢复并顶回最前（只在状态真不对时才写）。
-     * v2.0.11：alpha/平移的目标值随跟随状态走——过渡期以逐帧
-     * alpha 与头部平移为准（自愈不许把跟随中的 wrapper 拉回
-     * 不透明/原位），稳态才复位 alpha=1、translationX=0。
+     * 可见性/z 序自愈：wrapper 被改 INVISIBLE 或别的子视图后加进来盖住它时恢复并顶回最前（只在状态真不对时才写）。
+     * alpha/平移的目标值一律走合成变换（v2.0.12）：过渡期以
+     * 跟踪到的逐帧通道值为准（自愈不许把跟随中的 wrapper 拉
+     * 回不透明/原位），稳态跟踪值恒为恒等、等同复位。主 hook
+     * 没装上时合成不可用，退回 v2.0.11 口径（切换期采样兜底、
+     * 其余复位）。
      */
     private fun healWrapperVisibility(st: State, wrapper: View, parent: ViewGroup) {
         if (wrapper.visibility != View.VISIBLE) wrapper.visibility = View.VISIBLE
-        if (pageSwitching) {
-            if (wrapper.alpha != headerAnimAlpha) wrapper.alpha = headerAnimAlpha
-            val tx = st.header.translationX
-            if (wrapper.translationX != tx) wrapper.translationX = tx
+        if (animFollowHookActive) {
+            applyComposedTransform(st)
+        } else if (pageSwitching) {
+            applyFallbackFollow(st)
         } else {
             if (wrapper.alpha != 1f) wrapper.alpha = 1f
             if (wrapper.translationX != 0f) wrapper.translationX = 0f
+            if (wrapper.translationY != 0f) wrapper.translationY = 0f
         }
         if (parent.indexOfChild(wrapper) != parent.childCount - 1) {
             wrapper.bringToFront()
@@ -2172,6 +2315,9 @@ object HeaderOverlay {
                 "vis=${header.visibility} | " +
                 "wrapper=[${wrapper?.left},${wrapper?.top},${wrapper?.right},${wrapper?.bottom}] " +
                 "vis=${wrapper?.visibility} alpha=${wrapper?.alpha} " +
+                "effA=${effectiveShadeAlpha()} visFlag=$shadeContainerVisible " +
+                "cXY=${shadeContainerX}/${shadeContainerY} " +
+                "hTXY=${header.translationX}/${header.translationY} " +
                 "child=$childIdx/${parent?.childCount} clip=${parent?.clipChildren} | " +
                 "themeView=[${tv?.width}x${tv?.height}] vis=${tv?.visibility} " +
                 "alpha=${tv?.alpha} drawCalls=${tv?.drawCalls} " +
