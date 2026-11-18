@@ -22,7 +22,8 @@ import java.util.concurrent.atomic.AtomicInteger
  * IntSize State（f$17）。原版 dateAndTime 的摆放 x 写死 0。
  *
  * 本复刻与原方法逐项一致，唯一改动：dateAndTime 的摆放 x 改为
- * (总宽 - 铃铛宽 - dateAndTime 宽) / 2，并 clamp 到 [0, 总宽 - dateAndTime 宽]。
+ * (总宽 - 铃铛宽 - dateAndTime 宽) / 2，并 clamp 到 [0, 总宽 - dateAndTime 宽]；
+ * v1.1.1 起该改动带几何判别，不合头部特征的轮次仍用原版 x=0（见文末审计段）。
  * timePositionInParent 的回写值与原版逐字一致（x = density * f$10，
  * y = dateY），不随居中改动——这是分析文件的既定口径。
  *
@@ -42,6 +43,27 @@ import java.util.concurrent.atomic.AtomicInteger
  * 2. 运行时兜底：复刻逻辑全程 try-catch，任何异常立即回退调用原方法，
  *    异常细节只记前 3 次，避免逐帧刷屏；绝不让异常冒泡进 SystemUI。
  * 3. 热路径无反射查找：全部 Field/Method/Constructor 在安装时解析一次。
+ *
+ * v1.1.1 审计与判别（真机现象：hook 已装且不抛异常、头部时钟纹丝
+ * 不动、第一条通知上方多出半透明幽灵大时钟）：
+ * - 逐行 diff 结论：复刻与原版在三个子项的 subcompose 顺序、measure
+ *   约束（btn=copy(mask 10) 自由约束；traffic/dateAndTime 均为
+ *   copy(mask 8, maxWidth−铃铛宽)）、placeRelative 调用对象与顺序、
+ *   两个状态回写（timePositionInParent 的 Offset 打包、铃铛 IntSize
+ *   打包）上逐项一致，唯一差异就是 dateAndTime 的 x。「复刻误用
+ *   全宽约束测 dateAndTime」的怀疑在代码层不成立。
+ * - Lambda9 全仓仅在 Lambda7（头部 SubcomposeLayout 的 MeasurePolicy）
+ *   实例化，头部 composable 内也只有一个 SubcomposeLayout；但反编译
+ *   树是局部提取（16 个文件），面板侧是否还有借用同一 composable 的
+ *   转场/背景摆放轮次无法从源码排除——幽灵的形态（半透明、被放大
+ *   的时钟）与之吻合。
+ * - 对策：改 x 前加几何判别——头部 SubcomposeLayout 被
+ *   Modifier.height(notification_panelview_margin_top) 定高 80dp，
+ *   故 f$7（约束 minHeight）应 ≈ 80dp×density（±12dp 容差），且
+ *   dateAndTime 测得宽须窄于可用宽（maxWidth−铃铛宽）；不合特征的
+ *   轮次逐字走原版 x=0，幽灵层不许再被挪动。同时加有界诊断
+ *   （每进程前 5 次调用记一行：布局宽高、三子测得宽高、最终 x
+ *   与判别结果），下一轮凭日志即可定案。
  *
  * 全部调用走反射，是为了不给模块引入与宿主可能漂移的 Compose 编译期依赖；
  * 方法名（如 measure-BRTryo0、copy-Zbe2FdA$default）均为宿主 dex 中的
@@ -140,6 +162,7 @@ object HeaderCentering {
         val measureMethod: Method,
         val constraintsCopyDefault: Method,
         val constraintsMaxWidth: Method,
+        val constraintsMaxHeight: Method,
         val placeRelativeMethod: Method,
         val getDensityMethod: Method,
         val roundToPxMethod: Method,
@@ -154,6 +177,7 @@ object HeaderCentering {
     )
 
     private val fallbackLogCount = AtomicInteger(0)
+    private val diagLogCount = AtomicInteger(0)
 
     /**
      * 结构自检通过才安装居中 hook；任一不符只记一行原因、整体跳过
@@ -172,7 +196,7 @@ object HeaderCentering {
                 object : XC_MethodReplacement() {
                     override fun replaceHookedMethod(param: MethodHookParam): Any? {
                         try {
-                            return invokeCentered(api, param.thisObject, param.args.getOrNull(0))
+                            return invokeCentered(api, param.thisObject, param.args.getOrNull(0), log)
                         } catch (t: Throwable) {
                             val n = fallbackLogCount.incrementAndGet()
                             if (n <= 3) {
@@ -328,6 +352,13 @@ object HeaderCentering {
             }
             m
         }
+        val maxHeightMethod = resolve("Constraints.getMaxHeight-impl") {
+            val m = constraintsClass.getMethod("getMaxHeight-impl", java.lang.Long.TYPE)
+            if (!Modifier.isStatic(m.modifiers) || m.returnType !== Integer.TYPE) {
+                fail("getMaxHeight-impl is not static int")
+            }
+            m
+        }
         val placeRelativeMethod = resolve("PlacementScope.placeRelative\$default") {
             val m = placementScopeClass.getMethod(
                 "placeRelative\$default",
@@ -426,6 +457,7 @@ object HeaderCentering {
             measureMethod = measureMethod,
             constraintsCopyDefault = copyDefaultMethod,
             constraintsMaxWidth = maxWidthMethod,
+            constraintsMaxHeight = maxHeightMethod,
             placeRelativeMethod = placeRelativeMethod,
             getDensityMethod = getDensityMethod,
             roundToPxMethod = roundToPxMethod,
@@ -591,7 +623,7 @@ object HeaderCentering {
      * 唯一改动点以「★改动」标明，其余 subcompose/measure/y 计算/状态回写
      * 与原方法一致。
      */
-    private fun invokeCentered(api: Api, self: Any, placementScope: Any?): Any? {
+    private fun invokeCentered(api: Api, self: Any, placementScope: Any?, log: (String) -> Unit): Any? {
         // 原版首行对 placementScope 做 Intrinsics 空检查；此处以显式 NPE 等价复刻，
         // 异常会被上层兜底捕获并回退原方法。
         val scope = placementScope ?: throw NullPointerException("placementScope == null")
@@ -651,6 +683,8 @@ object HeaderCentering {
 
         // ---- trafficUi：可见时 subcompose/measure 并摆放（x=0、y 与原版一致） ----
         var trafficTop = 0 // 原局部 i：流量行顶部 y；不可见时为 0
+        var trafficWidth = -1 // 测得宽（不可见时 -1），仅供 v1.1.1 诊断日志
+        var trafficHeight = -1 // 测得高（不可见时 -1），下方 y 计算与诊断共用
         if (z) {
             // 工厂入参 = 捕获字段按声明顺序的值（与原版逐字段赋值一一对应）
             val lambda11 = api.lambda11Factory(
@@ -665,7 +699,8 @@ object HeaderCentering {
                 null, j3, 0, maxWidth - btnWidth, 0, 0, 8
             ) as Long
             val trafficPlaceable = api.measureMethod.invoke(trafficMeasurable, trafficConstraints)
-            val trafficHeight = api.placeableHeightField.getInt(trafficPlaceable)
+            trafficWidth = api.placeableWidthField.getInt(trafficPlaceable)
+            trafficHeight = api.placeableHeightField.getInt(trafficPlaceable)
             val t = roundToPx(api, scope, fTraffic) - getIntValue(api, snap1)
             val extra = if (z2) Math.round(trafficHeight * (if (z3) 0.1f else 0.2f)) else 0
             trafficTop = ((i3 - trafficHeight) - t) - extra
@@ -694,14 +729,38 @@ object HeaderCentering {
         } else {
             (trafficTop - dateHeight) - (density * f2).toInt()
         }
-        // ★改动：摆放 x 由写死 0 改为居中 (总宽 - 铃铛宽 - 容器宽)/2，并 clamp 到 [0, 总宽 - 容器宽]
-        var centeredX = (maxWidth - btnWidth - dateWidth) / 2
+        // ★改动（v1.1.1 起加几何判别）：摆放 x 默认仍为原版 0；仅当本轮
+        // 布局符合通知中心头部特征时才改居中 (总宽 - 铃铛宽 - 容器宽)/2：
+        // 头部 SubcomposeLayout 被 Modifier.height(80dp) 定高，故 f$7
+        // （约束 minHeight）应 ≈ 80dp×density（±12dp 容差）；且
+        // dateAndTime 测得宽须窄于可用宽（maxWidth - 铃铛宽），居中才
+        // 有意义。不合特征的轮次（疑似转场/背景层）逐字走原版 x=0。
+        val maxHeight = api.constraintsMaxHeight.invoke(null, j3) as Int
+        val heightOk = kotlin.math.abs(i3 - 80f * density) <= 12f * density
+        val roomOk = dateWidth < maxWidth - btnWidth
+        val centered = heightOk && roomOk
+        var centeredX = if (centered) (maxWidth - btnWidth - dateWidth) / 2 else 0
         val maxCenteredX = maxWidth - dateWidth
         centeredX = when {
             maxCenteredX < 0 -> 0
             centeredX < 0 -> 0
             centeredX > maxCenteredX -> maxCenteredX
             else -> centeredX
+        }
+        // 有界诊断：每进程前 5 次调用记一行（布局宽高、三子测得宽高、
+        // 最终 x 与判别结果），写 shadeclock_probe.log（经 install 的 log 通道）。
+        val diagN = diagLogCount.incrementAndGet()
+        if (diagN <= 5) {
+            try {
+                log(
+                    "centering diag #$diagN: maxW=$maxWidth maxH=$maxHeight layoutH=$i3 " +
+                        "density=$density btn=${btnWidth}x$btnHeight " +
+                        "traffic=${if (z) "${trafficWidth}x$trafficHeight" else "hidden"} " +
+                        "date=${dateWidth}x$dateHeight x=$centeredX centered=$centered"
+                )
+            } catch (t: Throwable) {
+                // 诊断失败不影响摆放
+            }
         }
         api.placeRelativeMethod.invoke(null, scope, datePlaceable, centeredX, dateY)
         // timePositionInParent 回写：与原版逐字一致（x = density * f$10，y = dateY 的 float 位模式）

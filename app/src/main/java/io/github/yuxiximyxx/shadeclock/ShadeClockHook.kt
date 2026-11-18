@@ -159,7 +159,7 @@ class ShadeClockHook : IXposedHookLoadPackage, IXposedHookInitPackageResources {
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != TARGET_PACKAGE) return
-        diag("=== HonorShadeClock v1.1.0 loaded in $TARGET_PACKAGE ===")
+        diag("=== HonorShadeClock v1.1.1 loaded in $TARGET_PACKAGE ===")
         installDimenDiagnostic(lpparam)
         if (settings().centerClock) {
             HeaderCentering.install(lpparam) { message -> diag(message) }
