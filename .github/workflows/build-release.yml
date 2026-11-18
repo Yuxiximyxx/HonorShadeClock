@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.14-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.15-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.14-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.15-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,34 +68,37 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.14
-          name: HonorShadeClock 2.0.14 — 修进出通知中心时钟闪烁
+          tag_name: v2.0.15
+          name: HonorShadeClock 2.0.15 — 修下拉时时钟迟到一拍
           body: |
-            ## HonorShadeClock 2.0.14
+            ## HonorShadeClock 2.0.15
 
-            单项修复：进入和退出通知中心的过程中，
-            时钟样式会闪烁（忽隐忽现/突然全亮）。
+            单项修复：下拉通知中心时通知卡片已经
+            进场、时钟区域却先空白一拍，面板全开
+            后时钟样式才整幅出现。
 
-            - 根因（真机日志对位）：样式的透明度合
-              成有两个硬跳变输入——头部容器可见标
-              志在过渡期会成串交替翻转，每翻一次透
-              明度就在 0 和满值之间砸一个来回；手势
-              拉动时两路透明度通道又是分开变的，合
-              成取小值会跟着先跳的那一路突然全亮。
-            - 修法：透明度落到样式上之前加一道斜率
-              限制——变化再急也至少用约 90ms 走完，
-              系统自己的动画（200ms 起）和手指渐变
-              都比这慢、原样通过，单帧毛刺只剩一个
-              浅坑，不再整幅闪。稳态显示完全不变。
+            - 根因（真机日志对位）：系统头部有两路
+              透明度——一路管时钟本体、一路管日期/
+              流量等公共元素，下拉过程中是分级呈现
+              的：时钟那路全程为满值，公共元素那路
+              被压到 0、等落定才补上。我们的样式之
+              前取两路的较小值合成，等于让时钟陪公
+              共元素一起迟到。日志同时证明主题预热
+              与内容首绘都早已就绪，迟到的只有透明
+              度这一环。
+            - 修法：样式的透明度改为只跟时钟本体
+              那一路，下拉第一帧起就与原时钟同帧在
+              场；面板全关时的零残留门与防闪烁的变
+              化限速保持不变。
 
             其余功能（面板开合/页面切换跟随、通知
             避让、运营商隐藏、锁屏预挂起、重启系统
-            界面按钮、垂直偏移、各开关）与 2.0.13
+            界面按钮、垂直偏移、各开关）与 2.0.14
             完全一致，未做任何改动。
 
             生效方式：覆盖安装 → 用设置页「重启系
-            统界面」按钮（或强停一次系统界面）→ 反
-            复下拉/收起通知中心看是否还闪。
+            统界面」按钮（或强停一次系统界面）→ 下
+            拉通知中心看时钟是否第一帧就在。
             关闭办法：在 LSPosed 里停用模块再重启
             一次系统界面，即恢复原样。
           files: dist/*.apk

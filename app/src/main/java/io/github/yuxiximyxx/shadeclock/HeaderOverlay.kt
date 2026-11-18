@@ -332,6 +332,23 @@ import kotlin.math.roundToInt
  * attach 时以宿主 applicationContext 注册（进程级、只注册
  * 一次，回调默认在主线程，与 tick 的门控重评同路径）。
  *
+ * v2.0.15 修下拉首帧空白（v2.0.14 真机：闪烁有改善，但下拉
+ * 中段通知卡已进场、时钟区仍空白，全开后才整幅出现——通知
+ * 先到、时钟迟到约一拍）。日志对位（probe_3 的 v2.0.14 会
+ * 话段）：预热 ready 与 attach 采纳（adopted）都在进程启动
+ * 时完成、不是迟到环；diag #3（下拉中段）ThemeView 已实绘
+ * 19 元素（drawCalls=1）——内容也不是迟到环；同行
+ * chA=0.0/1.0、effA=0.0 才是：两路 alpha 语义经反编译核实
+ * 为 time=时钟本体、common=日期/流量等公共元素，宿主分级
+ * 呈现（下拉跟踪期 time 恒 1、common 压 0、落定才补 1，
+ * diag #4 才两路齐 1），v2.0.12 起的 min() 保守合成让整簇
+ * 陪 common 一起迟到。改：有效 alpha 只跟 time 路（见
+ * [effectiveShadeAlpha]），容器可见门与 v2.0.14 斜率限制不
+ * 变。关闭期间 ThemeView 不重绘（tick 的 isShown 门控、
+ * drawCalls 冻结）是实情但非本症：首绘在打开过程中经预抽
+ * 补 invalidate 已落帧（diag #3 drawn=19 先于 alpha 到
+ * 位），故 tick 口径不动、防 v2.0.5 卡顿回潮。
+ *
  * 设置经 StampStore 的 stamp.txt 跨进程传递；覆盖层挂载时与每秒
  * tick 比对戳记，变了就重解析重载——切换主题免强停。
  * 全路径 try-catch：构建/渲染任何异常都卸下覆盖层、恢复原头部、
@@ -482,15 +499,25 @@ object HeaderOverlay {
     /**
      * 覆盖层应有的有效 alpha：容器不可见时恒 0（宿主收尾态就是
      * 靠 visible=false 藏头部、alpha 反而复位 1——只抄 alpha 会
-     * 在面板全关后残留在桌面上）；可见时取两路 alpha 的较小者
-     * ——两路同写的场合（页面切换、下拉动画集）两者相等；卷帘
-     * 跟踪等只写一路的场合，取小保证覆盖层永不比原头部任一
-     * 元素更显眼（时钟与日期在原头部本就分路淡变，单 View 的
-     * 覆盖层只能取保守合成）。
+     * 在面板全关后残留在桌面上）；可见时只跟 **time 路**（v2.0.15
+     * 改，v2.0.12–v2.0.14 是取两路较小者）。改的依据是两路的
+     * 语义（反编译 NotifCenterHeaderKt 核实）：time 路驱动的
+     * 正是时钟本体（DateAndTime 收集 timeAlpha），common 路
+     * 驱动日期/流量等公共元素（收集 commonAlpha 时同场读的
+     * 是 dateText）。宿主对两路是**分级呈现**：下拉跟踪期间
+     * time 恒 1（原时钟全程在场）、common 被压 0 直到落定才
+     * 补上（v2.0.14 真机 diag #3 实数 chA=0.0/1.0、通知卡已
+     * 进场而 effA=0；下一拍 #4 才 1.0/1.0）——取小合成等于让
+     * 时钟簇陪公共元素一起迟到，正是「通知先到、时钟迟一拍」
+     * 的成因。覆盖层整簇的主体就是时钟样式，单 View 也拆不开
+     * 两路，跟 time 路即与原时钟同帧。其余过渡不受影响：页面
+     * 切换 setViewAlpha 对两路同帧同值、开合 fling 动画集对
+     * 两路同写，time 路一条即载全程；收尾仍有 visible=false
+     * 的 0 门兜底，面板全关不残留。
      */
     private fun effectiveShadeAlpha(): Float =
         if (!shadeContainerVisible) 0f
-        else min(shadeCommonAlpha, shadeTimeAlpha).coerceIn(0f, 1f)
+        else shadeTimeAlpha.coerceIn(0f, 1f)
 
     /** 预热好的主题（install 阶段后台线程 load + 位图预解码完成），attach 时按 (themeId, stamp) 吻合采纳。 */
     private class PreheatedTheme(
@@ -813,10 +840,11 @@ object HeaderOverlay {
      * alpha 写进 interactor；面板开合把 alpha 与内容根偏移都
      * 写进 interactor、卷帘另把收尾平移写在头部 View 上。
      * 覆盖层是同级普通 View，两层都得自己抄：
-     * - alpha ＝ [effectiveShadeAlpha]（两路 alpha 的保守合成，
-     *   与驱动无关——谁在写漏斗就跟谁，页面切换与面板开合
-     *   不会互相打架，因为它们写的是同一组通道）；落到
-     *   wrapper 前再过一道斜率限制（v2.0.14，见函数内注）；
+     * - alpha ＝ [effectiveShadeAlpha]（v2.0.15 起只跟 time
+     *   路——时钟本体通道；与驱动无关——谁在写漏斗就跟谁，
+     *   页面切换与面板开合不会互相打架，因为它们写的是同一
+     *   组通道）；落到 wrapper 前再过一道斜率限制（v2.0.14，
+     *   见函数内注）；
      * - translationX ＝ 头部 View 平移 + 容器根偏移 X；
      * - translationY ＝ 头部 View 平移 + 容器根偏移 Y。
      * 稳态（面板全开、无切换）下跟踪值恒为 alpha 通道 1、
