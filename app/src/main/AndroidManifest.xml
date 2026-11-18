@@ -32,7 +32,7 @@
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="通知中心大时钟：把 MagicOS 11 通知中心顶部时钟居中并放大（时钟 54dp、日期 16dp）。" />
+            android:value="通知中心大时钟：把 MagicOS 11 通知中心顶部时钟居中并放大，居中与字号可在应用内自定义。" />
         <meta-data
             android:name="xposedminversion"
             android:value="82" />

@@ -6,6 +6,7 @@ import android.view.View
 import de.robv.android.xposed.IXposedHookInitPackageResources
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
+import de.robv.android.xposed.XSharedPreferences
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_InitPackageResources
@@ -15,21 +16,27 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.roundToInt
 
 /**
- * 正式版 v1.0.0 入口：通知中心时钟居中 + 放大。
+ * 正式版入口：通知中心时钟居中 + 放大（v1.1.0 起带自定义设置）。
  *
  * 两件互相独立的事（可行性依据见仓库 HEADER_ANALYSIS.md）：
  * 1. 放大（资源替换）：handleInitPackageResources 里把 SystemUI 的
- *    dimen/notif_center_header_clock_text_size 40dp -> 54dp、
- *    dimen/notif_center_header_clock_date_size 14dp -> 16dp。
- *    头部 composable 每次重组都现读 getDimensionPixelSize，替换直接生效。
- *    DimensionReplacement 的单位按 API 82 签名 (float, int unit) 传
+ *    dimen/notif_center_header_clock_text_size（默认 40dp）、
+ *    dimen/notif_center_header_clock_date_size（默认 14dp）替换为
+ *    设置里的字号。头部 composable 每次重组都现读
+ *    getDimensionPixelSize，替换直接生效。DimensionReplacement 的
+ *    单位按 API 82 签名 (float, int unit) 传
  *    TypedValue.COMPLEX_UNIT_DIP，即 dp 语义。
  * 2. 居中（摆放 lambda 替换）：见 HeaderCentering——带结构自检与异常
- *    回退地复刻头部 SubcomposeLayout 的摆放逻辑，只改 dateAndTime 的 x。
+ *    回退地复刻头部 SubcomposeLayout 的摆放逻辑，只改 dateAndTime
+ *    的 x。仅当设置 center_clock=true 时安装；false 时不装 hook，
+ *    摆放完全走系统原逻辑。
  *
- * v0.1-v0.3 的探针逻辑（setText hook、整树遍历、图纸测绘）已全部下线；
- * 只保留每进程一次的字号验读回与 hook 安装结果诊断，仍写
- * /sdcard/Download/shadeclock_probe.log（+ LSPosed 日志）。
+ * 设置来自模块 App 的 SharedPreferences（名 settings），经
+ * XSharedPreferences 在 SystemUI 进程启动时读取一次（改设置后强停
+ * 系统界面生效）；读不到时用默认值（居中开、时钟 54dp、日期 16dp）。
+ *
+ * 诊断只保留每进程一次的字号验读回、设置读数与 hook 安装结果，
+ * 仍写 /sdcard/Download/shadeclock_probe.log（+ LSPosed 日志）。
  *
  * 作用域只有 com.android.systemui（见 AndroidManifest 的 xposedscope）。
  */
@@ -42,8 +49,19 @@ class ShadeClockHook : IXposedHookLoadPackage, IXposedHookInitPackageResources {
 
         private const val CLOCK_DIMEN = "notif_center_header_clock_text_size"
         private const val DATE_DIMEN = "notif_center_header_clock_date_size"
-        private const val CLOCK_DP = 54f
-        private const val DATE_DP = 16f
+
+        private const val MODULE_PACKAGE = "io.github.yuxiximyxx.shadeclock"
+        private const val PREFS_NAME = "settings"
+        private const val KEY_CENTER_CLOCK = "center_clock"
+        private const val KEY_CLOCK_SIZE = "clock_size_dp"
+        private const val KEY_DATE_SIZE = "date_size_dp"
+        private const val DEFAULT_CENTER_CLOCK = true
+        private const val DEFAULT_CLOCK_DP = 54
+        private const val DEFAULT_DATE_DP = 16
+        private const val CLOCK_DP_MIN = 36
+        private const val CLOCK_DP_MAX = 68
+        private const val DATE_DP_MIN = 12
+        private const val DATE_DP_MAX = 24
 
         private const val HEADER_CLASS_NAME =
             "com.android.systemui.statusbar.notification.header.HnNotificationCenterHeader"
@@ -65,7 +83,49 @@ class ShadeClockHook : IXposedHookLoadPackage, IXposedHookInitPackageResources {
         }
     }
 
+    /** 一次进程生命周期内读取到的设置快照。 */
+    private data class ModuleSettings(
+        val centerClock: Boolean,
+        val clockDp: Float,
+        val dateDp: Float,
+    )
+
+    @Volatile
+    private var cachedSettings: ModuleSettings? = null
+
     private val dimenDiagDone = AtomicBoolean(false)
+
+    /**
+     * 读取设置（每进程只读一次并缓存）。XSharedPreferences 读不到
+     * （文件不可读/尚不存在）时整体回退默认值，并各写一行诊断。
+     */
+    private fun settings(): ModuleSettings {
+        cachedSettings?.let { return it }
+        val loaded = try {
+            val prefs = XSharedPreferences(MODULE_PACKAGE, PREFS_NAME)
+            val s = ModuleSettings(
+                centerClock = prefs.getBoolean(KEY_CENTER_CLOCK, DEFAULT_CENTER_CLOCK),
+                clockDp = prefs.getInt(KEY_CLOCK_SIZE, DEFAULT_CLOCK_DP)
+                    .coerceIn(CLOCK_DP_MIN, CLOCK_DP_MAX).toFloat(),
+                dateDp = prefs.getInt(KEY_DATE_SIZE, DEFAULT_DATE_DP)
+                    .coerceIn(DATE_DP_MIN, DATE_DP_MAX).toFloat(),
+            )
+            diag(
+                "settings loaded: center_clock=${s.centerClock}, " +
+                    "clock_size_dp=${s.clockDp.roundToInt()}, date_size_dp=${s.dateDp.roundToInt()}"
+            )
+            s
+        } catch (t: Throwable) {
+            diag("settings load failed, using defaults: ${t.javaClass.name}: ${t.message}")
+            ModuleSettings(
+                DEFAULT_CENTER_CLOCK,
+                DEFAULT_CLOCK_DP.toFloat(),
+                DEFAULT_DATE_DP.toFloat(),
+            )
+        }
+        cachedSettings = loaded
+        return loaded
+    }
 
     // ================= 放大：资源替换 =================
 
@@ -73,8 +133,9 @@ class ShadeClockHook : IXposedHookLoadPackage, IXposedHookInitPackageResources {
         resparam: XC_InitPackageResources.InitPackageResourcesParam
     ) {
         if (resparam.packageName != TARGET_PACKAGE) return
-        replaceDimen(resparam.res, CLOCK_DIMEN, CLOCK_DP)
-        replaceDimen(resparam.res, DATE_DIMEN, DATE_DP)
+        val s = settings()
+        replaceDimen(resparam.res, CLOCK_DIMEN, s.clockDp)
+        replaceDimen(resparam.res, DATE_DIMEN, s.dateDp)
     }
 
     private fun replaceDimen(res: XResources, name: String, dp: Float) {
@@ -98,18 +159,23 @@ class ShadeClockHook : IXposedHookLoadPackage, IXposedHookInitPackageResources {
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != TARGET_PACKAGE) return
-        diag("=== HonorShadeClock v1.0.0 loaded in $TARGET_PACKAGE ===")
+        diag("=== HonorShadeClock v1.1.0 loaded in $TARGET_PACKAGE ===")
         installDimenDiagnostic(lpparam)
-        HeaderCentering.install(lpparam) { message -> diag(message) }
+        if (settings().centerClock) {
+            HeaderCentering.install(lpparam) { message -> diag(message) }
+        } else {
+            diag("centering hook not installed: center_clock=false in settings")
+        }
     }
 
     /**
      * 字号验读回：头部首次 onAttachedToWindow 后读一次两个 dimen 的
-     * getDimensionPixelSize，与期望像素（dp x 当前 density）对照写一行
-     * 诊断。每个进程只读一次；失败只记一行，不影响其他功能。
+     * getDimensionPixelSize，与期望像素（设置 dp x 当前 density）对照
+     * 写一行诊断。每个进程只读一次；失败只记一行，不影响其他功能。
      */
     private fun installDimenDiagnostic(lpparam: XC_LoadPackage.LoadPackageParam) {
         try {
+            val s = settings()
             val headerClass = XposedHelpers.findClass(HEADER_CLASS_NAME, lpparam.classLoader)
             XposedHelpers.findAndHookMethod(
                 headerClass, "onAttachedToWindow",
@@ -126,8 +192,8 @@ class ShadeClockHook : IXposedHookLoadPackage, IXposedHookInitPackageResources {
                                 if (clockId != 0) res.getDimensionPixelSize(clockId) else -1
                             val datePx =
                                 if (dateId != 0) res.getDimensionPixelSize(dateId) else -1
-                            val clockExpected = (CLOCK_DP * density).roundToInt()
-                            val dateExpected = (DATE_DP * density).roundToInt()
+                            val clockExpected = (s.clockDp * density).roundToInt()
+                            val dateExpected = (s.dateDp * density).roundToInt()
                             diag(
                                 "dimen check: density=$density " +
                                     "clock=${clockPx}px (expect ${clockExpected}px), " +

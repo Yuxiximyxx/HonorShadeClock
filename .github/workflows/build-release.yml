@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-1.0.0-release.apk
+          cp "$SRC" dist/HonorShadeClock-1.1.0-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-1.0.0-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-1.1.0-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,28 +68,36 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.0
-          name: HonorShadeClock 1.0.0 — 正式版：通知中心时钟居中 + 放大
+          tag_name: v1.1.0
+          name: HonorShadeClock 1.1.0 — 修居中失效 + 自定义设置
           body: |
-            ## HonorShadeClock 1.0.0（正式版）
+            ## HonorShadeClock 1.1.0
 
             把荣耀 MagicOS 11 通知中心顶部的时钟改成居中
-            显示的大时钟：
+            显示的大时钟，本版修复居中并新增自定义设置：
 
+            - 修居中：v1.0.0 的居中被结构自检误跳过——
+              Lambda11/12 在 SystemUI 的 dex 里没有任何
+              构造器（原版是免构造分配 + 逐字段赋值），
+              自检按无参构造反射必然失败。本版改为按
+              捕获字段声明顺序三路探测构造方式（带参
+              构造 / 无参构造 / Unsafe 免构造分配），
+              居中可正常安装。
+            - 自定义设置（模块应用内）：「时钟居中」
+              开关（关掉回原左对齐、不装居中 hook）、
+              时钟字号滑杆 36–68dp（默认 54）、日期
+              字号滑杆 12–24dp（默认 16）。改完强停
+              一次系统界面生效。
             - 居中：时钟 + 日期整组水平居中（替换头部
               SubcomposeLayout 的摆放逻辑，只改 dateAndTime
               的摆放 x；流量行、铃铛按钮、动画与状态回写
-              保持原样）。
-            - 放大：时钟字号 40dp → 54dp、日期字号
-              14dp → 16dp（资源替换头部 dimen）。
+              保持原样）。放大：资源替换头部 dimen。
 
             安全设计：居中 hook 安装前做结构自检，系统
             版本变化导致头部结构对不上时自动跳过居中、
             只保留放大；居中逻辑运行时出错会立即回退
-            系统原逻辑，不会让 SystemUI 崩溃。探针版
-            （v0.1-v0.3）的遍历/测绘逻辑已全部下线，只
-            保留每进程一次的字号验读与安装结果诊断，
-            仍写 /sdcard/Download/shadeclock_probe.log。
+            系统原逻辑，不会让 SystemUI 崩溃。诊断仍写
+            /sdcard/Download/shadeclock_probe.log。
 
             生效方式：LSPosed 启用模块、作用域勾「系统
             界面」→ 强停一次系统界面 → 下拉通知中心查看。

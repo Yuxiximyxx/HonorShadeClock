@@ -26,6 +26,15 @@ import java.util.concurrent.atomic.AtomicInteger
  * timePositionInParent 的回写值与原版逐字一致（x = density * f$10，
  * y = dateY），不随居中改动——这是分析文件的既定口径。
  *
+ * 内容 lambda 的构造方式（v1.1.0 修订，dexdump 对 17.0.0.1 实测）：
+ * Lambda8 只有 <init>(int)（classId），f$0 构造后赋值；Lambda11/12 在
+ * dex 里根本没有任何 <init>（Direct methods 为空）——原版字节码是
+ * new + 逐字段赋值、靠运行时隐式默认构造，反射枚举不到构造器，
+ * v1.0.0 用无参构造反射正死在此处。故实例工厂按三路探测：与字段
+ * 声明顺序一致的带参构造器 → 无参构造器 → Unsafe.allocateInstance
+ * 免构造分配后逐字段赋值（与原版对象形态等价）。ComposableLambdaImpl
+ * 只有一个 public <init>(int, boolean, Object)，与现解析一致。
+ *
  * 保险丝：
  * 1. 安装前结构自检：目标类、invoke 签名、三个内容 lambda 的字段
  *    数量/类型、全部 Compose 内部 API 的反射句柄逐项核对；任一不符
@@ -124,10 +133,8 @@ object HeaderCentering {
         val constraintsValueField: Field?,
         val lambda8Constructor: Constructor<*>,
         val lambda8F0: Field,
-        val lambda11Constructor: Constructor<*>,
-        val lambda11Fields: Array<Field>,
-        val lambda12Constructor: Constructor<*>,
-        val lambda12Fields: Array<Field>,
+        val lambda11Factory: (Array<Any?>) -> Any,
+        val lambda12Factory: (Array<Any?>) -> Any,
         val composableLambdaConstructor: Constructor<*>,
         val subcomposeMethod: Method,
         val measureMethod: Method,
@@ -264,16 +271,14 @@ object HeaderCentering {
         }
 
         // ---- 内容 lambda：Lambda11（流量）/ Lambda12（时钟+日期） ----
+        // 构造方式不能假设：按字段表核对后走 resolveLambdaFactory 三路探测
+        // （带参构造 / 无参构造 / Unsafe 免构造分配），见该函数注释。
         val lambda11Class = findClass(LAMBDA11_NAME)
         val lambda11Fields = checkedFields(lambda11Class, LAMBDA11_FIELD_TYPES, "Lambda11")
-        val lambda11Constructor = resolve("Lambda11 constructor") {
-            lambda11Class.getDeclaredConstructor().apply { isAccessible = true }
-        }
+        val lambda11Factory = resolveLambdaFactory(lambda11Class, lambda11Fields, "Lambda11")
         val lambda12Class = findClass(LAMBDA12_NAME)
         val lambda12Fields = checkedFields(lambda12Class, LAMBDA12_FIELD_TYPES, "Lambda12")
-        val lambda12Constructor = resolve("Lambda12 constructor") {
-            lambda12Class.getDeclaredConstructor().apply { isAccessible = true }
-        }
+        val lambda12Factory = resolveLambdaFactory(lambda12Class, lambda12Fields, "Lambda12")
 
         // ---- Compose 内部 API 句柄 ----
         val function2Class = findClass("kotlin.jvm.functions.Function2")
@@ -414,10 +419,8 @@ object HeaderCentering {
             constraintsValueField = constraintsValueField,
             lambda8Constructor = lambda8Constructor,
             lambda8F0 = lambda8F0,
-            lambda11Constructor = lambda11Constructor,
-            lambda11Fields = lambda11Fields,
-            lambda12Constructor = lambda12Constructor,
-            lambda12Fields = lambda12Fields,
+            lambda11Factory = lambda11Factory,
+            lambda12Factory = lambda12Factory,
             composableLambdaConstructor = composableLambdaConstructor,
             subcomposeMethod = subcomposeMethod,
             measureMethod = measureMethod,
@@ -461,6 +464,110 @@ object HeaderCentering {
             }
             field.isAccessible = true
             field
+        }
+    }
+
+    /**
+     * 为「构造后逐字段赋值」型 synthetic lambda 类解析实例工厂，入参为
+     * 按捕获字段声明顺序排列的值（基本类型传装箱值），返回新实例。
+     *
+     * 构造方式按顺序探测（dexdump 对 17.0.0.1 实测结论）：
+     * A. 与捕获字段声明顺序完全一致的带参构造器——命中则构造时直接传值；
+     * B. 无参构造器——命中则构造后逐字段赋值；
+     * C. 类在 dex 里根本没有 <init>（Lambda11/12 在本机即如此，v1.0.0 的
+     *    NoSuchMethodException 正出在此）——原版字节码是 new + 逐字段
+     *    赋值、靠运行时隐式默认构造，反射枚举不到任何构造器，改用
+     *    Unsafe.allocateInstance 免构造分配再逐字段赋值，与原版对象
+     *    形态等价；安装期先对目标类干跑一次分配验证可用。
+     * 三路都不通才 fail（整体跳过居中 hook）。
+     */
+    private fun resolveLambdaFactory(
+        clazz: Class<*>,
+        fields: Array<Field>,
+        label: String,
+    ): (Array<Any?>) -> Any {
+        // A：带参构造器（参数类型 = 捕获字段按声明顺序的类型列表）
+        val argCtor: Constructor<*>? = try {
+            clazz.getDeclaredConstructor(*fields.map { it.type }.toTypedArray())
+                .apply { isAccessible = true }
+        } catch (e: NoSuchMethodException) {
+            null
+        } catch (t: Throwable) {
+            fail("$label arg constructor probe: ${t.javaClass.simpleName}: ${t.message}")
+        }
+        if (argCtor != null) {
+            return { values -> argCtor.newInstance(*values) }
+        }
+        // B：无参构造器 + 逐字段赋值
+        val noArgCtor: Constructor<*>? = try {
+            clazz.getDeclaredConstructor().apply { isAccessible = true }
+        } catch (e: NoSuchMethodException) {
+            null
+        } catch (t: Throwable) {
+            fail("$label no-arg constructor probe: ${t.javaClass.simpleName}: ${t.message}")
+        }
+        if (noArgCtor != null) {
+            return { values ->
+                val instance = noArgCtor.newInstance()
+                setAllFields(fields, instance, values, label)
+                instance
+            }
+        }
+        // C：Unsafe 免构造分配 + 逐字段赋值（先干跑一次验证）
+        val allocate = resolveUnsafeAllocate(label)
+        try {
+            allocate(clazz)
+        } catch (t: Throwable) {
+            fail("$label Unsafe.allocateInstance dry-run: ${t.javaClass.simpleName}: ${t.message}")
+        }
+        return { values ->
+            val instance = allocate(clazz)
+            setAllFields(fields, instance, values, label)
+            instance
+        }
+    }
+
+    /** 按声明顺序把值逐个写入捕获字段（Field.set 自动拆箱基本类型）。 */
+    private fun setAllFields(
+        fields: Array<Field>,
+        instance: Any,
+        values: Array<Any?>,
+        label: String,
+    ) {
+        if (values.size != fields.size) {
+            throw IllegalStateException(
+                "$label factory values count ${values.size} != field count ${fields.size}"
+            )
+        }
+        for (i in fields.indices) {
+            fields[i].set(instance, values[i])
+        }
+    }
+
+    /**
+     * 解析 sun.misc.Unsafe.allocateInstance，返回分配函数。
+     * Unsafe 是平台类，在 SystemUI 进程内可达；拿不到就 fail。
+     */
+    private fun resolveUnsafeAllocate(label: String): (Class<*>) -> Any {
+        val unsafe: Any
+        val allocateMethod: Method
+        try {
+            val unsafeClass = Class.forName("sun.misc.Unsafe")
+            val theUnsafe = unsafeClass.getDeclaredField("theUnsafe")
+            theUnsafe.isAccessible = true
+            unsafe = theUnsafe.get(null) ?: fail("sun.misc.Unsafe.theUnsafe is null")
+            allocateMethod = unsafeClass.getMethod("allocateInstance", Class::class.java)
+        } catch (t: Throwable) {
+            if (t is IllegalStateException) throw t
+            fail("$label Unsafe resolution: ${t.javaClass.simpleName}: ${t.message}")
+        }
+        return { clazz ->
+            try {
+                allocateMethod.invoke(unsafe, clazz)
+                    ?: throw IllegalStateException("allocateInstance returned null for ${clazz.name}")
+            } catch (ite: InvocationTargetException) {
+                throw ite.cause ?: ite
+            }
         }
     }
 
@@ -545,16 +652,10 @@ object HeaderCentering {
         // ---- trafficUi：可见时 subcompose/measure 并摆放（x=0、y 与原版一致） ----
         var trafficTop = 0 // 原局部 i：流量行顶部 y；不可见时为 0
         if (z) {
-            val lambda11 = api.lambda11Constructor.newInstance()
-            val lf = api.lambda11Fields
-            lf[0].set(lambda11, viewModel)
-            lf[1].set(lambda11, trafficState)
-            lf[2].setLong(lambda11, color)
-            lf[3].setFloat(lambda11, f7)
-            lf[4].set(lambda11, ms2)
-            lf[5].set(lambda11, ms3)
-            lf[6].set(lambda11, ms4)
-            lf[7].set(lambda11, fn1)
+            // 工厂入参 = 捕获字段按声明顺序的值（与原版逐字段赋值一一对应）
+            val lambda11 = api.lambda11Factory(
+                arrayOf<Any?>(viewModel, trafficState, color, f7, ms2, ms3, ms4, fn1)
+            )
             val trafficContent =
                 api.composableLambdaConstructor.newInstance(-305758715, true, lambda11)
             val trafficMeasurable = firstMeasurable(
@@ -572,18 +673,10 @@ object HeaderCentering {
         }
 
         // ---- dateAndTime：subcompose/measure（copy mask=8，与原版一致） ----
-        val lambda12 = api.lambda12Constructor.newInstance()
-        val df = api.lambda12Fields
-        df[0].setBoolean(lambda12, z)
-        df[1].setFloat(lambda12, fMargin)
-        df[2].set(lambda12, viewModel)
-        df[3].setLong(lambda12, color)
-        df[4].set(lambda12, ms5)
-        df[5].set(lambda12, ms3)
-        df[6].set(lambda12, ms4)
-        df[7].set(lambda12, flow2)
-        df[8].set(lambda12, fn2)
-        df[9].set(lambda12, fn3)
+        // 工厂入参 = 捕获字段按声明顺序的值（与原版逐字段赋值一一对应）
+        val lambda12 = api.lambda12Factory(
+            arrayOf<Any?>(z, fMargin, viewModel, color, ms5, ms3, ms4, flow2, fn2, fn3)
+        )
         val dateContent = api.composableLambdaConstructor.newInstance(-431306260, true, lambda12)
         val dateMeasurable = firstMeasurable(
             api.subcomposeMethod.invoke(measureScope, "dateAndTime", dateContent)
