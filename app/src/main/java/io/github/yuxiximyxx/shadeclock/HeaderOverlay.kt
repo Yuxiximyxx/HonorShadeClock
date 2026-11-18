@@ -188,6 +188,33 @@ import kotlin.math.roundToInt
  * ShadeCarrier 经查在本构建无布局声明、无实例化，是死代码，
  * 不挂钩。
  *
+ * v2.0.9：①避让收敛时序根治——v2.0.8 真机：来源追踪本身正确
+ * （system=501/adjusted=770），但 stack check #2/#3 仍停在
+ * 未收敛窗口（topPadding=501、realGap=−269），#4 才靠运气
+ * 收敛。本版先静态定案再改：dex 全量扫 invoke，写入口
+ * requestScrollerTopPaddingUpdate 的调用方只有 7 处、全在
+ * NotificationPanelView 内（Lambda3 动画取消回调、$7 面板
+ * 高度动画帧、onHeightChanged、onLayout、onQsHeightChanged、
+ * positionClockAndNotifications、setQsExpansion）。逐个核
+ * 我们写回的五个更新方法：updateAlgorithmHeightAndPadding /
+ * updateContentHeight（含荣耀 Hw 实现）/ updateStackPosition$1
+ * 均为纯计算，requestChildrenUpdate 只登记 pre-draw（异步），
+ * 唯 **notifyHeightChangeListener 同步再入**：它直达面板
+ * onHeightChanged（对任何 view 参数都执行尾部两步）→
+ * PanelView.requestPanelHeightUpdate → setExpandedHeight →
+ * setExpandedHeightInternal 无条件回调 onHeightUpdated →
+ * NotificationPanelView.onHeightUpdated（通知页 mQsExpanded
+ * =false 时）→ positionClockAndNotifications → 写入口——
+ * 嵌套写把字段盖回系统原值，其 after 又被我们自己的重入
+ * 保护挡掉，延迟复查/tick 每次补写都重走同一链，直到面板
+ * 状态变化（收敛条件消失）才偶然粘住。改法：writeTopPadding
+ * 的更新组**摘除 notifyHeightChangeListener**，只留经证实不
+ * 再入的四件；调整在同一调用栈内落定、链终止于调整值，延
+ * 迟复查保留作兜底。②运行时留有界证据：写入口每次经过记
+ * 一行 stack pass（来源分支 flow/qs/keyguard + 是否嵌套 +
+ * 字段前后值，每进程上限 40 行），配合 stack check 的真量
+ * 测验收。
+ *
  * 设置经 StampStore 的 stamp.txt 跨进程传递；覆盖层挂载时与每秒
  * tick 比对戳记，变了就重解析重载——切换主题免强停。
  * 全路径 try-catch：构建/渲染任何异常都卸下覆盖层、恢复原头部、
@@ -215,6 +242,10 @@ object HeaderOverlay {
         "com.android.systemui.statusbar.phone.NotificationPanelView"
     private const val STACK_CLASS_NAME =
         "com.android.systemui.statusbar.notification.stack.NotificationStackScrollLayout"
+    // 场景开关（v2.0.9 分支判定用）：静态布尔字段，经反编译核实
+    // （sget-boolean SceneContainerFlag.isSceneEnabled）。
+    private const val SCENE_FLAG_CLASS =
+        "com.android.systemui.scene.shared.flag.SceneContainerFlag"
 
     // 控制中心门控（v2.0.4）：类名经反编译核实——HwPanelControlImpl
     // 是页面状态分发者，HnColumeContainer 是头部父容器（镜像字段宿主自维护）。
@@ -287,6 +318,8 @@ object HeaderOverlay {
         var lastAdjustedWritten: Int? = null
         /** 写入口调整日志计数（有界，避免刷屏）。 */
         var interceptLogCount = 0
+        /** 写入口经过证据日志计数（v2.0.9，上限 40 行/进程）。 */
+        var stackPassLogCount = 0
         /** 延迟栈顶复查是否已在队列里（v2.0.7，防重复排队）。 */
         var stackReconcilePosted = false
         /** 延迟复查的连续重试次数（v2.0.7，上限后交给 tick 兜底）。 */
@@ -1012,7 +1045,7 @@ object HeaderOverlay {
     // 系统写入时机不受我们控制、tick 总慢半拍且基线捕获条件
     // 苛刻。v2.0.4 改拦截写入口：hook 该方法，after 里在同一次
     // 调用栈内读出系统刚写的值，加上（当前头部高 - 原头部高）
-    // 的增量后按系统同组更新方法放行——系统每次更新都自带
+    // 的增量后写回字段并刷新栈状态——系统每次更新都自带
     // 偏移，不再赛跑。挂起/卸载时只在当前值仍是我们调整过的
     // 值时才恢复系统原值。
     // v2.0.5 教训：v2.0.4 的拦截不幂等且会自激（见类头 v2.0.5
@@ -1033,6 +1066,12 @@ object HeaderOverlay {
     // HwNotchStatusBar 高 + dimen(notification_panelview_
     // margin_top=80dp=280px)；锁屏分支（mKeyguardShowing）=
     // mIntrinsicPadding，拦截不记录、不调整。
+    // v2.0.9：写回更新组摘除 notifyHeightChangeListener——它是
+    // 五个更新方法里唯一同步再入写入口的（经面板
+    // onHeightChanged → requestPanelHeightUpdate →
+    // setExpandedHeight → onHeightUpdated →
+    // positionClockAndNotifications 拐回），嵌套写盖回原值是
+    // 「未收敛窗口」的根源；完整链路见类头 v2.0.9 段。
 
     /** 定位 NSSL 并取其 AmbientState（从面板子树按类名找，找到后缓存）。 */
     private fun findStack(st: State): Boolean {
@@ -1088,16 +1127,27 @@ object HeaderOverlay {
     private fun writeTopPadding(st: State, value: Int) {
         val ambient = st.stackAmbient ?: return
         val stack = st.stackScroller ?: return
-        // 重入保护（v2.0.5）：下面的系统更新组会同步再触发写入口
-        // hook（乃至系统再写一次），置位期间拦截/兜底/恢复一律
-        // 跳过——v2.0.4 没这层保护，一次写入级联多次全栈重排，
-        // 是真机卡死与重复加增量的共同源头。
+        // 重入保护（v2.0.5）：置位期间拦截/兜底一律跳过，防级联
+        // 自激（v2.0.4 真机卡死的主因之一）。v2.0.9 起更新组已
+        // 摘除唯一能同步再入写入口的 notifyHeightChangeListener
+        // （链路见类头 v2.0.9 段），此保护只作并发兜底。
         if (st.stackAdjusting) return
         st.stackAdjusting = true
         try {
             XposedHelpers.setIntField(ambient, "mTopPadding", value)
-            // 与系统 requestScrollerTopPaddingUpdate 写完字段后相同的
-            // 更新组（方法名经反编译核实），逐个尽力调用。
+            // 系统写入口写完字段后的更新组里经静态核实**不**同步
+            // 再入写入口的最小子集（v2.0.9）：前三个纯计算（分别
+            // 刷布局高、内容高、栈 Y），requestChildrenUpdate 只
+            // 登记 pre-draw 子更新 + invalidate（异步，帧后子高
+            // 度变化是新的系统写入、自有拦截处理）。
+            // notifyHeightChangeListener **故意不调**：它直达
+            // 面板 onHeightChanged → requestPanelHeightUpdate →
+            // setExpandedHeight → onHeightUpdated →
+            // positionClockAndNotifications → 写入口，嵌套写会把
+            // 字段盖回系统原值且其 after 被重入保护挡掉——这正是
+            // v2.0.4–v2.0.8 避让靠运气收敛的根源。面板侧的高度
+            // 记账由系统自己每次写入时的尾随 notify 完成，不缺
+            // 我们这一次。
             runCatching { XposedHelpers.callMethod(stack, "updateAlgorithmHeightAndPadding") }
             runCatching { XposedHelpers.callMethod(stack, "updateContentHeight") }
             runCatching { XposedHelpers.callMethod(stack, "updateStackPosition\$1") }
@@ -1105,17 +1155,6 @@ object HeaderOverlay {
                     runCatching { XposedHelpers.callMethod(stack, "updateStackPosition") }
                 }
             runCatching { XposedHelpers.callMethod(stack, "requestChildrenUpdate") }
-            runCatching {
-                val evClass = XposedHelpers.findClass(
-                    "com.android.systemui.statusbar.notification.row.ExpandableView",
-                    stack.javaClass.classLoader,
-                )
-                XposedHelpers.callMethod(
-                    stack, "notifyHeightChangeListener",
-                    arrayOf(evClass, Boolean::class.javaPrimitiveType),
-                    null, false,
-                )
-            }
         } catch (t: Throwable) {
             logFn("stack sync: write failed: ${t.javaClass.name}: ${t.message}")
         } finally {
@@ -1129,7 +1168,8 @@ object HeaderOverlay {
      * AmbientState.mTopPadding 的系统写入口（方法体内完成计算、
      * 写字段与整组更新）。签名只有 boolean（动画标志），值在方法
      * 内部算出，故在 after 里同调用栈调整：读系统刚写的值 → 记为
-     * 系统原值 → 加头部高度增量 → 按系统同组更新方法放行。
+     * 系统原值 → 加头部高度增量 → 写回并刷新栈状态（v2.0.9 起
+     * 更新组已摘除会再入写入口的 notifyHeightChangeListener）。
      */
     private fun installStackWriteInterceptor(
         lpparam: XC_LoadPackage.LoadPackageParam,
@@ -1170,45 +1210,98 @@ object HeaderOverlay {
      * 里，我们自己的调整是直接写字段、从不经此方法——所以
      * after 里读到的字段值，只要不等于我们刚写下的目标值，
      * 就必然是系统本次写下的原始值，记为 lastSystemOriginal。
-     * 嵌套再入（我们写回的更新组同步触发）时同样先记录（嵌套
-     * 写落的正是系统最新原值），但不在嵌套栈里调更新组，只排
-     * 延迟复查。锁屏分支（面板 mKeyguardShowing）写的是
-     * mIntrinsicPadding、语义不同，不记录、不调整。
+     * 嵌套再入时同样先记录（嵌套写落的正是系统最新原值），但
+     * 不在嵌套栈里调更新组，只排延迟复查——v2.0.9 摘除
+     * notify 后我们的写回已无同步再入路径，此分支只作防御
+     * 兜底（系统自身经尾随 notify 链的自嵌套发生在方法体内、
+     * after 之前，不经此分支）。锁屏分支（面板
+     * mKeyguardShowing）写的是 mIntrinsicPadding、语义不同，
+     * 不记录、不调整。
      */
     private fun onSystemTopPaddingWrite(panel: View?) {
         val st = synchronized(states) {
             states.values.firstOrNull { it.wrapper != null }
         } ?: return
-        if (panel != null) {
-            val keyguardShowing = try {
-                XposedHelpers.getBooleanField(panel, "mKeyguardShowing")
-            } catch (t: Throwable) {
-                false
-            }
-            if (keyguardShowing) return
-        }
         if (!findStack(st)) return
         val cur = readTopPadding(st) ?: return
+        // 本次经过的来源分支与嵌套标记（v2.0.9 有界证据日志）：
+        // nested=true 表示这次经过发生在我们的调整调用栈内——
+        // v2.0.9 摘除 notify 后理论上不应再出现，出现即残留链路。
+        val nested = st.stackAdjusting
+        val branch = stackBranchOf(panel)
+        // 锁屏分支写的是 mIntrinsicPadding、语义不同，不记录、
+        // 不调整（与 v2.0.8 前的早退等价，只是挪到读值之后以便
+        // pass 日志能带上字段值）。
+        if (branch == "keyguard") {
+            logStackPass(st, branch, nested, cur, cur)
+            return
+        }
         // 来源记录（回声护栏：值等于我们刚写的目标时，可能是方法
         // 体因「值未变」没写、after 读到的是我们的值，不记录）
         if (cur != st.lastAdjustedWritten) {
             st.lastSystemOriginal = cur
         }
-        // 我们自己写回引发的嵌套再入（v2.0.5 防自激）：只记录 +
-        // 排延迟复查，不在嵌套栈里做调整——嵌套写（v2.0.6 实证
-        // 的 501）落字段后，等调用栈 unwind 由复查按最新原值补。
+        // 嵌套再入（防御兜底）：只记录 + 排延迟复查，不在嵌套栈
+        // 里做调整，等调用栈 unwind 由复查按最新原值补。
         if (st.stackAdjusting) {
             scheduleStackReconcile(st)
+            logStackPass(st, branch, nested, cur, readTopPadding(st) ?: cur)
             return
         }
         // 挂起（控制中心/横幅）时只记录不调整：挂起期系统写的
         // 值在门控恢复/attach 时由主动 reconcile 补账（v2.0.7）。
-        if (st.suspended) return
+        if (st.suspended) {
+            logStackPass(st, branch, nested, cur, cur)
+            return
+        }
         reconcileFromSource(st)
-        // 写后复查兜底（v2.0.7）：我们的写回也可能被更新组引发
-        // 的嵌套写覆盖（同上时序），排一次延迟复查读回校验；
-        // 已在位时复查是零写入空转，不增开销。
+        // 写后复查兜底（v2.0.7）：排一次延迟复查读回校验；已在
+        // 位时复查是零写入空转，不增开销。
         scheduleStackReconcile(st)
+        logStackPass(st, branch, nested, cur, readTopPadding(st) ?: cur)
+    }
+
+    /**
+     * 写入口本次经过的来源分支（v2.0.9）：按反编译核实的方法体
+     * 分支条件判定——面板 mKeyguardShowing → "keyguard"；
+     * !SceneContainerFlag.isSceneEnabled（静态布尔字段）或
+     * mBarState==2 → "qs"；其余 → "flow"；反射读不到 → "unknown"。
+     */
+    private fun stackBranchOf(panel: View?): String {
+        if (panel == null) return "unknown"
+        val keyguard = try {
+            XposedHelpers.getBooleanField(panel, "mKeyguardShowing")
+        } catch (t: Throwable) {
+            return "unknown"
+        }
+        if (keyguard) return "keyguard"
+        val barState = try {
+            XposedHelpers.getIntField(panel, "mBarState")
+        } catch (t: Throwable) {
+            -1
+        }
+        if (barState == 2) return "qs"
+        val sceneOn = try {
+            val cls = XposedHelpers.findClass(SCENE_FLAG_CLASS, panel.javaClass.classLoader)
+            XposedHelpers.getStaticBooleanField(cls, "isSceneEnabled")
+        } catch (t: Throwable) {
+            null
+        }
+        return when (sceneOn) {
+            false -> "qs"
+            true -> "flow"
+            null -> "unknown"
+        }
+    }
+
+    /** 写入口经过的有界证据日志（v2.0.9，每进程上限 40 行）：分支 + 是否嵌套 + 字段前后值。 */
+    private fun logStackPass(st: State, branch: String, nested: Boolean, before: Int, after: Int) {
+        if (st.stackPassLogCount >= 40) return
+        st.stackPassLogCount++
+        logFn(
+            "stack pass #${st.stackPassLogCount}: branch=$branch " +
+                "nested=$nested field $before -> $after"
+        )
     }
 
     /**
