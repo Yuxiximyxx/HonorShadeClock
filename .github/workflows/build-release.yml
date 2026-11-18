@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.17-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.18-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.17-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.18-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,43 +68,34 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.17
-          name: HonorShadeClock 2.0.17 — 修多次下拉仍不稳定（拆除显隐门）
+          tag_name: v2.0.18
+          name: HonorShadeClock 2.0.18 — 主题只存包本体，图片不再进图库
           body: |
-            ## HonorShadeClock 2.0.17
+            ## HonorShadeClock 2.0.18
 
-            单项修复：2.0.16 后多次下拉仍不稳——
-            第一拉在场、二拉中段样式缺席、三拉面
-            板已开头部仍全空。
+            单项改动：主题的存与读——渲染逻辑、门控、
+            跟随、避让等其余功能与 2.0.17 完全一致。
 
-            - 根因（真机日志逐拉对位）：2.0.16 新
-              接的下拉进度信号在真实下拉路径上从未
-              触发（日志里一次都没出现），并联门从
-              未开过；而原有的「容器可见」门在一次
-              会话里反复翻转约 15 次，连面板已开时
-              都出现关闭段——第二、三拉的空白都与
-              它的关闭段对位。两道二值门都不可靠。
-            - 决定性反证：日志里有整段面板全关的
-              时段，覆盖层透明度明明是满值、持续数
-              十秒，桌面却始终干净——覆盖层在通知
-              栏窗口内部，面板收起时窗口整体隐藏，
-              满透明度也画不出来，「全关后残留桌
-              面」的担心在本机不成立。
-            - 修法：整道二值门拆除，样式透明度只
-              跟时钟本体通道（关闭动画期间宿主会
-              把通道写到 0，整簇仍随面板淡出）。
-              两道门的跟踪值保留在诊断日志里备查，
-              不再参与显示。
+            - 旧版导入主题时把锁屏资产解压成一堆散图
+              存在 Download/HonorShadeClock/themes/ 下，
+              还按图片登记进系统媒体库，结果主题里的
+              每张图都出现在图库里。
+            - 新导入：只把主题文件本体原样存一份
+              （themes/<主题>/theme.pkg），按非媒体文件
+              登记；渲染器运行时直接读这份 zip 里的
+              manifest 与图片，不再解压。
+            - 存量主题：打开设置页会自动迁移——散图
+              就地打包回一个主题文件、散图本体与其
+              媒体库条目一并删除，图库随之清干净；
+              主题照常可用，不用重新导入。目录根另
+              放 .nomedia 兜底。
+            - 删除主题时包本体连同目录一起清干净；
+              主题列表与切换行为不变。
 
-            其余功能（面板开合/页面切换跟随、通知
-            避让、运营商隐藏、锁屏预挂起、重启系统
-            界面按钮、垂直偏移、各开关）与 2.0.16
-            完全一致，未做任何改动。
-
-            生效方式：覆盖安装 → 用设置页「重启系
-            统界面」按钮（或强停一次系统界面）→ 连
-            续下拉几次通知中心，看是否每次第一帧
-            时钟都在、且收起后桌面无残留。
+            生效方式：覆盖安装 → 打开一次设置页（等
+            它把旧主题迁移完）→ 用设置页「重启系统
+            界面」按钮重载 → 下拉通知中心确认样式
+            正常、图库里不再有主题散图。
             关闭办法：在 LSPosed 里停用模块再重启
             一次系统界面，即恢复原样。
           files: dist/*.apk

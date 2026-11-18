@@ -8,7 +8,10 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.graphics.fonts.Font
+import android.graphics.fonts.FontFamily
 import java.io.File
+import java.nio.ByteBuffer
 import java.util.Calendar
 import java.util.Locale
 import kotlin.math.max
@@ -110,7 +113,7 @@ class EvalContext(
  */
 class ThemeRenderer(private val log: (String) -> Unit) {
 
-    private var themeDir: File? = null
+    private var source: ThemeSource? = null
     private var model: ThemeModel? = null
     private var typeface: Typeface? = null
     private val bitmaps = HashMap<String, Bitmap?>()
@@ -168,24 +171,53 @@ class ThemeRenderer(private val log: (String) -> Unit) {
     var showWidgets: Boolean = false
     private var widgetSkipNodes: Set<XNode> = emptySet()
 
-    fun load(dir: File): Boolean {
-        themeDir = dir
+    /**
+     * 加载主题（v2.0.18）：entry 是主题包本体文件（zip 直读）或
+     * 旧版解压目录（迁移前兼容），按形态选 [ThemeSource]。
+     */
+    fun load(entry: File): Boolean {
+        source?.close()
+        source = null
         bitmaps.clear()
         missingLogged.clear()
+        val src = openSource(entry)
+        source = src
         model = try {
-            ThemeParser.load(dir)
+            src?.manifestBytes()?.let { ThemeParser.parse(it) }
         } catch (t: Throwable) {
-            log("theme parse failed in $dir: ${t.javaClass.name}: ${t.message}")
+            log("theme parse failed in $entry: ${t.javaClass.name}: ${t.message}")
             null
         }
-        typeface = loadTypeface(dir)
+        typeface = src?.let { loadTypeface(it) }
         backgroundSkipLogged = false
         widgetSkipNodes = model?.let { computeWidgetSkipNodes(it) } ?: emptySet()
         if (widgetSkipNodes.isNotEmpty()) {
             log("theme widgets: ${widgetSkipNodes.size} node(s) marked as data widgets")
         }
-        if (model == null) log("theme load failed: no valid manifest.xml in $dir")
+        if (model == null) log("theme load failed: no valid manifest.xml in $entry")
         return model != null
+    }
+
+    private fun openSource(entry: File): ThemeSource? {
+        return try {
+            when {
+                entry.isFile -> {
+                    val zip = ZipThemeSource(entry)
+                    if (zip.valid) {
+                        zip
+                    } else {
+                        zip.close()
+                        log("theme package has no lockscreen manifest: $entry")
+                        null
+                    }
+                }
+                entry.isDirectory -> DirThemeSource(entry)
+                else -> null
+            }
+        } catch (t: Throwable) {
+            log("theme source open failed in $entry: ${t.javaClass.name}: ${t.message}")
+            null
+        }
     }
 
     /** 属性串是否直接引用天气/电量数据（#Weather.…、@Weather.…、#battery_…）。 */
@@ -254,7 +286,8 @@ class ThemeRenderer(private val log: (String) -> Unit) {
      * stamp 另行赋值，不在此列。采纳后源实例不得再被使用。
      */
     fun adoptFrom(other: ThemeRenderer) {
-        themeDir = other.themeDir
+        source?.close()
+        source = other.source
         model = other.model
         typeface = other.typeface
         bitmaps.clear()
@@ -271,42 +304,42 @@ class ThemeRenderer(private val log: (String) -> Unit) {
     /**
      * 位图预解码（v2.0.11 预热用）：位图本是首绘时懒解码
      * （[bitmap]），冷进程首帧要现场解码整套图集，是下拉首显
-     * 迟滞的一环。这里把主题目录下的图片文件逐个按相对路径
-     * 预解码进缓存——[bitmap] 的缓存键就是解析后的相对路径，
-     * 遍历文件得到的相对路径与之天然一致，任何 manifest 能引用
-     * 到的文件都会命中。上限 512 个文件防病态主题目录。
-     * 只应在后台线程调用。
+     * 迟滞的一环。这里按 [ThemeSource.imagePaths] 枚举的图片
+     * 相对路径逐个预解码进缓存——[bitmap] 的缓存键就是相对
+     * 路径，枚举口径与之一致，任何 manifest 能引用到的文件
+     * 都会命中。上限 512 个文件防病态主题包。只应在后台线程
+     * 调用。
      */
     fun warmBitmapCache() {
-        val dir = themeDir ?: return
+        val src = source ?: return
         if (model == null) return
-        val exts = listOf(".png", ".jpg", ".jpeg", ".webp")
-        val files = try {
-            dir.walkTopDown().maxDepth(4)
-                .filter { f -> f.isFile && exts.any { f.name.endsWith(it, true) } }
-                .take(512)
-                .toList()
+        val paths = try {
+            src.imagePaths().take(512)
         } catch (t: Throwable) {
             log("theme bitmap warm scan failed: ${t.javaClass.name}: ${t.message}")
             return
         }
         var warmed = 0
-        for (f in files) {
-            val rel = f.relativeTo(dir).path.replace(File.separatorChar, '/')
+        for (rel in paths) {
             if (bitmap(rel) != null) warmed++
         }
-        log("theme bitmap cache warmed: $warmed/${files.size} image(s)")
+        log("theme bitmap cache warmed: $warmed/${paths.size} image(s)")
     }
 
-    private fun loadTypeface(dir: File): Typeface? {
-        val fontsDir = File(dir, "fonts")
-        val fontFile = fontsDir.listFiles()
-            ?.firstOrNull { it.isFile && (it.name.endsWith(".ttf", true) || it.name.endsWith(".otf", true)) }
-            ?: return null
+    /**
+     * 主题字体（v2.0.18 改字节构建）：资产只剩包本体一份、没有
+     * 落盘的字体文件可给 createFromFile，改走 Font.Builder
+     * （API 29+，minSdk 34 可用）从字节内存构建。失败回 null，
+     * 绘制侧回退系统字体（与旧版 createFromFile 失败同口径）。
+     */
+    private fun loadTypeface(src: ThemeSource): Typeface? {
+        val bytes = src.fontBytes() ?: return null
         return try {
-            Typeface.createFromFile(fontFile)
+            val font = Font.Builder(ByteBuffer.wrap(bytes)).build()
+            val family = FontFamily.Builder(font).build()
+            Typeface.CustomFallbackBuilder(family).build()
         } catch (t: Throwable) {
-            log("theme font load failed: ${fontFile.name}: ${t.message}")
+            log("theme font load failed: ${t.javaClass.name}: ${t.message}")
             null
         }
     }
@@ -406,12 +439,12 @@ class ThemeRenderer(private val log: (String) -> Unit) {
 
     private fun bitmap(relPath: String): Bitmap? {
         if (bitmaps.containsKey(relPath)) return bitmaps[relPath]
-        val dir = themeDir ?: return null
-        val file = File(dir, relPath)
+        val src = source ?: return null
         var bmp: Bitmap? = null
-        if (file.isFile) {
+        val bytes = src.assetBytes(relPath)
+        if (bytes != null) {
             bmp = try {
-                BitmapFactory.decodeFile(file.absolutePath)
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
             } catch (t: Throwable) {
                 null
             }

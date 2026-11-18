@@ -7,8 +7,11 @@ import java.io.File
  * 写成一个小文件 /sdcard/Download/HonorShadeClock/stamp.txt（经
  * MediaStore 写入，普通应用对公共 Download 目录的合规写路径）；
  * SystemUI 侧用普通文件 IO 读（它对 Download 的读写已被探针日志
- * 实证可行）。主题资产同样放在 /sdcard/Download/HonorShadeClock/
- * themes/<id>/（manifest.xml + 资产 + fonts/）。
+ * 实证可行）。主题资产放在 /sdcard/Download/HonorShadeClock/
+ * themes/<id>/：v2.0.18 起只存主题包本体一份（theme.pkg，渲染器
+ * 直接读 zip），不再解压散图（散图会被图库索引）；旧版解压目录
+ * （manifest.xml + 资产 + fonts/）在设置页迁移打包前仍可经
+ * [themeEntry] 兜底读取。目录根放 .nomedia 兜底防图库扫描。
  *
  * stamp.txt 格式（8 行）：themeId / stamp / heightMode / topStyle /
  * showBackground（1=画主题整幅背景图、0=不画，v2.0.3 加；旧 4 行
@@ -49,6 +52,10 @@ object StampStore {
     const val STAMP_NAME = "stamp.txt"
     const val RESTART_NAME = "restart.txt"
 
+    /** 主题包本体在主题目录里的固定文件名（v2.0.18）。 */
+    const val THEME_PACKAGE_NAME = "theme.pkg"
+    const val NOMEDIA_NAME = ".nomedia"
+
     val BASE_DIR = File("/sdcard/Download/HonorShadeClock")
     val THEMES_DIR = File(BASE_DIR, "themes")
     val STAMP_FILE = File(BASE_DIR, "stamp.txt")
@@ -70,6 +77,22 @@ object StampStore {
     )
 
     fun themeDir(id: String): File = File(THEMES_DIR, id)
+
+    /** 主题包本体文件（themes/<id>/theme.pkg）。 */
+    fun themePackage(id: String): File = File(themeDir(id), THEME_PACKAGE_NAME)
+
+    /**
+     * SystemUI 侧定位主题入口：优先包本体文件；旧版解压目录
+     * （设置页迁移还没跑到时）以 manifest.xml 存在为凭兜底；
+     * 两者都没有返回 null（调用方保持原头部）。
+     */
+    fun themeEntry(id: String): File? {
+        val pkg = themePackage(id)
+        if (pkg.isFile) return pkg
+        val dir = themeDir(id)
+        if (File(dir, "manifest.xml").isFile) return dir
+        return null
+    }
 
     fun formatStamp(
         themeId: String,

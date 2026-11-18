@@ -170,6 +170,22 @@ private fun SettingsScreen() {
         scope.launch(Dispatchers.IO) { ThemeStore.writeStamp(context, prefs) }
     }
 
+    // 存量主题迁移（v2.0.18）：旧版解压在公共目录里的散图会被
+    // 图库显示出来；设置页每次打开时在 IO 线程幂等跑一遍——把
+    // 散图打包回主题包本体、删散图与其 MediaStore 条目。有主题
+    // 被迁移时重写一次 stamp，让 SystemUI 侧随之改从包本体
+    // 重载（迁移前它经旧目录兼容读法照常渲染，不受影响）。
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        val migrated = withContext(Dispatchers.IO) {
+            ThemeStore.migrateLegacyThemes(context, prefs)
+        }
+        if (migrated > 0) {
+            themes = ThemeStore.loadThemes(prefs)
+            importStatus = "已把 $migrated 个旧主题打包成单文件（图库里的散图已清）"
+            syncStamp()
+        }
+    }
+
     fun saveTopStyle(theme: Boolean) {
         topStyleTheme = theme
         prefs.edit()
@@ -248,8 +264,7 @@ private fun SettingsScreen() {
                         prefs.edit()
                             .putString(ThemeStore.KEY_SELECTED_THEME, result.entry.id)
                             .apply()
-                        importStatus =
-                            "已导入并选中「${result.entry.name}」（${result.fileCount} 个文件）"
+                        importStatus = "已导入并选中「${result.entry.name}」"
                         syncStamp()
                     }
                     is ThemeImporter.Result.Err -> {
@@ -314,7 +329,10 @@ private fun SettingsScreen() {
                 .padding(innerPadding),
         ) {
             Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-                SmallTitle(text = "正式版 v2.0.12", insideMargin = PaddingValues(start = 4.dp))
+                SmallTitle(
+                    text = "正式版 v${BuildConfig.VERSION_NAME}",
+                    insideMargin = PaddingValues(start = 4.dp),
+                )
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     cornerRadius = 20.dp,

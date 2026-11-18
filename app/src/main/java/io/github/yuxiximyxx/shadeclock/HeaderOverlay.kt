@@ -765,12 +765,11 @@ object HeaderOverlay {
     private fun preheatWorker() {
         val stamp = StampStore.readStamp() ?: return
         if (stamp.topStyle != StampStore.TOP_STYLE_THEME || stamp.themeId.isEmpty()) return
-        val dir = StampStore.themeDir(stamp.themeId)
-        if (!dir.isDirectory) return
+        val entry = StampStore.themeEntry(stamp.themeId) ?: return
         val renderer = ThemeRenderer { message -> logFn(message) }
         renderer.showBackgroundImage = stamp.showBackground
         renderer.showWidgets = stamp.showWidgets
-        if (!renderer.load(dir)) return
+        if (!renderer.load(entry)) return
         renderer.warmBitmapCache()
         preheatedTheme = PreheatedTheme(stamp.themeId, stamp.stamp, renderer)
         logFn("overlay preheat ready: theme=${stamp.themeId}, stamp=${stamp.stamp}")
@@ -1532,9 +1531,12 @@ object HeaderOverlay {
                 teardown(header)
                 return
             }
-            val themeDir = StampStore.themeDir(stamp.themeId)
-            if (!themeDir.isDirectory) {
-                logFn("overlay: selected theme dir missing: $themeDir, keeping original header")
+            val themeEntry = StampStore.themeEntry(stamp.themeId)
+            if (themeEntry == null) {
+                logFn(
+                    "overlay: selected theme package missing for ${stamp.themeId}, " +
+                        "keeping original header"
+                )
                 teardown(header)
                 return
             }
@@ -1587,7 +1589,7 @@ object HeaderOverlay {
                     st.renderer.adoptFrom(pre.renderer)
                     preheatedTheme = null
                     logFn("overlay: theme adopted from preheat cache (zero-IO attach)")
-                } else if (!st.renderer.load(themeDir)) {
+                } else if (!st.renderer.load(themeEntry)) {
                     teardown(header)
                     return
                 } else {

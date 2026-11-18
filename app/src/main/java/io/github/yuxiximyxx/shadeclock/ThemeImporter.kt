@@ -7,6 +7,7 @@ import android.content.SharedPreferences
 import android.net.Uri
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import io.github.yuxiximyxx.shadeclock.theme.ThemePackage
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -25,7 +26,7 @@ object PublicStore {
 
     private val FILES_URI: Uri = MediaStore.Files.getContentUri("external")
 
-    /** relDir 形如 "Download/HonorShadeClock/themes/<id>/time"（无首尾斜杠）。 */
+    /** relDir 形如 "Download/HonorShadeClock/themes/<id>"（无首尾斜杠）。 */
     fun writeFile(context: Context, relDir: String, name: String, data: ByteArray): Boolean {
         val cr = context.contentResolver
         val rel = relDir.trim('/') + "/"
@@ -34,6 +35,74 @@ object PublicStore {
             val out = cr.openOutputStream(uri, "wt") ?: return false
             out.use { it.write(data) }
             true
+        } catch (t: Throwable) {
+            false
+        }
+    }
+
+    /** 流式写入（主题包本体可达几十 MB，不整读进内存）。 */
+    fun writeStream(
+        context: Context,
+        relDir: String,
+        name: String,
+        input: java.io.InputStream,
+    ): Boolean {
+        val cr = context.contentResolver
+        val rel = relDir.trim('/') + "/"
+        return try {
+            val uri = queryUri(cr, rel, name) ?: insertFile(cr, rel, name) ?: return false
+            val out = cr.openOutputStream(uri, "wt") ?: return false
+            out.use { input.copyTo(it) }
+            true
+        } catch (t: Throwable) {
+            false
+        }
+    }
+
+    /** 一条已登记文件的句柄：uri + 完整相对路径（形如 Download/HonorShadeClock/themes/<id>/time/time_0.png）。 */
+    class StoredFile(val uri: Uri, val fullPath: String)
+
+    /** 枚举 relDir 前缀下的全部自有文件（含子目录）。 */
+    fun listFiles(context: Context, relDir: String): List<StoredFile> {
+        val cr = context.contentResolver
+        val prefix = relDir.trim('/') + "/"
+        val out = ArrayList<StoredFile>()
+        try {
+            cr.query(
+                FILES_URI,
+                arrayOf(
+                    MediaStore.MediaColumns._ID,
+                    MediaStore.MediaColumns.RELATIVE_PATH,
+                    MediaStore.MediaColumns.DISPLAY_NAME,
+                ),
+                "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?",
+                arrayOf("$prefix%"),
+                null,
+            )?.use { cursor ->
+                val idIdx = cursor.getColumnIndex(MediaStore.MediaColumns._ID)
+                val relIdx = cursor.getColumnIndex(MediaStore.MediaColumns.RELATIVE_PATH)
+                val nameIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME)
+                while (cursor.moveToNext()) {
+                    val rel = cursor.getString(relIdx) ?: continue
+                    val name = cursor.getString(nameIdx) ?: continue
+                    out.add(
+                        StoredFile(
+                            ContentUris.withAppendedId(FILES_URI, cursor.getLong(idIdx)),
+                            rel + name,
+                        )
+                    )
+                }
+            }
+        } catch (t: Throwable) {
+            // 尽力而为
+        }
+        return out
+    }
+
+    /** 删除一条已登记文件（文件本体与 MediaStore 条目一并消失）。 */
+    fun deleteFile(context: Context, uri: Uri): Boolean {
+        return try {
+            context.contentResolver.delete(uri, null, null) > 0
         } catch (t: Throwable) {
             false
         }
@@ -184,13 +253,102 @@ object ThemeStore {
         }
         writeStamp(context, prefs)
     }
+
+    /**
+     * 兜底（v2.0.18）：在 HonorShadeClock 目录根放 .nomedia，
+     * 媒体扫描器跳过整棵子树——即便将来又落了图片文件也不进
+     * 图库。写入失败尽力而为（本体按非媒体登记才是主防线）。
+     */
+    fun ensureNoMedia(context: Context) {
+        PublicStore.writeFile(
+            context, StampStore.STAMP_REL_DIR, StampStore.NOMEDIA_NAME, ByteArray(0),
+        )
+    }
+
+    /**
+     * 存量迁移（v2.0.18）：旧版导入把主题解压成一堆散图存在
+     * themes/<id>/ 下、还以图片条目登记进 MediaStore，全被图库
+     * 显示出来。迁移把每个登记主题的散文件就地打包回一个
+     * theme.pkg（条目结构与新导入一致：锁屏资产在
+     * unlock/lockscreen/ 下、字体保持包根 fonts/），再逐条删掉
+     * 散文件——删 MediaStore 条目即删文件本体，图库条目随之
+     * 消失。返回成功迁移的主题数；已是包形态的主题跳过。
+     * 调用方在设置页打开时于 IO 线程跑一次，幂等；迁移后主题
+     * id 不变、登记不变，不需要用户重新导入。
+     */
+    fun migrateLegacyThemes(context: Context, prefs: SharedPreferences): Int {
+        ensureNoMedia(context)
+        var migrated = 0
+        for (entry in loadThemes(prefs)) {
+            if (migrateOneTheme(context, entry.id)) migrated++
+        }
+        return migrated
+    }
+
+    private fun migrateOneTheme(context: Context, id: String): Boolean {
+        val relDir = "${StampStore.THEMES_REL_DIR}/$id"
+        val prefix = "$relDir/"
+        val pkgPath = prefix + StampStore.THEME_PACKAGE_NAME
+        val files = PublicStore.listFiles(context, relDir)
+        val legacy = files.filter { it.fullPath != pkgPath }
+        if (legacy.isEmpty()) return false
+        val hasPackage = files.any { it.fullPath == pkgPath }
+        if (!hasPackage) {
+            val tmp = File(context.cacheDir, "theme_migrate_$id.zip")
+            try {
+                java.util.zip.ZipOutputStream(tmp.outputStream().buffered()).use { zos ->
+                    for (f in legacy) {
+                        val rel = f.fullPath.removePrefix(prefix)
+                        // 旧解压布局：锁屏资产在 <id>/<rel>、字体在
+                        // <id>/fonts/；回包时锁屏资产归位到
+                        // unlock/lockscreen/ 下（渲染器缺省
+                        // dynamicPath 即 lockscreen，与原包是否
+                        // 写过 theme.xml 无关、自洽），字体保持
+                        // 包根 fonts/。
+                        val entryName = if (rel.startsWith("fonts/")) {
+                            rel
+                        } else {
+                            "unlock/lockscreen/$rel"
+                        }
+                        val input = context.contentResolver.openInputStream(f.uri)
+                            ?: continue
+                        zos.putNextEntry(java.util.zip.ZipEntry(entryName))
+                        input.use { it.copyTo(zos) }
+                        zos.closeEntry()
+                    }
+                }
+                val ok = tmp.inputStream().buffered().use { ins ->
+                    PublicStore.writeStream(context, relDir, StampStore.THEME_PACKAGE_NAME, ins)
+                }
+                if (!ok) {
+                    tmp.delete()
+                    return false
+                }
+            } catch (t: Throwable) {
+                tmp.delete()
+                return false
+            }
+            tmp.delete()
+        }
+        // 包已就位（或本就有包、只是上次迁移删到一半）：删尽散文件
+        for (f in legacy) {
+            PublicStore.deleteFile(context, f.uri)
+        }
+        return true
+    }
 }
 
-/** .hnt/.hwt 主题包导入：解包、定位锁屏目录、把资产抽到公共目录。 */
+/**
+ * .hnt/.hwt 主题包导入（v2.0.18 改存包本体）：校验包里有锁屏
+ * manifest 后，只把主题文件原样复制一份存进 themes/<id>/（文件
+ * 名 theme.pkg，按 application/octet-stream 登记、不是图片条
+ * 目，图库索引不到），渲染器运行时直接读这份 zip。不再解压
+ * 散图——旧版解压出的散图全进了图库，就是这版要改掉的。
+ */
 object ThemeImporter {
 
     sealed interface Result {
-        class Ok(val entry: ThemeEntry, val fileCount: Int) : Result
+        class Ok(val entry: ThemeEntry) : Result
         class Err(val message: String) : Result
     }
 
@@ -201,63 +359,30 @@ object ThemeImporter {
                 ?: return Result.Err("读不到所选文件")
             input.use { ins -> cacheZip.outputStream().use { out -> ins.copyTo(out) } }
 
-            ZipFile(cacheZip).use { zip ->
+            val title = ZipFile(cacheZip).use { zip ->
+                if (ThemePackage.lockscreenPrefix(zip) == null) {
+                    return Result.Err("包里找不到锁屏 manifest.xml，不是可用的锁屏主题")
+                }
                 val entries = Collections.list(zip.entries())
-                val title = readTitle(zip, entries)
+                readTitle(zip, entries)
                     ?: displayName(context, uri)?.substringBeforeLast('.')
                     ?: "未命名主题"
-
-                var dynamicPath = "lockscreen"
-                val themeXml = entries.firstOrNull { it.name == "unlock/theme.xml" }
-                if (themeXml != null) {
-                    val text = zip.getInputStream(themeXml).readBytes().toString(Charsets.UTF_8)
-                    val m = Regex("""dynamicPath\s*=\s*"([^"]+)"""").find(text)
-                    if (m != null) dynamicPath = m.groupValues[1]
-                }
-                val prefix = "unlock/$dynamicPath/"
-                if (entries.none { it.name == prefix + "manifest.xml" }) {
-                    return Result.Err("包里找不到 ${prefix}manifest.xml，不是可用的锁屏主题")
-                }
-
-                val id = "t" + System.currentTimeMillis().toString(36)
-                var count = 0
-                for (entry in entries) {
-                    if (entry.isDirectory) continue
-                    val name = entry.name
-                    when {
-                        name.startsWith(prefix) -> {
-                            val rel = name.removePrefix(prefix)
-                            if (rel.isEmpty()) continue
-                            val dirPart = rel.substringBeforeLast('/', "")
-                            val fileName = rel.substringAfterLast('/')
-                            val relDir = if (dirPart.isEmpty()) {
-                                "${StampStore.THEMES_REL_DIR}/$id"
-                            } else {
-                                "${StampStore.THEMES_REL_DIR}/$id/$dirPart"
-                            }
-                            val data = zip.getInputStream(entry).readBytes()
-                            if (PublicStore.writeFile(context, relDir, fileName, data)) count++
-                        }
-                        name.startsWith("fonts/") &&
-                            (name.endsWith(".ttf", true) || name.endsWith(".otf", true)) -> {
-                            val data = zip.getInputStream(entry).readBytes()
-                            val fileName = name.substringAfterLast('/')
-                            if (PublicStore.writeFile(
-                                    context,
-                                    "${StampStore.THEMES_REL_DIR}/$id/fonts",
-                                    fileName, data,
-                                )
-                            ) {
-                                count++
-                            }
-                        }
-                    }
-                }
-                if (count == 0) {
-                    return Result.Err("资产写入失败（公共存储不可写）")
-                }
-                return Result.Ok(ThemeEntry(id, title), count)
             }
+
+            val id = "t" + System.currentTimeMillis().toString(36)
+            val ok = cacheZip.inputStream().buffered().use { ins ->
+                PublicStore.writeStream(
+                    context,
+                    "${StampStore.THEMES_REL_DIR}/$id",
+                    StampStore.THEME_PACKAGE_NAME,
+                    ins,
+                )
+            }
+            if (!ok) {
+                return Result.Err("主题文件写入失败（公共存储不可写）")
+            }
+            ThemeStore.ensureNoMedia(context)
+            return Result.Ok(ThemeEntry(id, title))
         } catch (t: Throwable) {
             return Result.Err("解析失败：${t.javaClass.simpleName}: ${t.message}")
         } finally {

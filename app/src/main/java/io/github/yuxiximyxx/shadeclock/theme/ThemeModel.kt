@@ -2,7 +2,6 @@ package io.github.yuxiximyxx.shadeclock.theme
 
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
-import java.io.File
 import java.io.InputStream
 
 /** 通用 XML 节点树（manifest.xml 先整体解析成树，再按语义解释）。 */
@@ -100,14 +99,12 @@ object ThemeParser {
     )
 
     /**
-     * 解析主题目录里的 manifest.xml。目录结构（由 App 导入时抽好）：
-     * <dir>/manifest.xml、<dir>/<资产相对路径>、<dir>/fonts/ 下的 ttf。
-     * 解析失败返回 null（调用方回退原头部）。
+     * 解析 manifest.xml 的字节（v2.0.18 起资产经 [ThemeSource] 读，
+     * 主题包本体与旧解压目录共用此入口）。解析失败返回 null
+     * （调用方回退原头部）。
      */
-    fun load(themeDir: File): ThemeModel? {
-        val manifest = File(themeDir, "manifest.xml")
-        if (!manifest.isFile) return null
-        val root = manifest.inputStream().buffered().use { parseXmlTree(it) } ?: return null
+    fun parse(manifestBytes: ByteArray): ThemeModel? {
+        val root = manifestBytes.inputStream().buffered().use { parseXmlTree(it) } ?: return null
         if (root.tag != "Lockscreen") return null
         val screenWidth = root.attr("screenWidth")?.toIntOrNull() ?: 1080
 
