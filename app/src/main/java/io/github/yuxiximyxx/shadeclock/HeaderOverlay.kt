@@ -409,6 +409,9 @@ object HeaderOverlay {
      */
     private const val OPEN_CONFIRM_MS = 8L
 
+    /** 页面切换取证的行数上限（v2.0.27，见 [logSwitchTrace]）。 */
+    private const val SWITCH_TRACE_MAX = 60
+
     // 锁屏门控（v2.0.3）：状态值与宿主 StatusBarState 的反编译源码
     // 逐一核对过（0=SHADE、1=KEYGUARD、2=SHADE_LOCKED、3=FS_USRSW）。
     private const val STATE_CONTROLLER_CLASS =
@@ -500,6 +503,10 @@ object HeaderOverlay {
     /** [pageSwitching] 的置位时刻（uptimeMillis），tick 防卡死兜底用。 */
     @Volatile
     private var pageSwitchSetAtMs = 0L
+
+    /** 页面切换取证计数（v2.0.27）：全进程最多 SWITCH_TRACE_MAX 行、漏斗写值节流 40ms，见 [logSwitchTrace]。 */
+    private var switchTraceCount = 0
+    private var switchTraceLastMs = 0L
 
     /** hook 回调捕获的 HnSwipeSwitchControllerImpl 实例（弱引用），供 tick 兜底直读其 mIsAnimationPlaying / mIsTracking。 */
     @Volatile
@@ -706,7 +713,7 @@ object HeaderOverlay {
          */
         var followAlpha = -1f
         var followAlphaAtMs = 0L
-        /** 二值收尾门（v2.0.21）的翻转日志计数（有界，防刷屏）。 */
+        /** 二值收尾门（v2.0.21）的翻转日志计数（有界，防刷屏；v2.0.27 上限 20→80，把页面切换段的翻转也纳进来留证）。 */
         var gateLogCount = 0
         /** 二值收尾门上次应用的判定（null=尚未应用），翻转才记日志/刷新。 */
         var gateClosed: Boolean? = null
@@ -740,6 +747,20 @@ object HeaderOverlay {
          * 见 [scheduleGateConfirmRecheck]。
          */
         var gateConfirmRecheckPosted = false
+        /**
+         * 页面切换中恢复挂载时先等跟随值（v2.0.27）：挂起（控制
+         * 中心驻留）结束恰逢切换进行中时置位——此时 interactor
+         * 通道里还是落定复位留下的旧值（两路 alpha=1、容器偏
+         * 移 0），attach 的对齐若直接落到这组旧值，覆盖层会整
+         * 簇全不透明抢先弹回还没移动的控制中心页上（v2.0.26
+         * 真机录屏定案，见 attach 的恢复分支注）。置位期间
+         * wrapper 保持 GONE、合成变换不应用；第一笔漏斗写值
+         * （alpha/容器平移，引擎 tracking 逐帧写）到达即清位
+         * 并按真值开门对齐；切换落定（pageSwitching 清位）后
+         * 仍没等到写值，则由 [applyWrapperVisibility] 自行清
+         * 位、回落到落定开门，不会永久等下去。
+         */
+        var resumeAwaitFollow = false
         /** 上一次采样的展开比例（判「正在下落」用），null=尚无采样。 */
         var gateLastFraction: Float? = null
         /** 面板本体（头部祖先 NotificationPanelView）与展开比例字段句柄（v2.0.22 收尾门用，懒定位、定位失败保持 null 走旧口径）。 */
@@ -817,11 +838,31 @@ object HeaderOverlay {
      * 的应用要过 [applyWrapperVisibility] 的时间确认
      * （复位尖峰单次采样不许开门），latch 解除同理（见
      * [updateCloseTailLatch] 注的定案）。
+     *
+     * v2.0.27 补第三项判据「头部本体已被宿主撤下」：展开
+     * 比例之外，头部 View 本身 visibility == GONE 也算关。
+     * 定案（v2.0.26 真机录屏+日志）：收起落定后整簇在桌
+     * 面原位全不透明重现约 225ms（约 10 帧）才随窗口隐藏
+     * 消失——比 v2.0.25 的单帧尖峰长得多：复位把比例写回
+     * 1.0 后能持续多发评估、8ms 时间确认被「持续成立」
+     * 放行（.25 回报预留的残余风险正是这条）。而两轮证据
+     * 里尖峰/复位时刻头部本体都是 GONE（.25 日志
+     * headerVis=8），历轮日志里真实下拉与全开驻留时头部
+     * 可见性只有 INVISIBLE/VISIBLE、从不为 GONE——头部是
+     * 被覆盖的槽位本体，它被宿主撤下（关闭行程撤头部、
+     * 落定复位期）时槽位不存在，覆盖层没有在场的理由。
+     * 此项同时让关侧与宿主撤头部的时刻同刻，不再单靠比
+     * 例归零或 latch。
      */
     private fun shadeSettledClosed(st: State): Boolean {
         if (pageSwitching) return false
         val fraction = panelExpandedFraction(st)
-        if (fraction != null) return fraction <= 0f || st.gateTailLatched
+        if (fraction != null) {
+            // 头部本体已被宿主撤下（GONE）也算关（v2.0.27，
+            // 定案见函数注）：复位期比例假读 1.0 也开不了门。
+            return fraction <= 0f || st.gateTailLatched ||
+                st.header.visibility == View.GONE
+        }
         return !shadeContainerVisible &&
             st.header.visibility != View.VISIBLE
     }
@@ -956,6 +997,18 @@ object HeaderOverlay {
             st.gateClosed = null
             return
         }
+        // 切换中恢复先等跟随值（v2.0.27）：置位期间保持
+        // GONE、不动门状态，等第一笔漏斗写值把判定带回真
+        // 值；切换已落定还没等到写值就清位、回落正常判定
+        // （见 State.resumeAwaitFollow 注）。
+        if (st.resumeAwaitFollow) {
+            if (!pageSwitching) {
+                st.resumeAwaitFollow = false
+            } else {
+                if (wrapper.visibility != View.GONE) wrapper.visibility = View.GONE
+                return
+            }
+        }
         updateCloseTailLatch(st)
         var closed = shadeSettledClosed(st)
         // 开门时间确认（v2.0.25 立、v2.0.26 修死锁）：门已关
@@ -1015,7 +1068,7 @@ object HeaderOverlay {
         }
         if (wrapper.visibility != want) {
             wrapper.visibility = want
-            if (st.gateLogCount < 20) {
+            if (st.gateLogCount < 80) {
                 st.gateLogCount++
                 logFn(
                     "overlay gate: ${if (closed) "settled-closed -> wrapper GONE" else "open -> wrapper VISIBLE"} " +
@@ -1294,6 +1347,13 @@ object HeaderOverlay {
                         override fun afterHookedMethod(param: MethodHookParam) {
                             val f = (param.args.getOrNull(0) as? Float) ?: return
                             apply(f)
+                            // 切换中恢复等跟随（v2.0.27）：第一
+                            // 笔真值写到达即清位——紧接着的
+                            // applyComposedToAllStates 里收尾门按
+                            // 真值开门、合成变换同栈对齐真值
+                            // （见 State.resumeAwaitFollow 注）。
+                            clearResumeAwaitFollow()
+                            logSwitchTrace("funnel:$method")
                             applyComposedToAllStates()
                         }
                     }
@@ -1351,6 +1411,7 @@ object HeaderOverlay {
                                 }
                             }
                         }
+                        logSwitchTrace("funnel:containerVisible")
                         applyComposedToAllStates()
                     }
                 }
@@ -1447,6 +1508,48 @@ object HeaderOverlay {
         }
     }
 
+    /** 清除全部 State 的「切换中恢复等跟随值」标志（v2.0.27，第一笔漏斗真值写到达时调）。 */
+    private fun clearResumeAwaitFollow() {
+        val snapshot = synchronized(states) { states.values.toList() }
+        for (st in snapshot) {
+            if (st.resumeAwaitFollow) st.resumeAwaitFollow = false
+        }
+    }
+
+    /**
+     * 页面切换取证（v2.0.27，有界）：切换开始/落定/取消/挂
+     * 起/恢复等事件点强制记一行、切换进行中的漏斗写值节流
+     * 40ms 记一行，全进程最多 [SWITCH_TRACE_MAX] 行。为
+     * v2.0.26 真机「下拉打开控制中心时整簇一帧内切断」留
+     * 的判别证据：一行内并列漏斗两路 alpha、容器偏移、头
+     * 部平移/可见性、展开比例、wrapper 的可见性/alpha/平
+     * 移与门状态——下一轮日志即可分辨切断来自 alpha 写
+     * 值、平移跳变还是收尾门/挂起。非切换期不记。
+     */
+    private fun logSwitchTrace(src: String, force: Boolean = false) {
+        if (!pageSwitching && !force) return
+        if (switchTraceCount >= SWITCH_TRACE_MAX) return
+        val now = SystemClock.uptimeMillis()
+        if (!force && now - switchTraceLastMs < 40L) return
+        switchTraceCount++
+        switchTraceLastMs = now
+        val st = synchronized(states) { states.values.firstOrNull() }
+        val w = st?.wrapper
+        logFn(
+            "switch trace #$switchTraceCount src=$src sw=$pageSwitching " +
+                "chA=$shadeCommonAlpha/$shadeTimeAlpha " +
+                "cXY=$shadeContainerX/$shadeContainerY " +
+                "visF=$shadeContainerVisible ccT=$controlCenterExpand " +
+                "expF=${st?.let { panelExpandedFraction(it) }} " +
+                "hVis=${st?.header?.visibility} " +
+                "hT=${st?.header?.translationX}/${st?.header?.translationY} " +
+                "wVis=${w?.visibility} wA=${w?.alpha} " +
+                "wT=${w?.translationX}/${w?.translationY} " +
+                "fA=${st?.followAlpha} gate=${st?.gateClosed} " +
+                "await=${st?.resumeAwaitFollow}"
+        )
+    }
+
     /**
      * 合成变换（v2.0.12，两路过渡的统一合成口径）：原头部的
      * 视觉变换 = 头部 View 自身变换 ∘ Compose 内容变换——
@@ -1467,6 +1570,12 @@ object HeaderOverlay {
      */
     private fun applyComposedTransform(st: State) {
         val wrapper = st.wrapper ?: return
+        // 切换中恢复等跟随值期间不应用（v2.0.27）：通道里还
+        // 是落定复位的旧值（alpha=1/偏移 0），此刻落到
+        // wrapper 上就是整簇抢先弹回；followAlpha 保持
+        // attach 复位留下的 -1，第一笔真值到达清位后同栈直
+        // 接对齐真值（见 State.resumeAwaitFollow 注）。
+        if (st.resumeAwaitFollow) return
         // alpha 斜率限制（v2.0.14，修进出通知中心闪烁）：合成目标
         // 曾有两个硬跳变输入——容器可见标志是二值门（日志实证它在
         // 过渡期会成串交替翻转，每翻一次旧口径就把 alpha 在 0 与
@@ -1514,6 +1623,9 @@ object HeaderOverlay {
      * 采样 View 属性拿不到），但顺带抄头部 translationY。
      */
     private fun applyFallbackFollow(st: State) {
+        // 切换中恢复等跟随值期间同样不应用（v2.0.27，同
+        // applyComposedTransform 的标志防线）。
+        if (st.resumeAwaitFollow) return
         val wrapper = st.wrapper ?: return
         val header = st.header
         val tx = header.translationX
@@ -1679,6 +1791,7 @@ object HeaderOverlay {
                         if (pageSwitching) {
                             pageSwitching = false
                             log("page switch settled (notify cc=$z)")
+                            logSwitchTrace("settled cc=$z", force = true)
                             // 跟随复位（v2.0.11）：落定回通知页才
                             // 复位为完全不透明；落定到控制中心不
                             // 复位——随后的 applyGate 会整组挂起，
@@ -1759,6 +1872,7 @@ object HeaderOverlay {
                             // 取消即回到起始页：起始页是通知页才
                             // 复位；起始页是控制中心时不复位（同
                             // notify 落定 cc 的理由，防挂起前闪帧）。
+                            logSwitchTrace("canceled", force = true)
                             if (!controlCenterExpand) resetFollowTransforms()
                             reevaluateGatesNow()
                         }
@@ -1804,6 +1918,7 @@ object HeaderOverlay {
             pageSwitching = true
             pageSwitchSetAtMs = SystemClock.uptimeMillis()
             logFn("page switch start: $source")
+            logSwitchTrace("start:$source", force = true)
         }
         reevaluateGatesNow()
     }
@@ -2050,12 +2165,23 @@ object HeaderOverlay {
                 val prevReason = st.suspendReason
                 st.suspended = false
                 st.suspendReason = null
+                // 切换中恢复先等跟随值（v2.0.27）：恢复恰逢页
+                // 面切换进行中时，通道里是控制中心落定复位留
+                // 下的旧值（alpha=1/偏移 0），下方的跟随对齐
+                // 若直接落这组值，整簇会抢在页面移动之前全不
+                // 透明弹回（v2.0.26 录屏定案）。置位后等第一
+                // 笔漏斗真值写到达才开门对齐（见
+                // State.resumeAwaitFollow 注）；不在切换中恢
+                // 复（锁屏/横幅结束）不置位、照旧立即对齐。
+                st.resumeAwaitFollow = pageSwitching
                 logFn(
                     "overlay resumed: $prevReason cleared " +
                         "(state=$statusBarState, cc=${isControlCenterActive(header)}, " +
                         "sw=$pageSwitching, hun=${isHeadsUpActive()}) " +
-                        "wrapperVis=${st.wrapper?.visibility}"
+                        "wrapperVis=${st.wrapper?.visibility} " +
+                        "awaitFollow=${st.resumeAwaitFollow}"
                 )
+                logSwitchTrace("resume:$prevReason", force = true)
             }
             // 主题背景图开关（v2.0.3）：stamp 每次挂载/变更时同步给渲染器
             st.renderer.showBackgroundImage = stamp.showBackground
@@ -3357,6 +3483,7 @@ object HeaderOverlay {
             logFn("overlay suspend failed: ${t.javaClass.name}: ${t.message}")
         }
         if (!wasSuspended || prevReason != reason) {
+            logSwitchTrace("suspend:$reason", force = true)
             logFn(
                 "overlay suspended: $reason (state=$statusBarState, " +
                     "cc=${isControlCenterActive(header)}, sw=$pageSwitching, " +
