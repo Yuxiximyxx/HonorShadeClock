@@ -411,10 +411,26 @@ object HeaderOverlay {
     private const val OPEN_CONFIRM_MS = 8L
 
     /**
-     * 面板连续因子饱和点（v2.0.28）：展开比例达到该值即全
-     * 不透明，见 [computePanelFactor]。
+     * 面板连续因子关侧饱和点（v2.0.28）：关闭行程中只降
+     * 不升的比较基线（展开比例达到该值即按全不透明算），
+     * 见 [computePanelFactor]。开侧已于 v2.0.30 改用渐入
+     * 窗 [PANEL_FADE_IN_START]/[PANEL_FADE_IN_END]，不再
+     * 共用这个饱和点。
      */
     private const val PANEL_FACTOR_SATURATION = 0.18f
+
+    /**
+     * 开侧渐入窗（v2.0.30）：展开比例低于起点因子恒 0、
+     * 高于终点恒 1、窗内 smoothstep，见 [computePanelFactor]。
+     * 起点 0.40 的依据：.29 真机日志里收尾门打开时刻的
+     * 比例分布为 0.34–0.47，最坏一例 0.47 在窗内也只得
+     * ≈0.06 的因子（压在未铺满的背景上肉眼不可见），其
+     * 余各轮开门时因子为 0；终点 0.90：面板近全开才全
+     * 显，fling 后段约 200ms 正好走完整个渐入。小乐已
+     * 明确接受出现晚一点、优先不起手闪。
+     */
+    private const val PANEL_FADE_IN_START = 0.40f
+    private const val PANEL_FADE_IN_END = 0.90f
 
     /**
      * 控制中心挂起/恢复的 alpha 斜坡全程（v2.0.28）：二值
@@ -809,10 +825,10 @@ object HeaderOverlay {
         var gateProgressionSeen = false
         /**
          * 面板连续因子（v2.0.28）：由展开比例连续驱动的透
-         * 明度乘子（饱和点 [PANEL_FACTOR_SATURATION]），关
-         * 闭行程中只降不升（单调），见 [computePanelFactor]。
-         * 与二值收尾门分工：门管终态清理、因子管行程中的
-         * 每一帧。
+         * 明度乘子——开侧走渐入窗（v2.0.30）、关侧用饱和
+         * 点 [PANEL_FACTOR_SATURATION] 且只降不升（单调），
+         * 见 [computePanelFactor]。与二值收尾门分工：门管
+         * 终态清理、因子管行程中的每一帧。
          */
         var panelFactor = 1f
         /** 因子上次采样的展开比例（判下落用）。 */
@@ -1833,14 +1849,30 @@ object HeaderOverlay {
     }
 
     /**
-     * 面板连续因子（v2.0.28）：展开比例 → 透明度乘子，
-     * 饱和点 [PANEL_FACTOR_SATURATION]（比例达 18% 即全
-     * 显——面板自身窗口的揭示慢于此，覆盖层不迟到，承
-     * v2.0.15 的开侧口径）。关闭行程（mClosing 或采样下
-     * 落）中只降不升：宿主在关闭尾段把高度打回满值时比
-     * 例假升、因子不跟升，闪无从发生。页面切换期比例恒
-     * 满、因子恒 1，不干涉横滑跟随；比例读不到时保持上
-     * 次值（fail-open 不劣化）。
+     * 面板连续因子（v2.0.28 引入；v2.0.30 开侧改渐入）：
+     * 展开比例 → 透明度乘子，两个方向两条曲线：
+     *
+     * 开侧（比例上升）：渐入窗 [PANEL_FADE_IN_START]～
+     * [PANEL_FADE_IN_END] 的 smoothstep。v2.0.15–.28 的
+     * 「下拉第一帧簇就在场」口径（开侧也用饱和点 0.18）
+     * 已被小乐于 v2.0.30 明确撤销——.29 真机日志定案：
+     * 每一轮下拉收尾门都在比例 0.34–0.47 处才打开（落
+     * 定隔离+开门确认走完），那时旧曲线早已饱和到 1.0、
+     * 通道 alpha 又是 1.0，开门那一帧合成 alpha 从 0 直
+     * 跳 1.0，而面板只展开约 1/3、背景未铺开，整簇全强
+     * 度浮在桌面上——就是每轮下拉起手那一闪（通知中心
+     * 里随后本就该显示、不突兀；控制中心里随即被摘、
+     * 格外刺眼；ccBound 闩在开门之后才置位、治不了这
+     * 一帧）。改渐入后开门时刻因子≈0、随行程平滑升到
+     * 全开 1.0。
+     *
+     * 关侧（mClosing 或采样下落）：仍用饱和点
+     * [PANEL_FACTOR_SATURATION] 的旧曲线且只降不升——
+     * v2.0.28 收起行程已真机过关、一字不动：宿主在关
+     * 闭尾段把高度打回满值时比例假升、因子不跟升。
+     *
+     * 页面切换期比例恒满、因子恒 1，不干涉横滑跟随；
+     * 比例读不到时保持上次值（fail-open 不劣化）。
      */
     private fun computePanelFactor(st: State): Float {
         if (pageSwitching) {
@@ -1850,18 +1882,26 @@ object HeaderOverlay {
         }
         val fraction = panelExpandedFraction(st)
             ?: return st.panelFactor
-        val curve = (fraction / PANEL_FACTOR_SATURATION)
-            .coerceIn(0f, 1f)
         val last = st.factorLastFraction
         val falling = last != null && fraction < last - 0.0005f
         st.factorLastFraction = fraction
         val next = if (panelClosing(st) == true || falling) {
+            val curve = (fraction / PANEL_FACTOR_SATURATION)
+                .coerceIn(0f, 1f)
             min(st.panelFactor, curve)
         } else {
-            curve
+            fadeInCurve(fraction)
         }
         st.panelFactor = next
         return next
+    }
+
+    /** 开侧渐入曲线（v2.0.30）：渐入窗内的 smoothstep。 */
+    private fun fadeInCurve(fraction: Float): Float {
+        val t = ((fraction - PANEL_FADE_IN_START) /
+            (PANEL_FADE_IN_END - PANEL_FADE_IN_START))
+            .coerceIn(0f, 1f)
+        return t * t * (3f - 2f * t)
     }
 
     /**
