@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.5-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.6-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.5-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.6-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,29 +68,24 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.5
-          name: HonorShadeClock 2.0.5 — 治卡顿/秒数不跳、小模块默认关
+          tag_name: v2.0.6
+          name: HonorShadeClock 2.0.6 — 横幅通知时不显示时间样式（第三道门控）
           body: |
-            ## HonorShadeClock 2.0.5
+            ## HonorShadeClock 2.0.6
 
-            修 v2.0.4 真机「很卡顿、几乎卡死、秒数
-            不跳」与小模块取舍：
+            修 v2.0.5 真机：弹出横幅通知时时间样式
+            也会出现、压在横幅卡片上。口径不变——
+            时间样式只在通知中心页出现，其它界面都
+            不许出现，本版补上第三道门控：
 
-            - 卡顿根因：通知栈顶的调整不幂等且会自
-              激——我们写回位置时调用的系统更新会同
-              步再触发调整，一次写入级联多次全栈重
-              排；且系统重启过渡期会按已变高的头部
-              量出含增量的值，旧逻辑把它当原值又加
-              一遍（越加越高、主线程被塞满，秒数自
-              然不跳）。现改为写死判定（原值才加、
-              已含增量不加、自己写过的值跳过）+ 写
-              回重入保护 + 目标值已在位时不调更新
-              组；对齐去掉每秒硬摆位置，面板不可见
-              时不重绘。
-            - 小模块默认关：设置页新增「小模块（温
-              度/风向/电量）」开关，默认关——只显示
-              时间样式（时钟/日期/星期），温度、风
-              向、电量三列先不画，等后期优化好再开。
+            - 横幅门控：跟踪系统横幅管理器的聚合呈
+              现状态（与系统自己的「横幅显示中」窗
+              口状态同源、呈现进入/退出即时变化），
+              横幅呈现中整组挂起覆盖层（头部高度与
+              通知栈顶恢复系统原值），横幅消失自动
+              恢复；状态变化即时生效，不等每秒轮询。
+            - 前两道门控（锁屏、控制中心页）与卡顿
+              修复、小模块开关保持不变。
 
             生效方式：覆盖安装 → 强停一次系统界面 →
             下拉通知中心查看（主题与设置沿用已导入
