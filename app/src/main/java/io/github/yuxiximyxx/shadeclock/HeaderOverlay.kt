@@ -23,6 +23,7 @@ import java.lang.ref.WeakReference
 import java.util.Calendar
 import java.util.WeakHashMap
 import kotlin.math.abs
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
@@ -561,6 +562,13 @@ object HeaderOverlay {
         var stackAdjusting = false
         /** tick 计数（心跳日志用，v2.0.5）。 */
         var tickCount = 0
+        /**
+         * 跟随 alpha 的已应用值与应用时刻（v2.0.14 斜率限制用）：
+         * followAlpha < 0 表示尚无应用值、下一次应用直接对齐
+         * 目标（attach/恢复时复位到 -1，见 applyComposedTransform）。
+         */
+        var followAlpha = -1f
+        var followAlphaAtMs = 0L
     }
 
     /** 自绘层：每帧按当前环境（时间/电量/天气）让渲染器画一遍。 */
@@ -758,8 +766,12 @@ object HeaderOverlay {
                         val v = (param.args.getOrNull(0) as? Boolean) ?: return
                         if (v != shadeContainerVisible) {
                             shadeContainerVisible = v
-                            // 可见标志翻转是低频事件（开合起止/收尾
-                            // 藏头部），逐次记一行供真机核对跟随链
+                            // 翻转逐次记一行供真机核对跟随链。注意
+                            // 它并不低频：v2.0.12/13 真机日志里过渡
+                            // 期会成串交替翻转——这正是 v2.0.14 在
+                            // applyComposedTransform 加斜率限制的
+                            // 原因（标志本身照常即时跟踪，砸到
+                            // wrapper 上的跳变由斜率封顶吸收）。
                             logFn("header container visible -> $v")
                         }
                         applyComposedToAllStates()
@@ -803,7 +815,8 @@ object HeaderOverlay {
      * 覆盖层是同级普通 View，两层都得自己抄：
      * - alpha ＝ [effectiveShadeAlpha]（两路 alpha 的保守合成，
      *   与驱动无关——谁在写漏斗就跟谁，页面切换与面板开合
-     *   不会互相打架，因为它们写的是同一组通道）；
+     *   不会互相打架，因为它们写的是同一组通道）；落到
+     *   wrapper 前再过一道斜率限制（v2.0.14，见函数内注）；
      * - translationX ＝ 头部 View 平移 + 容器根偏移 X；
      * - translationY ＝ 头部 View 平移 + 容器根偏移 Y。
      * 稳态（面板全开、无切换）下跟踪值恒为 alpha 通道 1、
@@ -812,7 +825,34 @@ object HeaderOverlay {
      */
     private fun applyComposedTransform(st: State) {
         val wrapper = st.wrapper ?: return
-        val a = effectiveShadeAlpha()
+        // alpha 斜率限制（v2.0.14，修进出通知中心闪烁）：合成目标
+        // 有两个硬跳变输入——容器可见标志是二值门（日志实证它在
+        // 过渡期会成串交替翻转，每翻一次旧口径就把 alpha 在 0 与
+        // 通道值之间砸一个来回）；卷帘跟踪时两路 alpha 又是分开
+        // 写的，min() 跟着先跳的那一路走（真机 diag 抓到开合中段
+        // effA 在相邻两秒间 0↔1 直跳、平移还在动）。故已应用值
+        // 不许直跳目标：按真实时间把每步移动量封顶为「全程
+        // 90ms」——宿主自己的动画器都是 200ms 起、跟踪渐变是
+        // 手指速度，都比封顶慢、原样通过；单帧毛刺（可见标志
+        // 一帧假翻、收尾 alpha 复位 1 抢在 visible=false 前一两
+        // 帧到达）只剩一个浅坑/小包，不再整幅闪。首应用与
+        // attach/恢复（followAlpha 被复位）直接对齐，不留残影。
+        val target = effectiveShadeAlpha()
+        val now = SystemClock.uptimeMillis()
+        val last = st.followAlpha
+        val a = if (last < 0f) {
+            target
+        } else {
+            val dtMs = (now - st.followAlphaAtMs).coerceIn(0L, 250L)
+            val maxDelta = dtMs * (1f / 90f)
+            when {
+                target > last -> min(target, last + maxDelta)
+                target < last -> max(target, last - maxDelta)
+                else -> last
+            }
+        }
+        st.followAlpha = a
+        st.followAlphaAtMs = now
         if (wrapper.alpha != a) wrapper.alpha = a
         val tx = st.header.translationX + shadeContainerX
         if (wrapper.translationX != tx) wrapper.translationX = tx
@@ -1420,6 +1460,9 @@ object HeaderOverlay {
             // 挂载/恢复时按当前跟踪值把合成变换接上——过渡中恢
             // 复挂载的接上当前帧；稳态跟踪值恒为恒等变换，等同
             // 复位（防上次跟随的残值把覆盖层留在半透明/偏移位）。
+            // v2.0.14：对齐前复位斜率状态，这一次应用直接落到
+            // 目标值（恢复不许从挂起前的旧 alpha 慢慢爬回来）。
+            st.followAlpha = -1f
             applyComposedTransform(st)
             // 首显即时（v2.0.11）：挂载完成不等 tick——本帧就把
             // 首绘排上（面板当前可见才有意义，不可见时预抽断言
@@ -2412,6 +2455,7 @@ object HeaderOverlay {
                 "wrapper=[${wrapper?.left},${wrapper?.top},${wrapper?.right},${wrapper?.bottom}] " +
                 "vis=${wrapper?.visibility} alpha=${wrapper?.alpha} " +
                 "effA=${effectiveShadeAlpha()} visFlag=$shadeContainerVisible " +
+                "chA=$shadeCommonAlpha/$shadeTimeAlpha " +
                 "cXY=${shadeContainerX}/${shadeContainerY} " +
                 "hTXY=${header.translationX}/${header.translationY} " +
                 "child=$childIdx/${parent?.childCount} clip=${parent?.clipChildren} | " +
@@ -2492,6 +2536,8 @@ object HeaderOverlay {
         val prevReason = st.suspendReason
         st.suspended = true
         st.suspendReason = reason
+        // 斜率状态复位（v2.0.14）：恢复后的第一次应用直接对齐
+        st.followAlpha = -1f
         // 栈顶停手并恢复系统原值，别误伤锁屏/控制中心自己的布局
         restoreStackTop(st)
         try {
