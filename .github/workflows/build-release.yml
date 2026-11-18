@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.24-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.25-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.24-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.25-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,31 +68,33 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.24
-          name: HonorShadeClock 2.0.24 — 返回闪烁修 + 垂直偏移放宽 + 设置页折叠分组
+          tag_name: v2.0.25
+          name: HonorShadeClock 2.0.25 — 返回闪烁再修（开门时间确认） + 设置页改 MIUI 式二级页面
           body: |
-            ## HonorShadeClock 2.0.24
+            ## HonorShadeClock 2.0.25
 
-            三件事：
+            两件事：
 
-            1. 返回（收起）闪烁修复：真机日志定案——收起
-            时原系统头部是被系统在行程中途先行隐藏的，而
-            覆盖层此前要等面板完全收完才撤，于是独自以全
-            不透明多留了约十几帧、末段被裁成残条。本版改
-            为：关闭行程中系统一藏原头部，覆盖层同刻撤下
-            （打开方向不受影响，下拉第一帧仍是加载好的成
-            品图）。
+            1. 返回（收起）闪烁再修：v2.0.24 的日志定
+            案——上一版的「收尾早关」其实触发成功了（在
+            面板还没收完时就与原头部同刻撤下），但面板
+            完全收起后系统做状态复位时把展开比例一次性
+            打回了满值，模块把这一瞬间的读数误判成「手
+            势反转重开」，又把整簇贴回了桌面约一帧。本
+            版给开门加了时间确认：重新打开的判定须持续
+            成立约半帧才算数，一次性的读数尖峰等不到确
+            认就回落；真实下拉与收起中途反手再拉都是持
+            续过程，只迟约一帧、第一帧仍是加载好的成品
+            图。打开侧其余行为、横滑跟随、三道门控、通
+            知避让均未动。
 
-            2. 垂直偏移范围放宽：-120dp～+40dp 改为
-            -400dp～+160dp。有些主题的时钟本身在画布中
-            部偏下，原范围拉满仍偏下；已存的偏移值原样有
-            效，仍按主题各记各的，偏移最多把时钟簇推到贴
-            边、不会移出画面。
-
-            3. 设置页改可折叠分组：点分组标题展开/收起，
-            展开状态会记住。默认展开「主题管理」「位置」，
-            其余默认收起；「重启系统界面」不折叠、常显。
-            所有设置项与原有行为不变。
+            2. 设置页改 MIUI 式二级页面：上一版的自研
+            折叠分组撤掉（miuix 本身也没有官方折叠组
+            件）。主页只留说明卡、一列分组入口与常显的
+            「重启系统界面」；主题管理、位置、显示与开
+            关、原系统头部、说明各自点进独立子页（顶部
+            返回、卡片分组、全套 miuix 组件）。所有设置
+            项与原有行为不变。
 
             生效方式：覆盖安装 → 打开一次设置页 → 用
             「重启系统界面」按钮重载 → 下拉确认。
