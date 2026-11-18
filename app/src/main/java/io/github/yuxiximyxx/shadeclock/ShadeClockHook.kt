@@ -16,7 +16,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.roundToInt
 
 /**
- * 入口（v2.0.0，方案 B）：通知栏顶部覆盖层 + 通用荣耀锁屏主题渲染。
+ * 入口（v2.0.1，方案 B）：通知栏顶部覆盖层 + 通用荣耀锁屏主题渲染。
  *
  * 两块互相独立：
  * 1. 覆盖层（HeaderOverlay）：隐藏头部 Compose 内容、自绘覆盖层按
@@ -147,7 +147,7 @@ class ShadeClockHook : IXposedHookLoadPackage, IXposedHookInitPackageResources {
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != TARGET_PACKAGE) return
-        diag("=== HonorShadeClock v2.0.0 loaded in $TARGET_PACKAGE ===")
+        diag("=== HonorShadeClock v2.0.1 loaded in $TARGET_PACKAGE ===")
         installDimenDiagnostic(lpparam)
         HeaderOverlay.install(lpparam) { message -> diag(message) }
     }

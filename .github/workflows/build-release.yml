@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.0-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.1-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.0-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.1-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,37 +68,34 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.0
-          name: HonorShadeClock 2.0.0 — 方案 B：锁屏主题覆盖层
+          tag_name: v2.0.1
+          name: HonorShadeClock 2.0.1 — 覆盖层改同级挂载
           body: |
-            ## HonorShadeClock 2.0.0
+            ## HonorShadeClock 2.0.1
 
-            方案 B 落地：放弃 v1.1.x 的原样复刻居中路线，改为在
-            通知栏顶部盖一层自绘覆盖层，按荣耀锁屏主题的样式
-            渲染；v1.1.x 的两套居中 hook 与居中开关整体下线。
+            修 v2.0.0 覆盖层挂载失败：头部继承
+            BasicComposeView、禁止 addView，v2.0.0 把覆盖层
+            加进头部内部被拒（真机日志实证），回退机制虽
+            保住了原头部，但覆盖层始终没生效。
 
-            - 覆盖层：隐藏头部 Compose 内容、自绘层接管，
-              高度三档（跟随内容 / 屏高 1/3 / 屏高 1/2），
-              右上角铃铛复刻（点击打开通知管理，与原行为
-              一致）；构建/渲染任何异常都自动卸下覆盖层、
-              恢复原头部，不让系统界面崩。
-            - 通用渲染器：运行时解析选中主题的
-              unlock/lockscreen/manifest.xml（数据驱动，
-              不写死主题），支持 Group/Image/Time/DateTime/
-              Text + Var/VarArray + 表达式求值子集；动画按
-              终态静态渲染，缺图/未知变量一律容错跳过。
-            - 主题管理：设置页导入 .hnt/.hwt、点选切换、
-              删除；资产抽到 Download/HonorShadeClock/
-              themes/，切换免强停（下次下拉即生效）。
-            - 天气小模块：照开源项目 HonorDuo 的路子读系统
-              天气服务（锁屏同源），温度/风向键名以真机
-              日志 dump 定案为准，本版可能先留空。
-            - 原系统头部模式保留：关掉「锁屏主题样式」即
-              回原头部，字号滑杆（放大）继续有效。
+            - 挂载改「同级覆盖」：覆盖层不再进头部内部，
+              改加到头部的父容器（HnColumeContainer，
+              FrameLayout 子类）里、z 序在头部之后，位置
+              尺寸与头部对齐；头部本体保留占位（内容
+              隐藏、高度改为覆盖层目标高度），通知仍被
+              推到下面。父容器若同样拒绝 addView，逐级
+              向上找第一个可加子视图的祖先容器兜底。
+            - 每秒 tick 新增 bounds 对齐：覆盖层位置尺寸
+              与头部重新对齐一次，防配置变更/重测后错位；
+              覆盖层被摘下时自动重挂。
+            - 自动停用阈值由连续失败 3 次放宽到 8 次，
+              成功挂载后失败计数归零。
+            - 渲染器、主题导入/切换、天气、铃铛、设置页
+              与 v2.0.0 完全一致，未动。
 
-            生效方式：LSPosed 启用模块、作用域勾「系统
-            界面」→ 强停一次系统界面 → 打开模块导入主题 →
-            下拉通知中心查看。
+            生效方式：覆盖安装 → 强停一次系统界面 →
+            下拉通知中心查看（主题与设置沿用 v2.0.0 的
+            已导入状态，无需重导）。
             关闭办法：在 LSPosed 里停用模块再强停一次
             系统界面，即恢复原样。
           files: dist/*.apk

@@ -27,11 +27,20 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
- * 方案 B 覆盖层（v2.0.0）：在 SystemUI 里定位通知中心头部
+ * 方案 B 覆盖层（v2.0.1）：在 SystemUI 里定位通知中心头部
  * HnNotificationCenterHeader，隐藏其 Compose 内容子视图，把头部
- * 高度改为覆盖层高度，并在头部容器内加一层自绘 View，按选中的
- * 荣耀锁屏主题（/sdcard/Download/HonorShadeClock/themes/<id>/）
- * 渲染；右上角复刻铃铛（点击反射调用宿主
+ * 高度改为覆盖层高度，并按选中的荣耀锁屏主题
+ * （/sdcard/Download/HonorShadeClock/themes/<id>/）渲染。
+ *
+ * 挂载方式（v2.0.1 改）：头部继承 BasicComposeView，禁止 addView
+ * （v2.0.0 真机实证 UnsupportedOperationException），故覆盖层不再
+ * 加进头部内部，而是**同级覆盖**：加到头部的父容器（实测为
+ * HnColumeContainer，FrameLayout 子类）里、z 序在头部之后，位置
+ * 尺寸与头部对齐；父容器若同样拒绝 addView 则逐级向上找第一个
+ * 可加子视图的 ViewGroup 祖先。头部本体保留占位（内容隐藏、高度
+ * 改为覆盖层目标高度），布局流仍由头部高度驱动、通知被推到下面。
+ * 每秒 tick 把覆盖层 bounds 与头部重新对齐一次。
+ * 右上角复刻铃铛（点击反射调用宿主
  * HwNotificationUtils.getManageNotificationsIntent()，与原
  * ViewModel.onClickNotifMgeBtn 的主路径一致；失败退化为系统
  * 通知设置页。原铃铛在有前台服务包时的弹窗分支不复刻）。
@@ -39,7 +48,8 @@ import kotlin.math.roundToInt
  * 设置经 StampStore 的 stamp.txt 跨进程传递；覆盖层挂载时与每秒
  * tick 比对戳记，变了就重解析重载——切换主题免强停。
  * 全路径 try-catch：构建/渲染任何异常都卸下覆盖层、恢复原头部、
- * 写日志，绝不让 SystemUI 崩；同进程连续失败 3 次后本进程停用。
+ * 写日志，绝不让 SystemUI 崩；同进程连续失败 8 次后本进程停用，
+ * 首次成功挂载后失败计数归零。
  */
 object HeaderOverlay {
 
@@ -48,6 +58,7 @@ object HeaderOverlay {
     private const val HW_UTILS_CLASS =
         "com.android.systemui.statusbar.notification.HwNotificationUtils"
     private const val WRAPPER_MARKER = "shadeclock_overlay_wrapper"
+    private const val MAX_FAILURES = 8
 
     private lateinit var logFn: (String) -> Unit
     private val states = WeakHashMap<View, State>()
@@ -58,6 +69,8 @@ object HeaderOverlay {
 
     private class State(val header: ViewGroup) {
         var wrapper: FrameLayout? = null
+        var mountParent: ViewGroup? = null
+        var mountBounds: IntArray? = null
         var themeView: ThemeView? = null
         var bell: ImageButton? = null
         var bellDrawableSet = false
@@ -131,7 +144,7 @@ object HeaderOverlay {
     // ---------- 挂载 ----------
 
     private fun attach(header: ViewGroup) {
-        if (processFailureCount >= 3) return
+        if (processFailureCount >= MAX_FAILURES) return
         try {
             val stamp = StampStore.readStamp()
             if (stamp == null ||
@@ -151,6 +164,8 @@ object HeaderOverlay {
                 states.getOrPut(header) { State(header) }
             }
             ensureWrapper(header, st)
+            // 走到这里说明覆盖层已成功挂到父容器上：失败计数归零
+            if (processFailureCount != 0) processFailureCount = 0
             hideComposeChildren(header, st)
             if (st.loadedThemeId != stamp.themeId ||
                 st.appliedStamp?.stamp != stamp.stamp
@@ -170,9 +185,10 @@ object HeaderOverlay {
             WeatherSource.start(header.context) { message -> logFn(message) }
             if (!st.mountLogged) {
                 st.mountLogged = true
+                val b = st.mountBounds
                 logFn(
-                    "overlay mounted: parent=${header.javaClass.simpleName}, " +
-                        "height=${header.layoutParams?.height}, theme=${stamp.themeId}, " +
+                    "overlay mounted as sibling: parent=${st.mountParent?.javaClass?.name}, " +
+                        "bounds=${b?.joinToString(",")}, theme=${stamp.themeId}, " +
                         "heightMode=${stamp.heightMode}"
                 )
             }
@@ -182,55 +198,162 @@ object HeaderOverlay {
     }
 
     private fun ensureWrapper(header: ViewGroup, st: State) {
-        if (st.wrapper != null) return
-        val ctx = header.context
-        st.originalHeight = header.layoutParams?.height?.takeIf { it > 0 } ?: 280
+        if (st.wrapper == null) {
+            val ctx = header.context
+            st.originalHeight = header.layoutParams?.height?.takeIf { it > 0 } ?: 280
 
-        val wrapper = FrameLayout(ctx)
-        wrapper.tag = WRAPPER_MARKER
-        val themeView = ThemeView(
-            ctx,
-            envProvider = { buildEnv(st) },
-            renderer = st.renderer,
-            onContentHeightChanged = {
-                val stamp = st.appliedStamp
-                if (stamp != null && stamp.heightMode == StampStore.HEIGHT_FOLLOW) {
-                    applyHeight(header, st, stamp)
+            val wrapper = FrameLayout(ctx)
+            wrapper.tag = WRAPPER_MARKER
+            val themeView = ThemeView(
+                ctx,
+                envProvider = { buildEnv(st) },
+                renderer = st.renderer,
+                onContentHeightChanged = {
+                    val stamp = st.appliedStamp
+                    if (stamp != null && stamp.heightMode == StampStore.HEIGHT_FOLLOW) {
+                        applyHeight(header, st, stamp)
+                    }
+                },
+                onDrawError = { t -> fail(header, t) },
+            )
+            wrapper.addView(
+                themeView,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                ),
+            )
+            val bell = buildBell(header, st)
+            wrapper.addView(bell)
+            st.wrapper = wrapper
+            st.themeView = themeView
+            st.bell = bell
+
+            wrapper.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(v: View) {
+                    registerBatteryReceiver(st)
+                    startTicker(st)
                 }
-            },
-            onDrawError = { t -> fail(header, t) },
-        )
-        wrapper.addView(
-            themeView,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT,
-            ),
-        )
-        val bell = buildBell(header, st)
-        wrapper.addView(bell)
-        st.wrapper = wrapper
-        st.themeView = themeView
-        st.bell = bell
 
-        wrapper.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
-            override fun onViewAttachedToWindow(v: View) {
-                registerBatteryReceiver(st)
-                startTicker(st)
-            }
+                override fun onViewDetachedFromWindow(v: View) {
+                    stopTicker(st)
+                    unregisterBatteryReceiver(st)
+                }
+            })
+        }
+        mountOverlay(header, st)
+    }
 
-            override fun onViewDetachedFromWindow(v: View) {
-                stopTicker(st)
-                unregisterBatteryReceiver(st)
+    /**
+     * 同级覆盖挂载：把 wrapper 加到头部的父容器（逐级向上找第一个
+     * 不拒绝 addView 的 ViewGroup），并与头部对齐。已挂载时只做对齐。
+     */
+    private fun mountOverlay(header: ViewGroup, st: State) {
+        val wrapper = st.wrapper ?: return
+        if (wrapper.parent == null) {
+            st.mountParent = null
+            var candidate = header.parent as? ViewGroup
+            var lastError: Throwable? = null
+            while (candidate != null) {
+                try {
+                    candidate.addView(wrapper, siblingLayoutParams(candidate, st))
+                    st.mountParent = candidate
+                    break
+                } catch (t: Throwable) {
+                    lastError = t
+                    logFn(
+                        "overlay: addView rejected by ${candidate.javaClass.name}: " +
+                            "${t.javaClass.simpleName}: ${t.message}, trying ancestor"
+                    )
+                    candidate = candidate.parent as? ViewGroup
+                }
             }
-        })
-        header.addView(
-            wrapper,
-            ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT,
-            ),
-        )
+            val mounted = st.mountParent
+                ?: throw IllegalStateException(
+                    "no ancestor ViewGroup accepts addView", lastError
+                )
+            wrapper.bringToFront()
+            logFn("overlay: sibling mount point = ${mounted.javaClass.name}")
+        }
+        alignOverlay(st)
+    }
+
+    /** 头部相对挂载父容器的偏移（逐级累加 left/top）。 */
+    private fun offsetIn(header: View, ancestor: ViewGroup): IntArray {
+        var x = 0
+        var y = 0
+        var v: View? = header
+        while (v != null && v !== ancestor) {
+            x += v.left
+            y += v.top
+            v = v.parent as? View
+        }
+        return intArrayOf(x, y)
+    }
+
+    private fun siblingLayoutParams(parent: ViewGroup, st: State): ViewGroup.LayoutParams {
+        val header = st.header
+        val w = if (header.width > 0) header.width else ViewGroup.LayoutParams.MATCH_PARENT
+        val h = if (header.height > 0) header.height else 280
+        val parent0 = st.mountParent ?: parent
+        val off = offsetIn(header, parent0)
+        return if (parent is FrameLayout) {
+            FrameLayout.LayoutParams(w, h).apply {
+                gravity = android.view.Gravity.TOP or android.view.Gravity.START
+                leftMargin = off[0]
+                topMargin = off[1]
+            }
+        } else {
+            ViewGroup.MarginLayoutParams(w, h).apply {
+                leftMargin = off[0]
+                topMargin = off[1]
+            }
+        }
+    }
+
+    /** 把覆盖层 bounds 与头部重新对齐（父容器相对坐标）。 */
+    private fun alignOverlay(st: State) {
+        val wrapper = st.wrapper ?: return
+        val parent = wrapper.parent as? ViewGroup ?: return
+        st.mountParent = parent
+        val header = st.header
+        if (header.width <= 0 || header.height <= 0) return
+        val off = offsetIn(header, parent)
+        val bounds = intArrayOf(off[0], off[1], header.width, header.height)
+        st.mountBounds = bounds
+        val lp = wrapper.layoutParams
+        if (lp is FrameLayout.LayoutParams) {
+            if (lp.width != bounds[2] || lp.height != bounds[3] ||
+                lp.leftMargin != bounds[0] || lp.topMargin != bounds[1]
+            ) {
+                lp.width = bounds[2]
+                lp.height = bounds[3]
+                lp.leftMargin = bounds[0]
+                lp.topMargin = bounds[1]
+                wrapper.layoutParams = lp
+                parent.requestLayout()
+            }
+        } else if (lp is ViewGroup.MarginLayoutParams) {
+            if (lp.width != bounds[2] || lp.height != bounds[3] ||
+                lp.leftMargin != bounds[0] || lp.topMargin != bounds[1]
+            ) {
+                lp.width = bounds[2]
+                lp.height = bounds[3]
+                lp.leftMargin = bounds[0]
+                lp.topMargin = bounds[1]
+                wrapper.layoutParams = lp
+                parent.requestLayout()
+            }
+        }
+        // 立即按目标 bounds 摆一次：父容器若有自定义 onLayout 不认
+        // margin，也能先到位；tick 每秒再校，父容器后续 layout 若按
+        // LayoutParams 摆放则与此一致。
+        if (wrapper.left != bounds[0] || wrapper.top != bounds[1] ||
+            wrapper.right != bounds[0] + bounds[2] ||
+            wrapper.bottom != bounds[1] + bounds[3]
+        ) {
+            wrapper.layout(bounds[0], bounds[1], bounds[0] + bounds[2], bounds[1] + bounds[3])
+        }
     }
 
     private fun hideComposeChildren(header: ViewGroup, st: State) {
@@ -439,7 +562,14 @@ object HeaderOverlay {
             override fun run() {
                 try {
                     val wrapper = st.wrapper
-                    if (wrapper == null || !wrapper.isAttachedToWindow) {
+                    if (wrapper == null) {
+                        st.ticker = null
+                        return
+                    }
+                    if (wrapper.parent == null) {
+                        // 覆盖层被摘下：尝试重新同级挂载
+                        mountOverlay(st.header, st)
+                    } else if (!wrapper.isAttachedToWindow) {
                         st.ticker = null
                         return
                     }
@@ -450,6 +580,8 @@ object HeaderOverlay {
                     } else {
                         hideComposeChildren(st.header, st)
                         st.appliedStamp?.let { applyHeight(st.header, st, it) }
+                        // 每秒把覆盖层 bounds 与头部重新对齐一次
+                        alignOverlay(st)
                         if (!st.bellDrawableSet) {
                             st.bell?.let { trySetBellDrawable(st.header, st, it) }
                         }
