@@ -4,7 +4,10 @@ import android.app.Activity
 import android.content.Context
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -21,6 +24,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -32,6 +36,9 @@ import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 import java.io.File
 import kotlin.math.roundToInt
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.Slider
@@ -44,11 +51,12 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.ThemeController
 
 /**
- * 正式版主界面（v1.1.0 起为设置页）：位置（时钟居中开关）与字号
- * （时钟/日期字号滑杆）两组设置，写入 SharedPreferences「settings」，
- * 由 hook 侧在 SystemUI 进程启动时经 XSharedPreferences 读取。
- * 样式照 MagicPods v2.11 的 MIUIX 写法（MiuixTheme + Scaffold +
- * SmallTopAppBar + Card + SuperSwitch + Slider）。
+ * 设置页（v2.0.0）：顶部样式（原系统头部 / 锁屏主题样式）、主题
+ * 管理（导入/切换/删除）、区域高度三档、字号滑杆（原头部模式）。
+ * 覆盖层相关设置经 stamp.txt（公共 Download 目录）传给 SystemUI
+ * 侧，切换免强停；字号仍走 SharedPreferences「settings」，由 hook
+ * 侧在 SystemUI 进程启动时经 XSharedPreferences 读取。
+ * 样式照 MagicPods v2.11 的 MIUIX 写法。
  */
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -78,7 +86,6 @@ class MainActivity : ComponentActivity() {
 }
 
 private const val PREFS_NAME = "settings"
-private const val KEY_CENTER_CLOCK = "center_clock"
 private const val KEY_CLOCK_SIZE = "clock_size_dp"
 private const val KEY_DATE_SIZE = "date_size_dp"
 private const val CLOCK_DP_MIN = 36
@@ -105,12 +112,27 @@ private fun makePrefsReadable(context: Context) {
 @Composable
 private fun SettingsScreen() {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val prefs = remember {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     }
-    var centerClock by remember {
-        mutableStateOf(prefs.getBoolean(KEY_CENTER_CLOCK, true))
+
+    var topStyleTheme by remember {
+        mutableStateOf(
+            prefs.getString(ThemeStore.KEY_TOP_STYLE, StampStore.TOP_STYLE_THEME) !=
+                StampStore.TOP_STYLE_ORIGINAL
+        )
     }
+    var heightMode by remember {
+        mutableIntStateOf(prefs.getInt(ThemeStore.KEY_HEIGHT_MODE, StampStore.HEIGHT_FOLLOW))
+    }
+    var themes by remember { mutableStateOf(ThemeStore.loadThemes(prefs)) }
+    var selectedThemeId by remember {
+        mutableStateOf(prefs.getString(ThemeStore.KEY_SELECTED_THEME, "") ?: "")
+    }
+    var importStatus by remember { mutableStateOf("") }
+    var importing by remember { mutableStateOf(false) }
+
     var clockSize by remember {
         mutableIntStateOf(
             prefs.getInt(KEY_CLOCK_SIZE, 54).coerceIn(CLOCK_DP_MIN, CLOCK_DP_MAX)
@@ -122,10 +144,73 @@ private fun SettingsScreen() {
         )
     }
 
-    fun saveCenterClock(checked: Boolean) {
-        centerClock = checked
-        prefs.edit().putBoolean(KEY_CENTER_CLOCK, checked).apply()
-        makePrefsReadable(context)
+    fun syncStamp() {
+        scope.launch(Dispatchers.IO) { ThemeStore.writeStamp(context, prefs) }
+    }
+
+    fun saveTopStyle(theme: Boolean) {
+        topStyleTheme = theme
+        prefs.edit()
+            .putString(
+                ThemeStore.KEY_TOP_STYLE,
+                if (theme) StampStore.TOP_STYLE_THEME else StampStore.TOP_STYLE_ORIGINAL,
+            )
+            .apply()
+        syncStamp()
+    }
+
+    fun saveHeightMode(mode: Int) {
+        heightMode = mode
+        prefs.edit().putInt(ThemeStore.KEY_HEIGHT_MODE, mode).apply()
+        syncStamp()
+    }
+
+    fun selectTheme(id: String) {
+        selectedThemeId = id
+        prefs.edit().putString(ThemeStore.KEY_SELECTED_THEME, id).apply()
+        syncStamp()
+    }
+
+    fun deleteTheme(id: String) {
+        scope.launch(Dispatchers.IO) {
+            ThemeStore.deleteTheme(context, prefs, id)
+            withContext(Dispatchers.Main) {
+                themes = ThemeStore.loadThemes(prefs)
+                if (selectedThemeId == id) selectedThemeId = ""
+                importStatus = "已删除主题"
+            }
+        }
+    }
+
+    val importLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        importing = true
+        importStatus = "正在导入…"
+        scope.launch(Dispatchers.IO) {
+            val result = ThemeImporter.importTheme(context, uri)
+            withContext(Dispatchers.Main) {
+                importing = false
+                when (result) {
+                    is ThemeImporter.Result.Ok -> {
+                        val newThemes = ThemeStore.loadThemes(prefs) + result.entry
+                        ThemeStore.saveThemes(prefs, newThemes)
+                        themes = newThemes
+                        selectedThemeId = result.entry.id
+                        prefs.edit()
+                            .putString(ThemeStore.KEY_SELECTED_THEME, result.entry.id)
+                            .apply()
+                        importStatus =
+                            "已导入并选中「${result.entry.name}」（${result.fileCount} 个文件）"
+                        syncStamp()
+                    }
+                    is ThemeImporter.Result.Err -> {
+                        importStatus = result.message
+                    }
+                }
+            }
+        }
     }
 
     fun saveClockSize(value: Int) {
@@ -158,7 +243,7 @@ private fun SettingsScreen() {
                 .padding(innerPadding),
         ) {
             Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-                SmallTitle(text = "正式版 v1.1.2", insideMargin = PaddingValues(start = 4.dp))
+                SmallTitle(text = "正式版 v2.0.0", insideMargin = PaddingValues(start = 4.dp))
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     cornerRadius = 20.dp,
@@ -166,12 +251,12 @@ private fun SettingsScreen() {
                 ) {
                     Column {
                         Text(
-                            "把荣耀 MagicOS 11 通知中心顶部的时钟改成居中显示的大时钟。流量行、右上角铃铛按钮和原动画保持原样。",
+                            "在通知栏顶部盖一层自绘覆盖层，按荣耀锁屏主题的样式渲染（数字图集时钟、日期、电量、天气小模块等），主题可导入、可切换。",
                             fontSize = 14.sp,
                             color = MiuixTheme.colorScheme.onSurface,
                         )
                         Text(
-                            "模块带结构自检：系统版本变化导致头部结构对不上时，居中会自动跳过、只保留放大，不会硬改；居中逻辑万一运行时出错也会立即回退系统原逻辑。",
+                            "覆盖层构建或渲染出任何问题都会自动卸下、恢复系统原头部，不会让系统界面崩溃。",
                             fontSize = 14.sp,
                             color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                             modifier = Modifier.padding(top = 8.dp),
@@ -180,7 +265,7 @@ private fun SettingsScreen() {
                 }
 
                 SmallTitle(
-                    text = "位置",
+                    text = "顶部样式",
                     insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
                 )
                 Card(
@@ -189,15 +274,126 @@ private fun SettingsScreen() {
                     insideMargin = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
                 ) {
                     SuperSwitch(
-                        title = "时钟居中",
-                        summary = "关掉回到原来的左对齐",
-                        checked = centerClock,
-                        onCheckedChange = { saveCenterClock(it) },
+                        title = "锁屏主题样式",
+                        summary = "开：用导入的锁屏主题渲染顶部；关：系统原头部",
+                        checked = topStyleTheme,
+                        onCheckedChange = { saveTopStyle(it) },
                     )
                 }
 
                 SmallTitle(
-                    text = "字号",
+                    text = "主题管理",
+                    insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
+                )
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    cornerRadius = 20.dp,
+                    insideMargin = PaddingValues(vertical = 4.dp),
+                ) {
+                    Column {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable(enabled = !importing) {
+                                    importLauncher.launch(arrayOf("*/*"))
+                                }
+                                .padding(horizontal = 16.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    "导入主题文件",
+                                    fontSize = 15.sp,
+                                    color = MiuixTheme.colorScheme.onSurface,
+                                )
+                                Text(
+                                    if (importing) "正在导入…" else "选择 .hnt / .hwt 主题包",
+                                    fontSize = 13.sp,
+                                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                )
+                            }
+                            Text(
+                                "›",
+                                fontSize = 20.sp,
+                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            )
+                        }
+                        if (importStatus.isNotEmpty()) {
+                            Text(
+                                importStatus,
+                                fontSize = 13.sp,
+                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                            )
+                        }
+                        if (themes.isEmpty()) {
+                            Text(
+                                "还没有导入主题。导入后点主题名即可切换。",
+                                fontSize = 13.sp,
+                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                            )
+                        }
+                        for (theme in themes) {
+                            val selected = theme.id == selectedThemeId
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { selectTheme(theme.id) }
+                                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        theme.name,
+                                        fontSize = 15.sp,
+                                        color = MiuixTheme.colorScheme.onSurface,
+                                    )
+                                    if (selected) {
+                                        Text(
+                                            "当前使用",
+                                            fontSize = 12.sp,
+                                            color = MiuixTheme.colorScheme.primary,
+                                        )
+                                    }
+                                }
+                                Text(
+                                    "删除",
+                                    fontSize = 13.sp,
+                                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                    modifier = Modifier
+                                        .clickable { deleteTheme(theme.id) }
+                                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                                )
+                            }
+                        }
+                    }
+                }
+
+                SmallTitle(
+                    text = "区域高度",
+                    insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
+                )
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    cornerRadius = 20.dp,
+                    insideMargin = PaddingValues(vertical = 4.dp),
+                ) {
+                    Column {
+                        HeightModeRow("跟随内容", "高度取所画元素的最下缘", heightMode == 0) {
+                            saveHeightMode(0)
+                        }
+                        HeightModeRow("屏高 1/3", "覆盖层固定占屏幕高度三分之一", heightMode == 1) {
+                            saveHeightMode(1)
+                        }
+                        HeightModeRow("屏高 1/2", "覆盖层固定占屏幕高度二分之一", heightMode == 2) {
+                            saveHeightMode(2)
+                        }
+                    }
+                }
+
+                SmallTitle(
+                    text = "字号（原系统头部模式）",
                     insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
                 )
                 Card(
@@ -237,18 +433,24 @@ private fun SettingsScreen() {
                 ) {
                     Column {
                         Text(
-                            "改完设置后，强停一次系统界面（或重启手机）生效：模块在新进程启动时读取设置。",
+                            "切换主题、改区域高度、开关锁屏主题样式：下次下拉通知栏即生效（约 1 秒内自动刷新），不用强停系统界面。",
                             fontSize = 14.sp,
                             color = MiuixTheme.colorScheme.onSurface,
                         )
                         Text(
-                            "在 LSPosed 里停用本模块，再强停一次系统界面，通知中心即恢复原样。",
+                            "字号滑杆只对原系统头部模式有效，改完需强停一次系统界面（或重启手机）。",
                             fontSize = 14.sp,
                             color = MiuixTheme.colorScheme.onSurface,
                             modifier = Modifier.padding(top = 8.dp),
                         )
                         Text(
-                            "模块的设置读数、安装结果与字号验读会写一行到 /sdcard/Download/shadeclock_probe.log，排查问题时可看这个文件。",
+                            "温度/风向小模块读系统天气服务，与锁屏同源；主题里的入场动画只按终态静态呈现，秒数逐秒切换。",
+                            fontSize = 14.sp,
+                            color = MiuixTheme.colorScheme.onSurface,
+                            modifier = Modifier.padding(top = 8.dp),
+                        )
+                        Text(
+                            "在 LSPosed 里停用本模块，再强停一次系统界面，通知中心即恢复原样。诊断日志在 /sdcard/Download/shadeclock_probe.log，主题资产在 /sdcard/Download/HonorShadeClock/themes/。",
                             fontSize = 14.sp,
                             color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                             modifier = Modifier.padding(top = 8.dp),
@@ -256,6 +458,43 @@ private fun SettingsScreen() {
                     }
                 }
             }
+        }
+    }
+}
+
+/** 区域高度三档的选择行。 */
+@Composable
+private fun HeightModeRow(
+    title: String,
+    summary: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onClick() }
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                title,
+                fontSize = 15.sp,
+                color = MiuixTheme.colorScheme.onSurface,
+            )
+            Text(
+                summary,
+                fontSize = 13.sp,
+                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+            )
+        }
+        if (selected) {
+            Text(
+                "当前",
+                fontSize = 13.sp,
+                color = MiuixTheme.colorScheme.primary,
+            )
         }
     }
 }

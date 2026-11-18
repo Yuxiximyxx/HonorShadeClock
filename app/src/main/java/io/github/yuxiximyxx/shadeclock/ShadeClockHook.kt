@@ -16,30 +16,27 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.roundToInt
 
 /**
- * 正式版入口：通知中心时钟居中 + 放大（v1.1.0 起带自定义设置）。
+ * 入口（v2.0.0，方案 B）：通知栏顶部覆盖层 + 通用荣耀锁屏主题渲染。
  *
- * 两件互相独立的事（可行性依据见仓库 HEADER_ANALYSIS.md）：
- * 1. 放大（资源替换）：handleInitPackageResources 里把 SystemUI 的
+ * 两块互相独立：
+ * 1. 覆盖层（HeaderOverlay）：隐藏头部 Compose 内容、自绘覆盖层按
+ *    选中的锁屏主题渲染（数据驱动，/sdcard/Download/HonorShadeClock/
+ *    themes/<id>/），高度三档（跟随内容/1/3/1/2），铃铛复刻；
+ *    设置经 stamp.txt 跨进程传递，切换免强停；异常全回退原头部。
+ *    v1.1.x 的居中 hook（Lambda9 与 DateAndTime MeasurePolicy 两套）
+ *    已整体下线。
+ * 2. 放大（资源替换）：覆盖层关闭（原系统头部模式）时仍生效——
+ *    handleInitPackageResources 里把 SystemUI 的
  *    dimen/notif_center_header_clock_text_size（默认 40dp）、
  *    dimen/notif_center_header_clock_date_size（默认 14dp）替换为
- *    设置里的字号。头部 composable 每次重组都现读
- *    getDimensionPixelSize，替换直接生效。DimensionReplacement 的
- *    单位按 API 82 签名 (float, int unit) 传
- *    TypedValue.COMPLEX_UNIT_DIP，即 dp 语义。
- * 2. 居中（MeasurePolicy 替换）：见 PolicyCentering——带结构自检与
- *    异常回退地复刻 DateAndTime 内部 MeasurePolicy 的 measure，
- *    只给时钟/日期在盒内的摆放 x 整体加居中偏移（v1.1.2 起的新
- *    路线；v1.0–v1.1.1 在外层 Lambda9 挪盒子的路线已撤销，稳态下
- *    盒子本身满宽、挪盒子居中不了）。仅当设置 center_clock=true
- *    时安装；false 时不装 hook，摆放完全走系统原逻辑。
+ *    设置里的字号。DimensionReplacement 单位按 API 82 签名
+ *    (float, int unit) 传 TypedValue.COMPLEX_UNIT_DIP。
  *
- * 设置来自模块 App 的 SharedPreferences（名 settings），经
- * XSharedPreferences 在 SystemUI 进程启动时读取一次（改设置后强停
- * 系统界面生效）；读不到时用默认值（居中开、时钟 54dp、日期 16dp）。
+ * 字号设置来自模块 App 的 SharedPreferences（名 settings），经
+ * XSharedPreferences 在 SystemUI 进程启动时读取一次（改字号后强停
+ * 系统界面生效）；覆盖层设置走 StampStore 的 stamp.txt，不经此路。
  *
- * 诊断只保留每进程一次的字号验读回、设置读数与 hook 安装结果，
- * 仍写 /sdcard/Download/shadeclock_probe.log（+ LSPosed 日志）。
- *
+ * 诊断写 /sdcard/Download/shadeclock_probe.log（+ LSPosed 日志）。
  * 作用域只有 com.android.systemui（见 AndroidManifest 的 xposedscope）。
  */
 class ShadeClockHook : IXposedHookLoadPackage, IXposedHookInitPackageResources {
@@ -54,10 +51,8 @@ class ShadeClockHook : IXposedHookLoadPackage, IXposedHookInitPackageResources {
 
         private const val MODULE_PACKAGE = "io.github.yuxiximyxx.shadeclock"
         private const val PREFS_NAME = "settings"
-        private const val KEY_CENTER_CLOCK = "center_clock"
         private const val KEY_CLOCK_SIZE = "clock_size_dp"
         private const val KEY_DATE_SIZE = "date_size_dp"
-        private const val DEFAULT_CENTER_CLOCK = true
         private const val DEFAULT_CLOCK_DP = 54
         private const val DEFAULT_DATE_DP = 16
         private const val CLOCK_DP_MIN = 36
@@ -85,45 +80,36 @@ class ShadeClockHook : IXposedHookLoadPackage, IXposedHookInitPackageResources {
         }
     }
 
-    /** 一次进程生命周期内读取到的设置快照。 */
-    private data class ModuleSettings(
-        val centerClock: Boolean,
+    /** 一次进程生命周期内读取到的字号快照（覆盖层设置不走这里）。 */
+    private data class FontSettings(
         val clockDp: Float,
         val dateDp: Float,
     )
 
     @Volatile
-    private var cachedSettings: ModuleSettings? = null
+    private var cachedSettings: FontSettings? = null
 
     private val dimenDiagDone = AtomicBoolean(false)
 
-    /**
-     * 读取设置（每进程只读一次并缓存）。XSharedPreferences 读不到
-     * （文件不可读/尚不存在）时整体回退默认值，并各写一行诊断。
-     */
-    private fun settings(): ModuleSettings {
+    /** 读取字号设置（每进程只读一次并缓存），读不到整体回退默认值。 */
+    private fun settings(): FontSettings {
         cachedSettings?.let { return it }
         val loaded = try {
             val prefs = XSharedPreferences(MODULE_PACKAGE, PREFS_NAME)
-            val s = ModuleSettings(
-                centerClock = prefs.getBoolean(KEY_CENTER_CLOCK, DEFAULT_CENTER_CLOCK),
+            val s = FontSettings(
                 clockDp = prefs.getInt(KEY_CLOCK_SIZE, DEFAULT_CLOCK_DP)
                     .coerceIn(CLOCK_DP_MIN, CLOCK_DP_MAX).toFloat(),
                 dateDp = prefs.getInt(KEY_DATE_SIZE, DEFAULT_DATE_DP)
                     .coerceIn(DATE_DP_MIN, DATE_DP_MAX).toFloat(),
             )
             diag(
-                "settings loaded: center_clock=${s.centerClock}, " +
-                    "clock_size_dp=${s.clockDp.roundToInt()}, date_size_dp=${s.dateDp.roundToInt()}"
+                "settings loaded: clock_size_dp=${s.clockDp.roundToInt()}, " +
+                    "date_size_dp=${s.dateDp.roundToInt()}"
             )
             s
         } catch (t: Throwable) {
             diag("settings load failed, using defaults: ${t.javaClass.name}: ${t.message}")
-            ModuleSettings(
-                DEFAULT_CENTER_CLOCK,
-                DEFAULT_CLOCK_DP.toFloat(),
-                DEFAULT_DATE_DP.toFloat(),
-            )
+            FontSettings(DEFAULT_CLOCK_DP.toFloat(), DEFAULT_DATE_DP.toFloat())
         }
         cachedSettings = loaded
         return loaded
@@ -161,13 +147,9 @@ class ShadeClockHook : IXposedHookLoadPackage, IXposedHookInitPackageResources {
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != TARGET_PACKAGE) return
-        diag("=== HonorShadeClock v1.1.2 loaded in $TARGET_PACKAGE ===")
+        diag("=== HonorShadeClock v2.0.0 loaded in $TARGET_PACKAGE ===")
         installDimenDiagnostic(lpparam)
-        if (settings().centerClock) {
-            PolicyCentering.install(lpparam) { message -> diag(message) }
-        } else {
-            diag("policy centering hook not installed: center_clock=false in settings")
-        }
+        HeaderOverlay.install(lpparam) { message -> diag(message) }
     }
 
     /**
