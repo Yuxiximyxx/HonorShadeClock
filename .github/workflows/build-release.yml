@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.18-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.19-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.18-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.19-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,34 +68,38 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.18
-          name: HonorShadeClock 2.0.18 — 主题只存包本体，图片不再进图库
+          tag_name: v2.0.19
+          name: HonorShadeClock 2.0.19 — 选了云镜却渲染别的主题修复（戳记通道+迁移校验+字体）
           body: |
-            ## HonorShadeClock 2.0.18
+            ## HonorShadeClock 2.0.19
 
-            单项改动：主题的存与读——渲染逻辑、门控、
-            跟随、避让等其余功能与 2.0.17 完全一致。
+            修 v2.0.18 的三处回归，其余功能与 2.0.18 一致：
 
-            - 旧版导入主题时把锁屏资产解压成一堆散图
-              存在 Download/HonorShadeClock/themes/ 下，
-              还按图片登记进系统媒体库，结果主题里的
-              每张图都出现在图库里。
-            - 新导入：只把主题文件本体原样存一份
-              （themes/<主题>/theme.pkg），按非媒体文件
-              登记；渲染器运行时直接读这份 zip 里的
-              manifest 与图片，不再解压。
-            - 存量主题：打开设置页会自动迁移——散图
-              就地打包回一个主题文件、散图本体与其
-              媒体库条目一并删除，图库随之清干净；
-              主题照常可用，不用重新导入。目录根另
-              放 .nomedia 兜底。
-            - 删除主题时包本体连同目录一起清干净；
-              主题列表与切换行为不变。
+            - 选了云镜却还渲染旧主题：卸载重装后，旧安装
+              写下的 stamp.txt 不再归新安装所有，设置里
+              改选主题的写入静默落到「stamp (1).txt」副本
+              上、正本纹丝不动，系统界面一直读旧戳记。
+              本版系统界面侧改为多候选取胜：正本与全部
+              副本按内容时间戳取最大者，并把胜者回写正本
+              修复；重启系统界面按钮的标记文件同理。已
+              经装了 2.0.18 又重装过的，升级后打开一次
+              设置页即可自愈，不用再重装、不用重选。
+            - 迁移丢图：2.0.18 的存量迁移曾把一个 103
+              图的主题打成只剩 2 图的包、还删了散图原件。
+              本版迁移改为打包后回读校验（条目数/图片数
+              对不上就删新包、保留散图），任一散文件读
+              不出整题放弃，绝不先删原件。注意：已被
+              2.0.18 迁移弄丢图片的主题（如 AAA）数据
+              已丢失，需要在设置里删掉后重新导入一次
+              才能恢复完整；云镜若是重装后新导入的则
+              不受影响。
+            - 主题字体加载失败：字体构建改用 direct
+              buffer（2.0.18 用堆缓冲被系统拒绝，带字体
+              的主题如云镜每版必失败一次）。
 
-            生效方式：覆盖安装 → 打开一次设置页（等
-            它把旧主题迁移完）→ 用设置页「重启系统
-            界面」按钮重载 → 下拉通知中心确认样式
-            正常、图库里不再有主题散图。
-            关闭办法：在 LSPosed 里停用模块再重启
-            一次系统界面，即恢复原样。
+            生效方式：覆盖安装 → 打开一次设置页 → 用
+            设置页「重启系统界面」按钮重载 → 下拉通知
+            中心确认渲染的是所选主题。
+            关闭办法：在 LSPosed 里停用模块再重启一次
+            系统界面，即恢复原样。
           files: dist/*.apk

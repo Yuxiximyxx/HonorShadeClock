@@ -329,13 +329,19 @@ class ThemeRenderer(private val log: (String) -> Unit) {
     /**
      * 主题字体（v2.0.18 改字节构建）：资产只剩包本体一份、没有
      * 落盘的字体文件可给 createFromFile，改走 Font.Builder
-     * （API 29+，minSdk 34 可用）从字节内存构建。失败回 null，
+     * （API 29+，minSdk 34 可用）从字节内存构建。注意
+     * Font.Builder 只收 direct buffer（v2.0.19 修：ByteBuffer
+     * .wrap 的堆缓冲会被它以 IllegalArgumentException 拒绝，
+     * 真机日志实证云镜字体每会话必失败一次）。失败回 null，
      * 绘制侧回退系统字体（与旧版 createFromFile 失败同口径）。
      */
     private fun loadTypeface(src: ThemeSource): Typeface? {
         val bytes = src.fontBytes() ?: return null
         return try {
-            val font = Font.Builder(ByteBuffer.wrap(bytes)).build()
+            val buffer = ByteBuffer.allocateDirect(bytes.size)
+            buffer.put(bytes)
+            buffer.flip()
+            val font = Font.Builder(buffer).build()
             val family = FontFamily.Builder(font).build()
             Typeface.CustomFallbackBuilder(family).build()
         } catch (t: Throwable) {

@@ -182,8 +182,12 @@ private fun SettingsScreen() {
         if (migrated > 0) {
             themes = ThemeStore.loadThemes(prefs)
             importStatus = "已把 $migrated 个旧主题打包成单文件（图库里的散图已清）"
-            syncStamp()
         }
+        // 无论有没有迁移都重写一次戳记（v2.0.19）：重装后
+        // stamp.txt 可能已不归本安装所有、写入会落到副本上，
+        // 靠 SystemUI 侧的多候选采纳跟上；每次打开设置页都
+        // 重申当前选择，保证自愈路径不需要用户多点任何东西。
+        syncStamp()
     }
 
     fun saveTopStyle(theme: Boolean) {

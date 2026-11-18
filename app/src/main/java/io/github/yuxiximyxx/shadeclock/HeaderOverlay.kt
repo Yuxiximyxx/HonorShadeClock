@@ -772,7 +772,10 @@ object HeaderOverlay {
         if (!renderer.load(entry)) return
         renderer.warmBitmapCache()
         preheatedTheme = PreheatedTheme(stamp.themeId, stamp.stamp, renderer)
-        logFn("overlay preheat ready: theme=${stamp.themeId}, stamp=${stamp.stamp}")
+        val srcNote = StampStore.lastStampSource
+            ?.takeIf { it != StampStore.STAMP_NAME }
+            ?.let { ", stampSource=$it" } ?: ""
+        logFn("overlay preheat ready: theme=${stamp.themeId}, stamp=${stamp.stamp}$srcNote")
     }
 
     /**

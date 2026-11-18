@@ -46,16 +46,24 @@ object PublicStore {
         relDir: String,
         name: String,
         input: java.io.InputStream,
-    ): Boolean {
+    ): Boolean = writeStreamUri(context, relDir, name, input) != null
+
+    /** 流式写入并返回落盘条目的 Uri（迁移校验回读要用）；失败返回 null。 */
+    fun writeStreamUri(
+        context: Context,
+        relDir: String,
+        name: String,
+        input: java.io.InputStream,
+    ): Uri? {
         val cr = context.contentResolver
         val rel = relDir.trim('/') + "/"
         return try {
-            val uri = queryUri(cr, rel, name) ?: insertFile(cr, rel, name) ?: return false
-            val out = cr.openOutputStream(uri, "wt") ?: return false
+            val uri = queryUri(cr, rel, name) ?: insertFile(cr, rel, name) ?: return null
+            val out = cr.openOutputStream(uri, "wt") ?: return null
             out.use { input.copyTo(it) }
-            true
+            uri
         } catch (t: Throwable) {
-            false
+            null
         }
     }
 
@@ -272,7 +280,9 @@ object ThemeStore {
      * theme.pkg（条目结构与新导入一致：锁屏资产在
      * unlock/lockscreen/ 下、字体保持包根 fonts/），再逐条删掉
      * 散文件——删 MediaStore 条目即删文件本体，图库条目随之
-     * 消失。返回成功迁移的主题数；已是包形态的主题跳过。
+     * 消失。返回成功迁移的主题数；无散文件的主题跳过；打包
+     * 后必须回读校验通过才删散文件（v2.0.19，防再现 2.0.18
+     * 迁移把 103 图打成 2 图还删原件的数据丢失）。
      * 调用方在设置页打开时于 IO 线程跑一次，幂等；迁移后主题
      * id 不变、登记不变，不需要用户重新导入。
      */
@@ -292,49 +302,97 @@ object ThemeStore {
         val files = PublicStore.listFiles(context, relDir)
         val legacy = files.filter { it.fullPath != pkgPath }
         if (legacy.isEmpty()) return false
-        val hasPackage = files.any { it.fullPath == pkgPath }
-        if (!hasPackage) {
-            val tmp = File(context.cacheDir, "theme_migrate_$id.zip")
-            try {
-                java.util.zip.ZipOutputStream(tmp.outputStream().buffered()).use { zos ->
-                    for (f in legacy) {
-                        val rel = f.fullPath.removePrefix(prefix)
-                        // 旧解压布局：锁屏资产在 <id>/<rel>、字体在
-                        // <id>/fonts/；回包时锁屏资产归位到
-                        // unlock/lockscreen/ 下（渲染器缺省
-                        // dynamicPath 即 lockscreen，与原包是否
-                        // 写过 theme.xml 无关、自洽），字体保持
-                        // 包根 fonts/。
-                        val entryName = if (rel.startsWith("fonts/")) {
-                            rel
-                        } else {
-                            "unlock/lockscreen/$rel"
-                        }
-                        val input = context.contentResolver.openInputStream(f.uri)
-                            ?: continue
-                        zos.putNextEntry(java.util.zip.ZipEntry(entryName))
-                        input.use { it.copyTo(zos) }
-                        zos.closeEntry()
+        // v2.0.19 安全性重写：v2.0.18 的迁移在真机上把一个
+        // 103 图的主题打成了只剩 2 图的包、还把散图全删了，
+        // 数据不可逆丢失（枚举/读流任一环静默少件都会如此）。
+        // 本版口径：只要还有散文件就一律重新打包（不因「已有
+        // 包」就跳过打包只删散文件——那会把坏包坐实）；任一
+        // 散文件读不出来就整题放弃、散文件原样保留；包写完
+        // 必须回读校验（manifest 可定位、条目数与图片数与打
+        // 包计数一致）通过后才删散文件，校验不过删掉新包、
+        // 散文件保留，渲染侧继续走解压目录兜底。
+        val tmp = File(context.cacheDir, "theme_migrate_$id.zip")
+        var packedEntries = 0
+        var packedImages = 0
+        try {
+            java.util.zip.ZipOutputStream(tmp.outputStream().buffered()).use { zos ->
+                for (f in legacy) {
+                    val rel = f.fullPath.removePrefix(prefix)
+                    // 旧解压布局：锁屏资产在 <id>/<rel>、字体在
+                    // <id>/fonts/；回包时锁屏资产归位到
+                    // unlock/lockscreen/ 下（渲染器缺省
+                    // dynamicPath 即 lockscreen，与原包是否
+                    // 写过 theme.xml 无关、自洽），字体保持
+                    // 包根 fonts/。
+                    val entryName = if (rel.startsWith("fonts/")) {
+                        rel
+                    } else {
+                        "unlock/lockscreen/$rel"
                     }
+                    val input = context.contentResolver.openInputStream(f.uri)
+                        ?: return false
+                    zos.putNextEntry(java.util.zip.ZipEntry(entryName))
+                    input.use { it.copyTo(zos) }
+                    zos.closeEntry()
+                    packedEntries++
+                    if (isImageName(entryName)) packedImages++
                 }
-                val ok = tmp.inputStream().buffered().use { ins ->
-                    PublicStore.writeStream(context, relDir, StampStore.THEME_PACKAGE_NAME, ins)
-                }
-                if (!ok) {
-                    tmp.delete()
-                    return false
-                }
-            } catch (t: Throwable) {
+            }
+            val pkgUri = tmp.inputStream().buffered().use { ins ->
+                PublicStore.writeStreamUri(
+                    context, relDir, StampStore.THEME_PACKAGE_NAME, ins,
+                )
+            }
+            if (pkgUri == null) {
                 tmp.delete()
                 return false
             }
+            if (!verifyPackage(context, pkgUri, packedEntries, packedImages)) {
+                PublicStore.deleteFile(context, pkgUri)
+                tmp.delete()
+                return false
+            }
+        } catch (t: Throwable) {
             tmp.delete()
+            return false
         }
-        // 包已就位（或本就有包、只是上次迁移删到一半）：删尽散文件
+        tmp.delete()
+        // 包已校验就位：删尽散文件（连同其 MediaStore 条目）
         for (f in legacy) {
             PublicStore.deleteFile(context, f.uri)
         }
         return true
+    }
+
+    private fun isImageName(name: String): Boolean =
+        name.endsWith(".png", true) || name.endsWith(".jpg", true) ||
+            name.endsWith(".jpeg", true) || name.endsWith(".webp", true)
+
+    /** 回读刚写的主题包做完整性校验：manifest 可定位、条目数与锁屏图片数与打包计数一致。 */
+    private fun verifyPackage(
+        context: Context,
+        uri: Uri,
+        expectEntries: Int,
+        expectImages: Int,
+    ): Boolean {
+        val tmp = File(context.cacheDir, "theme_verify_${System.currentTimeMillis()}.zip")
+        return try {
+            val input = context.contentResolver.openInputStream(uri) ?: return false
+            input.use { ins -> tmp.outputStream().use { out -> ins.copyTo(out) } }
+            ZipFile(tmp).use { zip ->
+                val prefix = ThemePackage.lockscreenPrefix(zip) ?: return false
+                val entries = Collections.list(zip.entries()).filter { !it.isDirectory }
+                if (entries.size != expectEntries) return false
+                val images = entries.count {
+                    it.name.startsWith(prefix) && isImageName(it.name)
+                }
+                images == expectImages
+            }
+        } catch (t: Throwable) {
+            false
+        } finally {
+            tmp.delete()
+        }
     }
 }
 
