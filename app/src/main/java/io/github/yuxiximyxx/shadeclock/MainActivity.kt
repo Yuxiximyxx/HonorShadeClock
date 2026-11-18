@@ -5,17 +5,12 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -35,10 +30,12 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
@@ -48,12 +45,17 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.Card
+import top.yukonga.miuix.kmp.basic.Icon
+import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.Slider
 import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.basic.SmallTopAppBar
 import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.extra.SuperArrow
 import top.yukonga.miuix.kmp.extra.SuperSwitch
+import top.yukonga.miuix.kmp.icon.MiuixIcons
+import top.yukonga.miuix.kmp.icon.extended.Back
 import top.yukonga.miuix.kmp.theme.ColorSchemeMode
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.ThemeController
@@ -72,9 +74,14 @@ import top.yukonga.miuix.kmp.theme.ThemeController
  * 侧，切换免强停；字号仍走 SharedPreferences「settings」，由 hook
  * 侧在 SystemUI 进程启动时经 XSharedPreferences 读取。
  * 样式照 MagicPods v2.11 的 MIUIX 写法。
- * v2.0.24：设置项越加越多、全摊一页太长——各分组改可折叠
- * （见 [SettingsSection]，展开状态按组落盘）；「系统界面」
- * （重启按钮）是动作行、不折叠、常显。
+ * v2.0.25：页面组织改 MIUI 式二级页面（v2.0.24 的自研折叠
+ * 分组被小乐以「不 miuix、不美观」否决；miuix 0.8.8 本身也
+ * 没有官方折叠/可展开分节组件）——主页只留版本说明卡、一列
+ * SuperArrow 入口（主题管理/位置/显示与开关/原系统头部/说
+ * 明）与常显的「系统界面」（重启按钮），每组点进独立子页
+ * （SmallTopAppBar+返回、Card 分组、组件全用 miuix 词汇）。
+ * 设置项、存储键、戳记格式一律未动；v2.0.24 的 ui_section_*
+ * 展开状态键弃用、打开时清掉。
  */
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -111,6 +118,16 @@ private const val CLOCK_DP_MAX = 68
 private const val DATE_DP_MIN = 12
 private const val DATE_DP_MAX = 24
 
+// 设置页页面状态（v2.0.25 二级页面）：朴素字符串状态切换，
+// 不引入导航库；系统返回键在子页时先回主页（见 SettingsScreen
+// 里的 BackHandler）。
+private const val PAGE_HOME = "home"
+private const val PAGE_THEMES = "themes"
+private const val PAGE_POSITION = "position"
+private const val PAGE_DISPLAY = "display"
+private const val PAGE_FONTSIZE = "fontsize"
+private const val PAGE_ABOUT = "about"
+
 /**
  * 让 SystemUI 进程能读到本应用的 settings.xml：XSharedPreferences 是
  * 跨进程直读文件，需要 shared_prefs 目录可穿越、文件可读。尽力而为，
@@ -127,12 +144,43 @@ private fun makePrefsReadable(context: Context) {
     }
 }
 
+/** 子页返回按钮（照 miuix 官方示例的 BackNavigationIcon 写法）。 */
+@Composable
+private fun BackNavigationIcon(onClick: () -> Unit) {
+    val layoutDirection = LocalLayoutDirection.current
+    IconButton(onClick = onClick) {
+        Icon(
+            modifier = Modifier.graphicsLayer {
+                if (layoutDirection == LayoutDirection.Rtl) scaleX = -1f
+            },
+            imageVector = MiuixIcons.Back,
+            contentDescription = null,
+            tint = MiuixTheme.colorScheme.onBackground,
+        )
+    }
+}
+
 @Composable
 private fun SettingsScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val prefs = remember {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    }
+
+    // 当前页（v2.0.25 二级页面）：主页是入口列，子页承载各组
+    // 设置；状态只在本次打开内保留，不落盘。
+    var page by remember { mutableStateOf(PAGE_HOME) }
+    BackHandler(enabled = page != PAGE_HOME) { page = PAGE_HOME }
+
+    // v2.0.24 折叠分组的展开状态键 ui_section_* 自 v2.0.25
+    // 起弃用，打开设置页时顺手清掉（纯呈现偏好、无数据）。
+    remember {
+        val e = prefs.edit()
+        for (id in listOf("style", "position", "themes", "height", "fontsize", "about")) {
+            e.remove("ui_section_$id")
+        }
+        e.apply()
     }
 
     var topStyleTheme by remember {
@@ -389,12 +437,26 @@ private fun SettingsScreen() {
         makePrefsReadable(context)
     }
 
+    val pageTitle = when (page) {
+        PAGE_THEMES -> "主题管理"
+        PAGE_POSITION -> "位置"
+        PAGE_DISPLAY -> "显示与开关"
+        PAGE_FONTSIZE -> "原系统头部"
+        PAGE_ABOUT -> "说明"
+        else -> "通知中心主题"
+    }
+
     Scaffold(
         containerColor = MiuixTheme.colorScheme.background,
         topBar = {
             SmallTopAppBar(
-                title = "通知中心主题",
+                title = pageTitle,
                 color = Color.Transparent,
+                navigationIcon = {
+                    if (page != PAGE_HOME) {
+                        BackNavigationIcon { page = PAGE_HOME }
+                    }
+                },
             )
         },
     ) { innerPadding ->
@@ -404,406 +466,337 @@ private fun SettingsScreen() {
                 .verticalScroll(rememberScrollState())
                 .padding(innerPadding),
         ) {
-            Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-                SmallTitle(
-                    text = "正式版 v${BuildConfig.VERSION_NAME}",
-                    insideMargin = PaddingValues(start = 4.dp),
-                )
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    cornerRadius = 20.dp,
-                    insideMargin = PaddingValues(16.dp),
-                ) {
-                    Column {
-                        Text(
-                            "在通知栏顶部盖一层自绘覆盖层，按荣耀锁屏主题的样式渲染（数字图集时钟、日期、电量、天气小模块等），主题可导入、可切换。",
-                            fontSize = 14.sp,
-                            color = MiuixTheme.colorScheme.onSurface,
-                        )
-                        Text(
-                            "覆盖层构建或渲染出任何问题都会自动卸下、恢复系统原头部，不会让系统界面崩溃。",
-                            fontSize = 14.sp,
-                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                            modifier = Modifier.padding(top = 8.dp),
-                        )
-                    }
-                }
-
-                SettingsSection(
-                    prefs = prefs,
-                    id = "style",
-                    title = "顶部样式",
-                    defaultExpanded = false,
-                ) {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    cornerRadius = 20.dp,
-                    insideMargin = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
-                ) {
-                    SuperSwitch(
-                        title = "锁屏主题样式",
-                        summary = "开：用导入的锁屏主题渲染顶部；关：系统原头部",
-                        checked = topStyleTheme,
-                        onCheckedChange = { saveTopStyle(it) },
-                    )
-                    SuperSwitch(
-                        title = "主题背景图",
-                        summary = "开：连主题的整幅背景图一起画；关：只画时钟等元素，透出通知栏原背景",
-                        checked = showBackground,
-                        onCheckedChange = { saveShowBackground(it) },
-                    )
-                    SuperSwitch(
-                        title = "小模块（温度/风向/电量）",
-                        summary = "开：连温度、风向、电量小模块一起画；关：只显示时间样式（默认关）",
-                        checked = showWidgets,
-                        onCheckedChange = { saveShowWidgets(it) },
-                    )
-                    SuperSwitch(
-                        title = "隐藏运营商文字",
-                        summary = "开：锁屏、控制中心、通知中心左上角的运营商文字（中国联通等）不显示（默认开）",
-                        checked = hideCarrier,
-                        onCheckedChange = { saveHideCarrier(it) },
-                    )
-                }
-
-                }
-
-                SettingsSection(
-                    prefs = prefs,
-                    id = "position",
-                    title = "位置",
-                    defaultExpanded = true,
-                ) {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    cornerRadius = 20.dp,
-                    insideMargin = PaddingValues(16.dp),
-                ) {
-                    Column {
-                        SizeSliderRow(
-                            title = "垂直偏移",
-                            value = offsetDp,
-                            min = StampStore.OFFSET_DP_MIN,
-                            max = StampStore.OFFSET_DP_MAX,
-                            onValueChange = { saveOffsetDp(it) },
-                        )
-                        SizeSliderRow(
-                            title = "左右偏移",
-                            value = offsetXDp,
-                            min = StampStore.OFFSET_X_DP_MIN,
-                            max = StampStore.OFFSET_X_DP_MAX,
-                            onValueChange = { saveOffsetXDp(it) },
-                            modifier = Modifier.padding(top = 12.dp),
-                        )
-                        SuperSwitch(
-                            title = "星期编号按周一起算",
-                            summary = "关（默认）：星期图按周日=1 编号（AAA 这类）；开：按周一=1 编号（云镜这类）。主题文件不声明编号口径、星期差一天时切它；同样按主题各记各的。",
-                            checked = weekdayMondayStart,
-                            onCheckedChange = { saveWeekdayMondayStart(it) },
-                        )
-                        Text(
-                            "垂直：负数上移、正数下移；左右：负数左移、正数右移。每个主题单独记自己的偏移：滑杆调的是当前选中的主题，切到别的主题显示的是那个主题的值。主题顶部的留白是给锁屏天空的，在通知中心里显空时往上调；偏移最多把时钟簇推到贴边，不会移出画面。",
-                            fontSize = 13.sp,
-                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                            modifier = Modifier.padding(top = 8.dp),
-                        )
-                    }
-                }
-
-                }
-
-                SettingsSection(
-                    prefs = prefs,
-                    id = "themes",
-                    title = "主题管理",
-                    defaultExpanded = true,
-                ) {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    cornerRadius = 20.dp,
-                    insideMargin = PaddingValues(vertical = 4.dp),
-                ) {
-                    Column {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable(enabled = !importing) {
-                                    importLauncher.launch(arrayOf("*/*"))
-                                }
-                                .padding(horizontal = 16.dp, vertical = 12.dp),
-                            verticalAlignment = Alignment.CenterVertically,
+            Column(
+                modifier = Modifier
+                    .padding(horizontal = 16.dp)
+                    .padding(bottom = 24.dp),
+            ) {
+                when (page) {
+                    PAGE_THEMES -> {
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            cornerRadius = 20.dp,
+                            insideMargin = PaddingValues(vertical = 4.dp),
                         ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    "导入主题文件",
-                                    fontSize = 15.sp,
-                                    color = MiuixTheme.colorScheme.onSurface,
+                            Column {
+                                SuperArrow(
+                                    title = "导入主题文件",
+                                    summary = if (importing) "正在导入…" else "选择 .hnt / .hwt 主题包",
+                                    onClick = {
+                                        importLauncher.launch(arrayOf("*/*"))
+                                    },
+                                    enabled = !importing,
                                 )
-                                Text(
-                                    if (importing) "正在导入…" else "选择 .hnt / .hwt 主题包",
-                                    fontSize = 13.sp,
-                                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                                )
-                            }
-                            Text(
-                                "›",
-                                fontSize = 20.sp,
-                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                            )
-                        }
-                        if (importStatus.isNotEmpty()) {
-                            Text(
-                                importStatus,
-                                fontSize = 13.sp,
-                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
-                            )
-                        }
-                        if (themes.isEmpty()) {
-                            Text(
-                                "还没有导入主题。导入后点主题名即可切换。",
-                                fontSize = 13.sp,
-                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                            )
-                        }
-                        for (theme in themes) {
-                            val selected = theme.id == selectedThemeId
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable { selectTheme(theme.id) }
-                                    .padding(horizontal = 16.dp, vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
+                                if (importStatus.isNotEmpty()) {
                                     Text(
-                                        theme.name,
-                                        fontSize = 15.sp,
-                                        color = MiuixTheme.colorScheme.onSurface,
+                                        importStatus,
+                                        fontSize = 13.sp,
+                                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                                     )
-                                    if (selected) {
+                                }
+                                if (themes.isEmpty()) {
+                                    Text(
+                                        "还没有导入主题。导入后点主题名即可切换。",
+                                        fontSize = 13.sp,
+                                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                                    )
+                                }
+                                for (theme in themes) {
+                                    val selected = theme.id == selectedThemeId
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable { selectTheme(theme.id) }
+                                            .padding(horizontal = 16.dp, vertical = 10.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                theme.name,
+                                                fontSize = 15.sp,
+                                                color = MiuixTheme.colorScheme.onSurface,
+                                            )
+                                            if (selected) {
+                                                Text(
+                                                    "当前使用",
+                                                    fontSize = 12.sp,
+                                                    color = MiuixTheme.colorScheme.primary,
+                                                )
+                                            }
+                                        }
                                         Text(
-                                            "当前使用",
-                                            fontSize = 12.sp,
-                                            color = MiuixTheme.colorScheme.primary,
+                                            "删除",
+                                            fontSize = 13.sp,
+                                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                            modifier = Modifier
+                                                .clickable { deleteTheme(theme.id) }
+                                                .padding(horizontal = 8.dp, vertical = 4.dp),
                                         )
                                     }
                                 }
+                            }
+                        }
+                    }
+
+                    PAGE_POSITION -> {
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            cornerRadius = 20.dp,
+                            insideMargin = PaddingValues(16.dp),
+                        ) {
+                            Column {
+                                SizeSliderRow(
+                                    title = "垂直偏移",
+                                    value = offsetDp,
+                                    min = StampStore.OFFSET_DP_MIN,
+                                    max = StampStore.OFFSET_DP_MAX,
+                                    onValueChange = { saveOffsetDp(it) },
+                                )
+                                SizeSliderRow(
+                                    title = "左右偏移",
+                                    value = offsetXDp,
+                                    min = StampStore.OFFSET_X_DP_MIN,
+                                    max = StampStore.OFFSET_X_DP_MAX,
+                                    onValueChange = { saveOffsetXDp(it) },
+                                    modifier = Modifier.padding(top = 12.dp),
+                                )
+                                SuperSwitch(
+                                    title = "星期编号按周一起算",
+                                    summary = "关（默认）：星期图按周日=1 编号（AAA 这类）；开：按周一=1 编号（云镜这类）。主题文件不声明编号口径、星期差一天时切它；同样按主题各记各的。",
+                                    checked = weekdayMondayStart,
+                                    onCheckedChange = { saveWeekdayMondayStart(it) },
+                                )
                                 Text(
-                                    "删除",
+                                    "垂直：负数上移、正数下移；左右：负数左移、正数右移。每个主题单独记自己的偏移：滑杆调的是当前选中的主题，切到别的主题显示的是那个主题的值。主题顶部的留白是给锁屏天空的，在通知中心里显空时往上调；偏移最多把时钟簇推到贴边，不会移出画面。",
                                     fontSize = 13.sp,
                                     color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                                    modifier = Modifier
-                                        .clickable { deleteTheme(theme.id) }
-                                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                                    modifier = Modifier.padding(top = 8.dp),
                                 )
                             }
                         }
                     }
-                }
 
-                }
-
-                SettingsSection(
-                    prefs = prefs,
-                    id = "height",
-                    title = "区域高度",
-                    defaultExpanded = false,
-                ) {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    cornerRadius = 20.dp,
-                    insideMargin = PaddingValues(vertical = 4.dp),
-                ) {
-                    Column {
-                        HeightModeRow("跟随内容", "高度取所画元素的最下缘", heightMode == 0) {
-                            saveHeightMode(0)
-                        }
-                        HeightModeRow("屏高 1/3", "覆盖层固定占屏幕高度三分之一", heightMode == 1) {
-                            saveHeightMode(1)
-                        }
-                        HeightModeRow("屏高 1/2", "覆盖层固定占屏幕高度二分之一", heightMode == 2) {
-                            saveHeightMode(2)
-                        }
-                    }
-                }
-
-                }
-
-                SettingsSection(
-                    prefs = prefs,
-                    id = "fontsize",
-                    title = "字号（原系统头部模式）",
-                    defaultExpanded = false,
-                ) {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    cornerRadius = 20.dp,
-                    insideMargin = PaddingValues(16.dp),
-                ) {
-                    Column {
-                        SizeSliderRow(
-                            title = "时钟字号",
-                            value = clockSize,
-                            min = CLOCK_DP_MIN,
-                            max = CLOCK_DP_MAX,
-                            onValueChange = { saveClockSize(it) },
+                    PAGE_DISPLAY -> {
+                        SmallTitle(
+                            text = "顶部样式",
+                            insideMargin = PaddingValues(start = 4.dp),
                         )
-                        SizeSliderRow(
-                            title = "日期字号",
-                            value = dateSize,
-                            min = DATE_DP_MIN,
-                            max = DATE_DP_MAX,
-                            onValueChange = { saveDateSize(it) },
-                            modifier = Modifier.padding(top = 12.dp),
-                        )
-                    }
-                }
-
-                }
-
-                SmallTitle(
-                    text = "系统界面",
-                    insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
-                )
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    cornerRadius = 20.dp,
-                    insideMargin = PaddingValues(vertical = 4.dp),
-                ) {
-                    Column {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { requestRestart() }
-                                .padding(horizontal = 16.dp, vertical = 12.dp),
-                            verticalAlignment = Alignment.CenterVertically,
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            cornerRadius = 20.dp,
+                            insideMargin = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
                         ) {
-                            Column(modifier = Modifier.weight(1f)) {
+                            SuperSwitch(
+                                title = "锁屏主题样式",
+                                summary = "开：用导入的锁屏主题渲染顶部；关：系统原头部",
+                                checked = topStyleTheme,
+                                onCheckedChange = { saveTopStyle(it) },
+                            )
+                            SuperSwitch(
+                                title = "主题背景图",
+                                summary = "开：连主题的整幅背景图一起画；关：只画时钟等元素，透出通知栏原背景",
+                                checked = showBackground,
+                                onCheckedChange = { saveShowBackground(it) },
+                            )
+                            SuperSwitch(
+                                title = "小模块（温度/风向/电量）",
+                                summary = "开：连温度、风向、电量小模块一起画；关：只显示时间样式（默认关）",
+                                checked = showWidgets,
+                                onCheckedChange = { saveShowWidgets(it) },
+                            )
+                            SuperSwitch(
+                                title = "隐藏运营商文字",
+                                summary = "开：锁屏、控制中心、通知中心左上角的运营商文字（中国联通等）不显示（默认开）",
+                                checked = hideCarrier,
+                                onCheckedChange = { saveHideCarrier(it) },
+                            )
+                        }
+                        SmallTitle(
+                            text = "区域高度",
+                            insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
+                        )
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            cornerRadius = 20.dp,
+                            insideMargin = PaddingValues(vertical = 4.dp),
+                        ) {
+                            Column {
+                                HeightModeRow("跟随内容", "高度取所画元素的最下缘", heightMode == 0) {
+                                    saveHeightMode(0)
+                                }
+                                HeightModeRow("屏高 1/3", "覆盖层固定占屏幕高度三分之一", heightMode == 1) {
+                                    saveHeightMode(1)
+                                }
+                                HeightModeRow("屏高 1/2", "覆盖层固定占屏幕高度二分之一", heightMode == 2) {
+                                    saveHeightMode(2)
+                                }
+                            }
+                        }
+                    }
+
+                    PAGE_FONTSIZE -> {
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            cornerRadius = 20.dp,
+                            insideMargin = PaddingValues(16.dp),
+                        ) {
+                            Column {
+                                SizeSliderRow(
+                                    title = "时钟字号",
+                                    value = clockSize,
+                                    min = CLOCK_DP_MIN,
+                                    max = CLOCK_DP_MAX,
+                                    onValueChange = { saveClockSize(it) },
+                                )
+                                SizeSliderRow(
+                                    title = "日期字号",
+                                    value = dateSize,
+                                    min = DATE_DP_MIN,
+                                    max = DATE_DP_MAX,
+                                    onValueChange = { saveDateSize(it) },
+                                    modifier = Modifier.padding(top = 12.dp),
+                                )
                                 Text(
-                                    "重启系统界面",
-                                    fontSize = 15.sp,
+                                    "字号只对原系统头部模式有效，改完回主页点「重启系统界面」即可生效。",
+                                    fontSize = 13.sp,
+                                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                    modifier = Modifier.padding(top = 8.dp),
+                                )
+                            }
+                        }
+                    }
+
+                    PAGE_ABOUT -> {
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            cornerRadius = 20.dp,
+                            insideMargin = PaddingValues(16.dp),
+                        ) {
+                            Column {
+                                Text(
+                                    "切换主题、改区域高度、调垂直/左右偏移、开关锁屏主题样式、主题背景图与隐藏运营商文字：下次下拉通知栏即生效（约 1 秒内自动刷新），不用强停系统界面。",
+                                    fontSize = 14.sp,
                                     color = MiuixTheme.colorScheme.onSurface,
                                 )
                                 Text(
-                                    "等同强停系统界面：字号等需要重载的改动点它即可生效，不用去设置里强停",
-                                    fontSize = 13.sp,
+                                    "字号滑杆只对原系统头部模式有效，改完点主页「重启系统界面」即可生效（等同强停，不用重启手机）。",
+                                    fontSize = 14.sp,
+                                    color = MiuixTheme.colorScheme.onSurface,
+                                    modifier = Modifier.padding(top = 8.dp),
+                                )
+                                Text(
+                                    "温度/风向小模块读系统天气服务，与锁屏同源（「小模块」开关默认关，打开后才画）；主题里的入场动画只按终态静态呈现，秒数逐秒切换。",
+                                    fontSize = 14.sp,
+                                    color = MiuixTheme.colorScheme.onSurface,
+                                    modifier = Modifier.padding(top = 8.dp),
+                                )
+                                Text(
+                                    "在 LSPosed 里停用本模块，再强停一次系统界面，通知中心即恢复原样。诊断日志在 /sdcard/Download/shadeclock_probe.log，主题资产在 /sdcard/Download/HonorShadeClock/themes/。",
+                                    fontSize = 14.sp,
                                     color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                    modifier = Modifier.padding(top = 8.dp),
                                 )
                             }
-                            Text(
-                                "›",
-                                fontSize = 20.sp,
-                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                            )
-                        }
-                        if (restartStatus.isNotEmpty()) {
-                            Text(
-                                restartStatus,
-                                fontSize = 13.sp,
-                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
-                            )
                         }
                     }
-                }
 
-                SettingsSection(
-                    prefs = prefs,
-                    id = "about",
-                    title = "说明",
-                    defaultExpanded = false,
-                ) {
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 24.dp),
-                    cornerRadius = 20.dp,
-                    insideMargin = PaddingValues(16.dp),
-                ) {
-                    Column {
-                        Text(
-                            "切换主题、改区域高度、调垂直/左右偏移、开关锁屏主题样式、主题背景图与隐藏运营商文字：下次下拉通知栏即生效（约 1 秒内自动刷新），不用强停系统界面。",
-                            fontSize = 14.sp,
-                            color = MiuixTheme.colorScheme.onSurface,
+                    else -> {
+                        // 主页：版本说明卡 + SuperArrow 入口列 +
+                        // 常显的系统界面（重启按钮，动作行不藏进
+                        // 子页）。
+                        SmallTitle(
+                            text = "正式版 v${BuildConfig.VERSION_NAME}",
+                            insideMargin = PaddingValues(start = 4.dp),
                         )
-                        Text(
-                            "字号滑杆只对原系统头部模式有效，改完点上方「重启系统界面」即可生效（等同强停，不用重启手机）。",
-                            fontSize = 14.sp,
-                            color = MiuixTheme.colorScheme.onSurface,
-                            modifier = Modifier.padding(top = 8.dp),
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            cornerRadius = 20.dp,
+                            insideMargin = PaddingValues(16.dp),
+                        ) {
+                            Column {
+                                Text(
+                                    "在通知栏顶部盖一层自绘覆盖层，按荣耀锁屏主题的样式渲染（数字图集时钟、日期、电量、天气小模块等），主题可导入、可切换。",
+                                    fontSize = 14.sp,
+                                    color = MiuixTheme.colorScheme.onSurface,
+                                )
+                                Text(
+                                    "覆盖层构建或渲染出任何问题都会自动卸下、恢复系统原头部，不会让系统界面崩溃。",
+                                    fontSize = 14.sp,
+                                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                    modifier = Modifier.padding(top = 8.dp),
+                                )
+                            }
+                        }
+                        SmallTitle(
+                            text = "设置",
+                            insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
                         )
-                        Text(
-                            "温度/风向小模块读系统天气服务，与锁屏同源（「小模块」开关默认关，打开后才画）；主题里的入场动画只按终态静态呈现，秒数逐秒切换。",
-                            fontSize = 14.sp,
-                            color = MiuixTheme.colorScheme.onSurface,
-                            modifier = Modifier.padding(top = 8.dp),
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            cornerRadius = 20.dp,
+                            insideMargin = PaddingValues(vertical = 4.dp),
+                        ) {
+                            Column {
+                                SuperArrow(
+                                    title = "主题管理",
+                                    summary = themes.firstOrNull { it.id == selectedThemeId }
+                                        ?.let { "当前使用：${it.name}" }
+                                        ?: "导入并选择锁屏主题",
+                                    onClick = { page = PAGE_THEMES },
+                                )
+                                SuperArrow(
+                                    title = "位置",
+                                    summary = "垂直/左右偏移、星期编号（按主题记）",
+                                    onClick = { page = PAGE_POSITION },
+                                )
+                                SuperArrow(
+                                    title = "显示与开关",
+                                    summary = "顶部样式、背景图、小模块、运营商、区域高度",
+                                    onClick = { page = PAGE_DISPLAY },
+                                )
+                                SuperArrow(
+                                    title = "原系统头部",
+                                    summary = "原头部模式的时钟/日期字号",
+                                    onClick = { page = PAGE_FONTSIZE },
+                                )
+                                SuperArrow(
+                                    title = "说明",
+                                    summary = "使用说明与注意事项",
+                                    onClick = { page = PAGE_ABOUT },
+                                )
+                            }
+                        }
+                        SmallTitle(
+                            text = "系统界面",
+                            insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
                         )
-                        Text(
-                            "在 LSPosed 里停用本模块，再强停一次系统界面，通知中心即恢复原样。诊断日志在 /sdcard/Download/shadeclock_probe.log，主题资产在 /sdcard/Download/HonorShadeClock/themes/。",
-                            fontSize = 14.sp,
-                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                            modifier = Modifier.padding(top = 8.dp),
-                        )
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            cornerRadius = 20.dp,
+                            insideMargin = PaddingValues(vertical = 4.dp),
+                        ) {
+                            Column {
+                                SuperArrow(
+                                    title = "重启系统界面",
+                                    summary = "等同强停系统界面：字号等需要重载的改动点它即可生效，不用去设置里强停",
+                                    onClick = { requestRestart() },
+                                )
+                                if (restartStatus.isNotEmpty()) {
+                                    Text(
+                                        restartStatus,
+                                        fontSize = 13.sp,
+                                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                                    )
+                                }
+                            }
+                        }
                     }
-                }
                 }
             }
         }
-    }
-}
-
-/**
- * 可折叠分组（v2.0.24）：标题行沿用 [SmallTitle] 观感，右侧带
- * 箭头（收起时朝右、展开时转朝下），整行可点切换展开/收起，
- * 内容带展开/收起动画。展开状态按组落盘
- * （ui_section_<id>，只存设置页自身的呈现偏好、不进戳记），
- * 下次打开设置页保持上次的样子；从未存过时用
- * [defaultExpanded]（按使用频率定：主题管理、位置默认展开，
- * 其余默认收起）。「系统界面」是动作行、不走本组件、常显。
- */
-@Composable
-private fun SettingsSection(
-    prefs: SharedPreferences,
-    id: String,
-    title: String,
-    defaultExpanded: Boolean,
-    content: @Composable () -> Unit,
-) {
-    var expanded by remember {
-        mutableStateOf(prefs.getBoolean("ui_section_$id", defaultExpanded))
-    }
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable {
-                expanded = !expanded
-                prefs.edit().putBoolean("ui_section_$id", expanded).apply()
-            },
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Box(modifier = Modifier.weight(1f)) {
-            SmallTitle(
-                text = title,
-                insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
-            )
-        }
-        Text(
-            "›",
-            fontSize = 20.sp,
-            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-            modifier = Modifier
-                .rotate(if (expanded) 90f else 0f)
-                .padding(end = 4.dp),
-        )
-    }
-    AnimatedVisibility(
-        visible = expanded,
-        enter = expandVertically() + fadeIn(),
-        exit = shrinkVertically() + fadeOut(),
-    ) {
-        content()
     }
 }
 

@@ -401,6 +401,14 @@ object HeaderOverlay {
     private const val WRAPPER_MARKER = "shadeclock_overlay_wrapper"
     private const val MAX_FAILURES = 8
 
+    /**
+     * 开门时间确认窗（v2.0.25）：收尾门从「已关」转「想开」
+     * 的判定须持续成立至少这段时间（约半帧）才放行——滤掉
+     * 关落定后宿主状态复位把展开比例一次性打回高值的单次
+     * 采样尖峰（定案见 [updateCloseTailLatch] 注）。
+     */
+    private const val OPEN_CONFIRM_MS = 8L
+
     // 锁屏门控（v2.0.3）：状态值与宿主 StatusBarState 的反编译源码
     // 逐一核对过（0=SHADE、1=KEYGUARD、2=SHADE_LOCKED、3=FS_USRSW）。
     private const val STATE_CONTROLLER_CLASS =
@@ -712,6 +720,19 @@ object HeaderOverlay {
         var gateTailLatched = false
         /** 早关 latch 的触发比例（反转解除的基准）。 */
         var gateTailFraction = 0f
+        /**
+         * 开门时间确认的起点（v2.0.25）：收尾门已关时出现
+         * 第一发「想开」评估的时刻，-1=无待确认；持续成立
+         * ≥ [OPEN_CONFIRM_MS] 才真开门，见
+         * [applyWrapperVisibility]。
+         */
+        var gateOpenConfirmAtMs = -1L
+        /**
+         * 早关 latch 解除（手势反转）的时间确认起点
+         * （v2.0.25）：比例越过解除阈值的第一发评估时刻，
+         * -1=无待确认，见 [updateCloseTailLatch]。
+         */
+        var gateLatchReleaseAtMs = -1L
         /** 上一次采样的展开比例（判「正在下落」用），null=尚无采样。 */
         var gateLastFraction: Float? = null
         /** 面板本体（头部祖先 NotificationPanelView）与展开比例字段句柄（v2.0.22 收尾门用，懒定位、定位失败保持 null 走旧口径）。 */
@@ -784,6 +805,11 @@ object HeaderOverlay {
      * 例 0）外，关闭行程中宿主先行隐藏头部内容的那一刻
      * 也关门——[updateCloseTailLatch] 维护的 latch；定案
      * 与开侧不认该标志的理由见该函数注。
+     *
+     * v2.0.25：本函数的判定不变，但从「已关」转「开」
+     * 的应用要过 [applyWrapperVisibility] 的时间确认
+     * （复位尖峰单次采样不许开门），latch 解除同理（见
+     * [updateCloseTailLatch] 注的定案）。
      */
     private fun shadeSettledClosed(st: State): Boolean {
         if (pageSwitching) return false
@@ -812,6 +838,25 @@ object HeaderOverlay {
      * 触发。解除：比例回升超过触发点 0.02（手势反转上
      * 行）、标志回到 true、或比例归零（落定判据接管，
      * latch 顺手清掉）。页面切换期整门豁免、latch 不动。
+     *
+     * v2.0.25 定案（v2.0.24 真机录屏+日志）：latch 本身触
+     * 发成功（日志实证在比例 0.82 处与原头部同刻关门），
+     * 但紧接着一发评估里比例读数跳回 1.0——当时容器标志
+     * 仍 false、头部本体已 GONE，面板只可能更关、不可能
+     * 在一发评估内真重开：这是关落定后宿主状态复位（比
+     * 例与 alpha/标志同批被写回下次打开初值，v2.0.22 已
+     * 实证同批复位）打出的单次采样尖峰。旧解除条件是单
+     * 次采样越过触发点+0.02 即解除，尖峰正好冒充「手势
+     * 反转」把 latch 解掉、门随即按 open 把整簇以全不透
+     * 明贴回已关的桌面（录屏落定后整簇重现约一帧，与该
+     * 行日志逐项对位）。另一轮关闭里标志翻转时比例已
+     * ≈0、门在同一调用栈内靠落定判据关掉（tail=false 属
+     * 正常、无 latch 窗口）。修法：解除与开门都加时间确
+     * 认——判定须持续成立 ≥ [OPEN_CONFIRM_MS]（约半帧）
+     * 才算数；手势反转/真实下拉是持续过程、评估帧频密
+     * 集，确认只迟约一帧；尖峰等不到第二发评估就回落、
+     * 确认随之撤销。本函数管 latch 解除的确认，开门侧的
+     * 确认在 [applyWrapperVisibility]。
      */
     private fun updateCloseTailLatch(st: State) {
         if (pageSwitching) return
@@ -823,11 +868,25 @@ object HeaderOverlay {
         val last = st.gateLastFraction
         st.gateLastFraction = fraction
         when {
-            fraction <= 0f || shadeContainerVisible ->
+            fraction <= 0f || shadeContainerVisible -> {
                 st.gateTailLatched = false
+                st.gateLatchReleaseAtMs = -1L
+            }
             st.gateTailLatched -> {
                 if (fraction > st.gateTailFraction + 0.02f) {
-                    st.gateTailLatched = false
+                    // 解除要时间确认（v2.0.25）：单次采样越过
+                    // 阈值只记起点，持续 ≥ OPEN_CONFIRM_MS 的
+                    // 第二发评估才真解除（定案见函数注）。
+                    val now = SystemClock.uptimeMillis()
+                    val since = st.gateLatchReleaseAtMs
+                    if (since < 0L) {
+                        st.gateLatchReleaseAtMs = now
+                    } else if (now - since >= OPEN_CONFIRM_MS) {
+                        st.gateTailLatched = false
+                        st.gateLatchReleaseAtMs = -1L
+                    }
+                } else {
+                    st.gateLatchReleaseAtMs = -1L
                 }
             }
             last != null && fraction < last - 0.0005f -> {
@@ -852,7 +911,29 @@ object HeaderOverlay {
             return
         }
         updateCloseTailLatch(st)
-        val closed = shadeSettledClosed(st)
+        var closed = shadeSettledClosed(st)
+        // 开门时间确认（v2.0.25）：门已关落定时重新打开，
+        // 须「想开」判定持续成立 ≥ OPEN_CONFIRM_MS（约半
+        // 帧）才放行——关落定后宿主复位打出的比例尖峰只
+        // 持续一发评估（定案见 updateCloseTailLatch 注），
+        // 等不到确认就回落；真实下拉/手势反转是持续过
+        // 程、评估帧频密集，确认只迟约一帧，且位图早已
+        // 离屏渲好、第一帧仍是成品。挂起恢复与 attach 首
+        // 应用不走确认（gateClosed 非 true：挂起分支已置
+        // null），行为与旧版一致。
+        if (!closed && st.gateClosed == true) {
+            val now = SystemClock.uptimeMillis()
+            val since = st.gateOpenConfirmAtMs
+            if (since < 0L) {
+                st.gateOpenConfirmAtMs = now
+                closed = true
+            } else if (now - since < OPEN_CONFIRM_MS) {
+                closed = true
+            } else {
+                st.gateOpenConfirmAtMs = -1L
+            }
+        }
+        if (closed) st.gateOpenConfirmAtMs = -1L
         if (st.gateClosed == closed && wrapper.visibility ==
             if (closed) View.GONE else View.VISIBLE
         ) {
@@ -3110,6 +3191,7 @@ object HeaderOverlay {
                 "renders=${tv?.renderCount} " +
                 "gate=${if (shadeSettledClosed(st)) "closed" else "open"} " +
                 "expF=${panelExpandedFraction(st)} tail=${st.gateTailLatched} " +
+                    "cfm=${st.gateOpenConfirmAtMs >= 0L} rel=${st.gateLatchReleaseAtMs >= 0L} " +
                 "drawn=${tv?.lastDrawnElements} envNull=${tv?.lastEnvMissing} | " +
                 "bgShown=${st.appliedStamp?.showBackground} | " +
                 "mountBounds=${st.mountBounds?.joinToString(",")}"
