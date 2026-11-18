@@ -420,17 +420,20 @@ object HeaderOverlay {
     private const val PANEL_FACTOR_SATURATION = 0.18f
 
     /**
-     * 开侧渐入窗（v2.0.30）：展开比例低于起点因子恒 0、
-     * 高于终点恒 1、窗内 smoothstep，见 [computePanelFactor]。
-     * 起点 0.40 的依据：.29 真机日志里收尾门打开时刻的
-     * 比例分布为 0.34–0.47，最坏一例 0.47 在窗内也只得
-     * ≈0.06 的因子（压在未铺满的背景上肉眼不可见），其
-     * 余各轮开门时因子为 0；终点 0.90：面板近全开才全
-     * 显，fling 后段约 200ms 正好走完整个渐入。小乐已
-     * 明确接受出现晚一点、优先不起手闪。
+     * 落定打开的比例门槛（v2.0.30）：展开比例达到该值且
+     * 不在跟手/瞬时展开/关闭行程中，才算「落定打开」、
+     * 簇才许出现，见 [settledOpenFactor]。取 0.999 而非
+     * 1.0 是给浮点留余量（真机 diag 里全开稳态恒读 1.0）。
      */
-    private const val PANEL_FADE_IN_START = 0.40f
-    private const val PANEL_FADE_IN_END = 0.90f
+    private const val PANEL_SETTLED_FRACTION = 0.999f
+
+    /**
+     * 落定淡入全程（v2.0.30）：落定打开后簇从 0 淡入到
+     * 全显的时间（smoothstep、时间驱动）。几十毫秒级：
+     * 只够把「出现」从硬切软化成落地，不构成行程中的
+     * 呈现（行程中因子恒 0、淡入无从谈起）。
+     */
+    private const val SETTLE_FADE_MS = 80f
 
     /**
      * 控制中心挂起/恢复的 alpha 斜坡全程（v2.0.28）：二值
@@ -825,14 +828,19 @@ object HeaderOverlay {
         var gateProgressionSeen = false
         /**
          * 面板连续因子（v2.0.28）：由展开比例连续驱动的透
-         * 明度乘子——开侧走渐入窗（v2.0.30）、关侧用饱和
-         * 点 [PANEL_FACTOR_SATURATION] 且只降不升（单调），
+         * 明度乘子——开侧行程中恒 0、落定打开后才淡入
+         * （v2.0.30 定版口径），关侧用饱和点
+         * [PANEL_FACTOR_SATURATION] 且只降不升（单调），
          * 见 [computePanelFactor]。与二值收尾门分工：门管
          * 终态清理、因子管行程中的每一帧。
          */
         var panelFactor = 1f
         /** 因子上次采样的展开比例（判下落用）。 */
         var factorLastFraction: Float? = null
+        /** 落定淡入起点（v2.0.30）：首次观测到落定打开的时刻，0=未起/已复位（关侧复位）。 */
+        var settleFadeStartMs = 0L
+        /** 落定淡入驱动复评是否已在主线程队列里（防重复排队）。 */
+        var settleFadeRecheckPosted = false
         /**
          * 容器标志抑制（v2.0.28）：关闭行程中容器可见标志
          * 翻 false 后置位——原头部在那一刻退出，覆盖层的
@@ -1849,27 +1857,29 @@ object HeaderOverlay {
     }
 
     /**
-     * 面板连续因子（v2.0.28 引入；v2.0.30 开侧改渐入）：
-     * 展开比例 → 透明度乘子，两个方向两条曲线：
+     * 面板连续因子（v2.0.28 引入；v2.0.30 开侧定版为
+     * 「行程中不出现、落定后出现」）：展开比例 → 透明
+     * 度乘子，两个方向两套口径：
      *
-     * 开侧（比例上升）：渐入窗 [PANEL_FADE_IN_START]～
-     * [PANEL_FADE_IN_END] 的 smoothstep。v2.0.15–.28 的
-     * 「下拉第一帧簇就在场」口径（开侧也用饱和点 0.18）
-     * 已被小乐于 v2.0.30 明确撤销——.29 真机日志定案：
-     * 每一轮下拉收尾门都在比例 0.34–0.47 处才打开（落
-     * 定隔离+开门确认走完），那时旧曲线早已饱和到 1.0、
-     * 通道 alpha 又是 1.0，开门那一帧合成 alpha 从 0 直
-     * 跳 1.0，而面板只展开约 1/3、背景未铺开，整簇全强
-     * 度浮在桌面上——就是每轮下拉起手那一闪（通知中心
-     * 里随后本就该显示、不突兀；控制中心里随即被摘、
-     * 格外刺眼；ccBound 闩在开门之后才置位、治不了这
-     * 一帧）。改渐入后开门时刻因子≈0、随行程平滑升到
-     * 全开 1.0。
+     * 开侧（比例上升/持平）：行程中恒 0，只有「落定打
+     * 开」才许出现、且带 [SETTLE_FADE_MS] 的短淡入，
+     * 见 [settledOpenFactor]。口径是小乐两轮拍板收敛的
+     * 结果：v2.0.15–.28 的「下拉第一帧簇就在场」（开侧
+     * 饱和点 0.18）先被他撤销——.29 真机日志定案每一轮
+     * 下拉收尾门都在比例 0.34–0.47 处打开、那时旧曲线
+     * 早已饱和 1.0，开门一帧内整簇全强度浮在尚未铺开
+     * 的面板背景之上；本版初稿曾改「随比例渐入窗」，
+     * 又被他的慢拉录屏证伪——极慢拉时比例长时间停在
+     * 窗内，簇就长时间半透明地浮在桌面图标之上，去通
+     * 知中心与去控制中心各出现一次，正是他点名要去掉
+     * 的「那个」。故定版：行程中（跟手/fling 未落定）
+     * 因子恒 0、不谈渐入；落定后才出现。
      *
      * 关侧（mClosing 或采样下落）：仍用饱和点
      * [PANEL_FACTOR_SATURATION] 的旧曲线且只降不升——
      * v2.0.28 收起行程已真机过关、一字不动：宿主在关
-     * 闭尾段把高度打回满值时比例假升、因子不跟升。
+     * 闭尾段把高度打回满值时比例假升、因子不跟升。关
+     * 侧只顺带把落定淡入起点复位，下次落定重新淡入。
      *
      * 页面切换期比例恒满、因子恒 1，不干涉横滑跟随；
      * 比例读不到时保持上次值（fail-open 不劣化）。
@@ -1886,22 +1896,86 @@ object HeaderOverlay {
         val falling = last != null && fraction < last - 0.0005f
         st.factorLastFraction = fraction
         val next = if (panelClosing(st) == true || falling) {
+            st.settleFadeStartMs = 0L
             val curve = (fraction / PANEL_FACTOR_SATURATION)
                 .coerceIn(0f, 1f)
             min(st.panelFactor, curve)
         } else {
-            fadeInCurve(fraction)
+            settledOpenFactor(st, fraction)
         }
         st.panelFactor = next
         return next
     }
 
-    /** 开侧渐入曲线（v2.0.30）：渐入窗内的 smoothstep。 */
-    private fun fadeInCurve(fraction: Float): Float {
-        val t = ((fraction - PANEL_FADE_IN_START) /
-            (PANEL_FADE_IN_END - PANEL_FADE_IN_START))
-            .coerceIn(0f, 1f)
+    /**
+     * 开侧因子（v2.0.30 定版）：行程中恒 0、落定打开后
+     * 短淡入到 1。
+     *
+     * 「落定打开」的判据（全是现成物理量，不与收尾门
+     * 的落定隔离抢判据——那边管 wrapper 终态 GONE，这
+     * 边只管 alpha）：展开比例 ≥ [PANEL_SETTLED_FRACTION]
+     * 且不在关闭行程、不在跟手跟踪、不在瞬时展开中。
+     * 跟手抬满也不算落定（手指没抬、行程未完），抬手
+     * 落定才淡入；fling 中比例未满恒 0、动画走完比例
+     * 到 1.0 的那一刻起淡入。行程布尔量读不到（null）
+     * 按不在行程中处理：比例未满时因子仍恒 0，fling
+     * 靠比例本身就挡住了，fail-open 不劣化。
+     *
+     * 一个例外：本轮打开已落定全显过（因子已满）后，
+     * 比例仍在高位（≥0.90）的小幅回拖再弹回——回拖走
+     * 关侧 min 分支、因子本就没被降下来，弹回程里不许
+     * 反手把整簇摁灭再淡入，保持 1。
+     *
+     * 淡入是时间驱动（[SETTLE_FADE_MS] smoothstep）+
+     * [startSettleFadeLoop] 10ms 自持复评推进，不依赖
+     * 评估密度；起点被关侧复位后，下次落定重新淡入。
+     */
+    private fun settledOpenFactor(st: State, fraction: Float): Float {
+        val settled = fraction >= PANEL_SETTLED_FRACTION &&
+            panelClosing(st) != true &&
+            panelTracking(st) != true &&
+            panelInstantExpanding(st) != true
+        if (!settled) {
+            if (st.panelFactor >= 0.99f && fraction >= 0.90f) {
+                return 1f
+            }
+            st.settleFadeStartMs = 0L
+            return 0f
+        }
+        val now = SystemClock.uptimeMillis()
+        if (st.settleFadeStartMs <= 0L) {
+            st.settleFadeStartMs = now
+            startSettleFadeLoop(st)
+        }
+        val t = ((now - st.settleFadeStartMs).toFloat() /
+            SETTLE_FADE_MS).coerceIn(0f, 1f)
         return t * t * (3f - 2f * t)
+    }
+
+    /**
+     * 落定淡入的驱动复评（v2.0.30）：与 [startCcFadeLoop]
+     * 同款式——淡入起点一落就排 10ms 复评、自持到因子
+     * 到 1 或起点被复位（行程恢复/关侧接管）为止；状态
+     * 摘除/挂起即作罢，异常不外抛。
+     */
+    private fun startSettleFadeLoop(st: State) {
+        if (st.settleFadeRecheckPosted) return
+        st.settleFadeRecheckPosted = true
+        st.handler.postDelayed({
+            st.settleFadeRecheckPosted = false
+            val registered = synchronized(states) {
+                states[st.header] === st
+            }
+            if (!registered) return@postDelayed
+            try {
+                if (!st.suspended) applyComposedTransform(st)
+                if (st.settleFadeStartMs > 0L && st.panelFactor < 1f) {
+                    startSettleFadeLoop(st)
+                }
+            } catch (t: Throwable) {
+                // 淡入失败不许影响宿主
+            }
+        }, 10L)
     }
 
     /**
