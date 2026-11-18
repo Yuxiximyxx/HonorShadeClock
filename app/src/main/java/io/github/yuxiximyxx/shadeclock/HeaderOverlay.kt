@@ -465,6 +465,14 @@ object HeaderOverlay {
     private const val SWIPE_SWITCH_IMPL_CLASS =
         "com.android.systemui.statusbar.phone.HnSwipeSwitchControllerImpl"
 
+    // 目的页闩（v2.0.29）：类名经反编译核实——HnPanelViewControllerImpl
+    // 是面板呈现控制器：flingToState 的展开分支按触摸区决定
+    // 目的页后直接调 onControlCenterExpand /
+    // onNotificationCenterExpand（先于其内部动画集与落定
+    // notify），setPanelShowingType 是全部路径的目的页汇聚点。
+    private const val PANEL_VIEW_CONTROLLER_IMPL_CLASS =
+        "com.android.systemui.statusbar.phone.HnPanelViewControllerImpl"
+
     // 横幅门控（v2.0.6）：类名经反编译核实——HeadsUpManagerImpl
     // 是新场景架构的横幅管理器，setEntryPinned 是 pinned 状态
     // 变更的唯一汇聚点，聚合字段 mHasPinnedNotification 即
@@ -498,6 +506,22 @@ object HeaderOverlay {
     /** 控制中心页是否展开（HwPanelControlImpl 分发 hook 跟踪；字段读取兜底见 isControlCenterActive）。 */
     @Volatile
     private var controlCenterExpand = false
+
+    /**
+     * 目的页闩（v2.0.29）：宿主已决定呈现控制中心、但落定
+     * notify 尚未到（且宿主会在动画末尾把头部通道复位回
+     * 1.0）的窗口内，合成 alpha 强制归零。置位/清位信号取
+     * 自 HnPanelViewControllerImpl 的目的页入口（before
+     * hook，早于动画与 notify），落定 notify 里与
+     * [controlCenterExpand] 对齐兜底，applyGate 每轮与落定
+     * 真相 [isControlCenterActive] 对账防卡死。定案见
+     * [installCcBoundGate]。
+     */
+    @Volatile
+    private var ccBound = false
+
+    /** 目的页闩翻转日志计数（v2.0.29，有界 20 行/进程）。 */
+    private var ccBoundLogCount = 0
 
     /** 横幅是否呈现中（HeadsUpManagerImpl 聚合 pinned 状态 hook 跟踪；字段直读兜底见 isHeadsUpActive）。 */
     @Volatile
@@ -1382,6 +1406,7 @@ object HeaderOverlay {
         }
         installKeyguardGate(lpparam, log)
         installControlCenterGate(lpparam, log)
+        installCcBoundGate(lpparam, log)
         installPageSwitchGate(lpparam, log)
         installHeadsUpGate(lpparam, log)
         installStackWriteInterceptor(lpparam, log)
@@ -1770,7 +1795,12 @@ object HeaderOverlay {
         }
         st.ccFade = cc
         st.ccFadeAtMs = now
-        val composed = a * pf * vf * cc
+        // 目的页闩（v2.0.29）：宿主已定去控制中心时与通道
+        // 值无关地归零——抢在控制中心呈现之前，宿主动画
+        // 末尾把通道复位回 1.0 也顶不起来；横滑期豁免
+        // （跟随照旧）。定案见 [installCcBoundGate]。
+        val bound = if (ccBound && !pageSwitching) 0f else 1f
+        val composed = a * pf * vf * cc * bound
         if (wrapper.alpha != composed) wrapper.alpha = composed
         val tx = st.header.translationX + shadeContainerX
         if (wrapper.translationX != tx) wrapper.translationX = tx
@@ -1856,7 +1886,10 @@ object HeaderOverlay {
         val panelW = (header.parent as? View)?.width?.takeIf { it > 0 }
             ?: header.width.takeIf { it > 0 }
             ?: return
-        val a = (1f - abs(tx) / panelW).coerceIn(0f, 1f)
+        // 目的页闩兜底（v2.0.29）：漏斗全灭走兜底跟随
+        // 时同样不得在控制中心呈现期间露面。
+        val bound = if (ccBound && !pageSwitching) 0f else 1f
+        val a = (1f - abs(tx) / panelW).coerceIn(0f, 1f) * bound
         if (wrapper.alpha != a) wrapper.alpha = a
     }
 
@@ -1972,6 +2005,123 @@ object HeaderOverlay {
     }
 
     /**
+     * 目的页闩的置位/清位（v2.0.29）：翻转时打一行留证（带
+     * 来源与当时通道值），并在同栈内对全部 State 重跑合成
+     * 变换——闩的生效必须赶在宿主下一帧绘制前，不能等
+     * posted 的门控重评（那正是 .28 在直切路径上慢一拍的
+     * 原因之一）。
+     */
+    private fun setCcBound(bound: Boolean, source: String) {
+        if (ccBound == bound) return
+        ccBound = bound
+        if (ccBoundLogCount < 20) {
+            ccBoundLogCount++
+            logFn(
+                "cc bound -> $bound ($source) " +
+                    "chA=$shadeCommonAlpha/$shadeTimeAlpha sw=$pageSwitching"
+            )
+        }
+        applyComposedToAllStates()
+    }
+
+    /**
+     * 目的页闩（v2.0.29）的信号源：hook 宿主
+     * HnPanelViewControllerImpl 的目的页入口（全部 before）。
+     *
+     * 定案（.28 真机日志 + 反编译互证）：去控制中心的非横
+     * 滑路径（面板打开中下拉切换、右区下拉）走
+     * flingToState → onControlCenterExpand → 动画集，落定
+     * notify 在 expF≈0.3（面板还在打开行程中）就到达——它
+     * 是动画开始侧的信号，不是呈现完成信号。.28 对它的响
+     * 应是 ccFade：簇在控制中心呈现期间从全不透明用
+     * 110ms 淡出——「时钟出现在控制中心页上闪了一下」本
+     * 身就是这段淡出（小乐形态澄清：压根不该在控制中心露
+     * 面）。雪上加霜：pull 动画末尾宿主
+     * resetViewAlphaAndScale 把头部两路通道写回 1.0/1.0
+     * （.28 挂起采样 chA=1.0/1.0 即此），通道跟随在那一刻
+     * 也救不回来。
+     *
+     * 修法：抢在呈现之前——onControlCenterExpand 的调用
+     * 时机在动画集 start 之前、notify 之前（方法体内顺序
+     * 实证），是全链最早的「目的页已定」信号；置闩后合成
+     * alpha 与通道值无关地归零，宿主之后写回什么都顶不
+     * 起来，控制中心第一帧呈现时簇已不可见。回程的清位
+     * 点（onNotificationCenterExpand /
+     * onSwipeToNotificationCenter / setPanelShowingType(1)）
+     * 都在通知页呈现侧入口，清闩后 attach 的 ccFade 淡入
+     * 照旧在通知页上发生，不冲突。横滑期 pageSwitching
+     * 豁免闩因子、跟随照旧（.28 已过关路径不动）。
+     */
+    private fun installCcBoundGate(
+        lpparam: XC_LoadPackage.LoadPackageParam,
+        log: (String) -> Unit,
+    ) {
+        try {
+            val implClass = XposedHelpers.findClass(
+                PANEL_VIEW_CONTROLLER_IMPL_CLASS, lpparam.classLoader
+            )
+            var installed = 0
+            // 置位侧（去控制中心）：展开/滑动两入口加下方
+            // showingType 汇聚点，任一命中即可、最早者先到。
+            for (name in arrayOf("onControlCenterExpand", "onSwipeToControlCenter")) {
+                val method = name
+                try {
+                    XposedHelpers.findAndHookMethod(
+                        implClass, method,
+                        object : XC_MethodHook() {
+                            override fun beforeHookedMethod(param: MethodHookParam) {
+                                setCcBound(true, method)
+                            }
+                        }
+                    )
+                    installed++
+                } catch (t: Throwable) {
+                    log("cc bound hook $method failed: ${t.javaClass.simpleName}")
+                }
+            }
+            // 清位侧（回通知中心）。
+            for (name in arrayOf("onNotificationCenterExpand", "onSwipeToNotificationCenter")) {
+                val method = name
+                try {
+                    XposedHelpers.findAndHookMethod(
+                        implClass, method,
+                        object : XC_MethodHook() {
+                            override fun beforeHookedMethod(param: MethodHookParam) {
+                                setCcBound(false, method)
+                            }
+                        }
+                    )
+                    installed++
+                } catch (t: Throwable) {
+                    log("cc bound hook $method failed: ${t.javaClass.simpleName}")
+                }
+            }
+            // 目的页汇聚点：setPanelShowingType(2)=控制中心、
+            // (1)=通知中心；5（切换中）/0/4 不动闩。
+            try {
+                XposedHelpers.findAndHookMethod(
+                    implClass, "setPanelShowingType",
+                    Byte::class.javaPrimitiveType,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            when ((param.args.getOrNull(0) as? Byte)?.toInt()) {
+                                2 -> setCcBound(true, "setPanelShowingType")
+                                1 -> setCcBound(false, "setPanelShowingType")
+                            }
+                        }
+                    }
+                )
+                installed++
+            } catch (t: Throwable) {
+                log("cc bound hook setPanelShowingType failed: ${t.javaClass.simpleName}")
+            }
+            log("cc bound gate hooks installed ($installed/5 on HnPanelViewControllerImpl)")
+        } catch (t: Throwable) {
+            log("cc bound gate hook install failed: ${t.javaClass.name}: ${t.message}")
+        }
+    }
+
+    /**
      * 控制中心门控的信号源（v2.0.4）：hook 宿主 HwPanelControlImpl
      * .notifyControlCenterPanelChange(boolean)——反编译核实它是
      * 控制中心页状态的分发唯一入口（与旧值相同直接返回、更新
@@ -1998,6 +2148,11 @@ object HeaderOverlay {
                         val changed = z != controlCenterExpand
                         if (changed) {
                             controlCenterExpand = z
+                            // 目的页闩与落定真相对齐（v2.0.29 兜
+                            // 底）：直接赋值不走 setCcBound——紧
+                            // 接着的门控重评会重跑合成，此处只保
+                            // 证闩不滞留在落定真相之后。
+                            ccBound = z
                             log(
                                 "panel page -> " +
                                     if (z) "control-center" else "notification-center"
@@ -3471,6 +3626,15 @@ object HeaderOverlay {
      * 路径。返回 false 才是稳态（覆盖层正常挂载中）。
      */
     private fun applyGate(st: State): Boolean {
+        // 目的页闩对账（v2.0.29）：闩是「呈现决定已下、落
+        // 定未到」的提前量；落定真相说不在控制中心、又不
+        // 在切换中，闩不得滞留（防清位信号漏接时把通知页
+        // 显示吞掉）。置位窗口内宿主在同一调用栈里走完决
+        // 定→notify，跨栈评估到这里时落定真相必然已更
+        // 新，不会误清正在呈现的控制中心。
+        if (ccBound && !pageSwitching && !isControlCenterActive(st.header)) {
+            setCcBound(false, "reconcile")
+        }
         val reason = suspendReason(st.header)
         if (reason != null) {
             // 控制中心软挂起（v2.0.28）：落定到控制中心页先
@@ -3647,7 +3811,7 @@ object HeaderOverlay {
                 "expF=${panelExpandedFraction(st)} cls=${panelClosing(st)} " +
                     "cfm=${st.gateOpenConfirmAtMs >= 0L} q=${st.gateQuarantine} " +
                     "pg=${st.gateProgressionSeen} pf=${st.panelFactor} " +
-                    "vf=${st.visFactor} cc=${st.ccFade} " +
+                    "vf=${st.visFactor} cc=${st.ccFade} cb=$ccBound " +
                 "drawn=${tv?.lastDrawnElements} envNull=${tv?.lastEnvMissing} | " +
                 "bgShown=${st.appliedStamp?.showBackground} | " +
                 "mountBounds=${st.mountBounds?.joinToString(",")}"
