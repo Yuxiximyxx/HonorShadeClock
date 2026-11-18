@@ -763,6 +763,14 @@ object HeaderOverlay {
     }
 
     private fun preheatWorker() {
+        // 戳记候选全貌留证（v2.0.20）：必须在 readStamp 的收敛
+        // 删除之前取——多于一份候选时打一行，下次再出现「选
+        // 了不跟随」可直接看清目录里有几份、各自的 themeId
+        // 与时间戳，不用再靠猜。
+        val candSummary = StampStore.stampCandidatesSummary()
+        if (candSummary.isNotEmpty()) {
+            logFn("overlay stamp candidates: $candSummary")
+        }
         val stamp = StampStore.readStamp() ?: return
         if (stamp.topStyle != StampStore.TOP_STYLE_THEME || stamp.themeId.isEmpty()) return
         val entry = StampStore.themeEntry(stamp.themeId) ?: return
@@ -2428,7 +2436,15 @@ object HeaderOverlay {
         return RenderEnv(
             now = Calendar.getInstance(),
             batteryLevel = st.batteryLevel,
-            batteryState = st.batteryState,
+            // 充电状态在覆盖层求值里恒按未充电（v2.0.20）：锁屏
+            // 主题自带的充电组（visibility 靠 #battery_state 触
+            // 发的帧图/充电背景/百分比）是锁屏场景的东西，小乐
+            // 口径只要锁屏的时间样式、不要其他——充电触发的整
+            // 组在通知中心永不出现。电量数值（battery_level）
+            // 保持真值，电量小模块/图标不受影响。这是通用规
+            // 则，对所有主题一视同仁；st.batteryState 本身仍记
+            // 真值，只是喂给主题求值的这一处固定为 0。
+            batteryState = 0,
             weather = WeatherSource.vars(),
             screenWidthPx = w,
             screenHeightPx = screenHeightPx(st.header),

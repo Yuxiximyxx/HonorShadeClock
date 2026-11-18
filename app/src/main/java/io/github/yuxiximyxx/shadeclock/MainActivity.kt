@@ -167,7 +167,17 @@ private fun SettingsScreen() {
     }
 
     fun syncStamp() {
-        scope.launch(Dispatchers.IO) { ThemeStore.writeStamp(context, prefs) }
+        scope.launch(Dispatchers.IO) {
+            // v2.0.20：写入带回读校验，再失败要让用户看见，
+            // 不再静默丢弃（v2.0.19 选了主题不跟随就是静默
+            // 失败吃掉的）。
+            val ok = ThemeStore.writeStamp(context, prefs)
+            if (!ok) {
+                withContext(Dispatchers.Main) {
+                    importStatus = "设置同步到系统界面失败，请再操作一次"
+                }
+            }
+        }
     }
 
     // 存量主题迁移（v2.0.18）：旧版解压在公共目录里的散图会被
@@ -289,12 +299,7 @@ private fun SettingsScreen() {
     fun requestRestart() {
         restartStatus = "已发送重启请求，系统界面马上会重启（通知栏会闪断一两秒）"
         scope.launch(Dispatchers.IO) {
-            val ok = PublicStore.writeFile(
-                context,
-                StampStore.STAMP_REL_DIR,
-                StampStore.RESTART_NAME,
-                System.currentTimeMillis().toString().toByteArray(Charsets.UTF_8),
-            )
+            val ok = ThemeStore.writeRestartRequest(context)
             if (!ok) {
                 withContext(Dispatchers.Main) {
                     restartStatus = "发送失败，请再点一次"

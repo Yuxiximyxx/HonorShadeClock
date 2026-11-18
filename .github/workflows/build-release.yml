@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.19-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.20-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.19-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.20-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,38 +68,38 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.19
-          name: HonorShadeClock 2.0.19 — 选了云镜却渲染别的主题修复（戳记通道+迁移校验+字体）
+          tag_name: v2.0.20
+          name: HonorShadeClock 2.0.20 — 选了 AAA 仍显示云镜修复（戳记收敛到单一权威）+ 充电动画不进通知中心
           body: |
-            ## HonorShadeClock 2.0.19
+            ## HonorShadeClock 2.0.20
 
-            修 v2.0.18 的三处回归，其余功能与 2.0.18 一致：
+            两件事，其余功能与 2.0.19 一致：
 
-            - 选了云镜却还渲染旧主题：卸载重装后，旧安装
-              写下的 stamp.txt 不再归新安装所有，设置里
-              改选主题的写入静默落到「stamp (1).txt」副本
-              上、正本纹丝不动，系统界面一直读旧戳记。
-              本版系统界面侧改为多候选取胜：正本与全部
-              副本按内容时间戳取最大者，并把胜者回写正本
-              修复；重启系统界面按钮的标记文件同理。已
-              经装了 2.0.18 又重装过的，升级后打开一次
-              设置页即可自愈，不用再重装、不用重选。
-            - 迁移丢图：2.0.18 的存量迁移曾把一个 103
-              图的主题打成只剩 2 图的包、还删了散图原件。
-              本版迁移改为打包后回读校验（条目数/图片数
-              对不上就删新包、保留散图），任一散文件读
-              不出整题放弃，绝不先删原件。注意：已被
-              2.0.18 迁移弄丢图片的主题（如 AAA）数据
-              已丢失，需要在设置里删掉后重新导入一次
-              才能恢复完整；云镜若是重装后新导入的则
-              不受影响。
-            - 主题字体加载失败：字体构建改用 direct
-              buffer（2.0.18 用堆缓冲被系统拒绝，带字体
-              的主题如云镜每版必失败一次）。
+            - 选了 AAA 却还是显示云镜：2.0.19 的日志实证，
+              系统界面侧从头到尾只采纳到云镜的那份戳记，
+              选 AAA 的写入没有在目录里留下一份能被采纳
+              的最新戳记——设置侧经 MediaStore 写入（查
+              不到就新建、被系统改名成副本、结果还被丢
+              弃）在重装过的机器上不可靠。本版把戳记通道
+              收敛到单一权威：设置侧每次写戳记前先删尽
+              本安装拥有的全部戳记副本、只写一份，写完
+              回读校验内容一致才算成功（失败会在设置页
+              给出提示，不再静默）；系统界面侧采纳胜者
+              后回写正本并删掉其余旧副本，目录最终只剩
+              正本一份。重启系统界面的标记文件同口径。
+              升级后打开一次设置页、把主题来回切换一次
+              即可自愈存量副本。
+            - 充电动画不再进通知中心：锁屏主题自带的充
+              电组（充电帧图、充电背景、充电百分比）是
+              锁屏场景的东西，覆盖层求值时一律按未充电
+              处理，充电触发的整组永不出现在通知中心；
+              电量数值保持真值，电量小模块/图标不受影
+              响。对所有主题通用，不只针对某一份。
 
             生效方式：覆盖安装 → 打开一次设置页 → 用
-            设置页「重启系统界面」按钮重载 → 下拉通知
-            中心确认渲染的是所选主题。
+            设置页「重启系统界面」按钮重载 → 在两个主
+            题间来回切换确认都跟随；充电时下拉确认不
+            再出现充电动画。
             关闭办法：在 LSPosed 里停用模块再重启一次
             系统界面，即恢复原样。
           files: dist/*.apk

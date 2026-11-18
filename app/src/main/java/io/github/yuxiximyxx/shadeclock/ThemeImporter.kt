@@ -107,6 +107,33 @@ object PublicStore {
         return out
     }
 
+    /**
+     * 枚举 relDir 直属（不含子目录）的自有文件，文件名需整名
+     * 匹配 nameRegex。戳记/重启标记的副本清理用：listFiles 的
+     * 前缀查询会连 themes/ 子目录的文件一并带回，这里按完整
+     * 路径的父目录严格过滤，只认直属文件。
+     */
+    fun listOwnFiles(
+        context: Context,
+        relDir: String,
+        nameRegex: Regex,
+    ): List<StoredFile> {
+        val dir = relDir.trim('/')
+        return listFiles(context, relDir).filter { f ->
+            f.fullPath.substringBeforeLast('/', "") == dir &&
+                nameRegex.matches(f.fullPath.substringAfterLast('/'))
+        }
+    }
+
+    /** 读回一条自有文件的内容（写后回读校验用）；读不出返回 null。 */
+    fun readOwnFile(context: Context, uri: Uri): ByteArray? {
+        return try {
+            context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
     /** 删除一条已登记文件（文件本体与 MediaStore 条目一并消失）。 */
     fun deleteFile(context: Context, uri: Uri): Boolean {
         return try {
@@ -231,8 +258,44 @@ object ThemeStore {
         prefs.edit().putString(KEY_THEMES_JSON, arr.toString()).apply()
     }
 
-    /** 按当前偏好重写 stamp.txt（调用方需在 IO 线程执行）。 */
-    fun writeStamp(context: Context, prefs: SharedPreferences) {
+    private val STAMP_FILE_NAME = Regex("""stamp( \(\d+\))?\.txt""")
+    private val RESTART_FILE_NAME = Regex("""restart( \(\d+\))?\.txt""")
+
+    /** 删除本安装在戳记目录直属拥有的全部同名候选（含正本，若归本安装所有）。 */
+    private fun deleteOwnCandidates(context: Context, nameRegex: Regex) {
+        for (f in PublicStore.listOwnFiles(context, StampStore.STAMP_REL_DIR, nameRegex)) {
+            PublicStore.deleteFile(context, f.uri)
+        }
+    }
+
+    /** 回读校验：自有候选里存在一份内容与 expect 完全一致的文件才算写成功。 */
+    private fun verifyOwnContent(
+        context: Context,
+        nameRegex: Regex,
+        expect: ByteArray,
+    ): Boolean {
+        for (f in PublicStore.listOwnFiles(context, StampStore.STAMP_REL_DIR, nameRegex)) {
+            val data = PublicStore.readOwnFile(context, f.uri) ?: continue
+            if (data.contentEquals(expect)) return true
+        }
+        return false
+    }
+
+    /**
+     * 按当前偏好重写 stamp.txt（调用方需在 IO 线程执行）；返回
+     * 是否经回读校验确认落盘。
+     *
+     * v2.0.20 单一权威口径：旧写法是「MediaStore 查不到就
+     * insert」——重装后正本不归本安装所有、查不到，insert 又
+     * 被系统改名成「stamp (n).txt」副本，结果还被丢弃，
+     * v2.0.19 真机出现过选了新主题、目录里却始终没有一份能
+     * 被 hook 采纳的最新戳记。本版写前先删尽本安装拥有的
+     * 全部戳记候选，再写一份（落盘名仍可能被改成副本，但
+     * 自有候选只剩这一份），最后回读校验内容一致才算成功；
+     * hook 侧采纳胜者后也会删旧副本收敛（见 StampStore），
+     * 两侧合力保证目录里最新写入就是唯一权威。
+     */
+    fun writeStamp(context: Context, prefs: SharedPreferences): Boolean {
         val selected = prefs.getString(KEY_SELECTED_THEME, "") ?: ""
         val topStyle = prefs.getString(KEY_TOP_STYLE, StampStore.TOP_STYLE_THEME)
             ?: StampStore.TOP_STYLE_THEME
@@ -245,10 +308,33 @@ object ThemeStore {
             selected, System.currentTimeMillis(), heightMode, topStyle,
             showBackground, showWidgets, offsetDp, hideCarrier,
         )
-        PublicStore.writeFile(
-            context, StampStore.STAMP_REL_DIR, StampStore.STAMP_NAME,
-            content.toByteArray(Charsets.UTF_8),
-        )
+        val bytes = content.toByteArray(Charsets.UTF_8)
+        deleteOwnCandidates(context, STAMP_FILE_NAME)
+        if (!PublicStore.writeFile(
+                context, StampStore.STAMP_REL_DIR, StampStore.STAMP_NAME, bytes,
+            )
+        ) {
+            return false
+        }
+        return verifyOwnContent(context, STAMP_FILE_NAME, bytes)
+    }
+
+    /**
+     * 「重启系统界面」请求（v2.0.12 通道）：把请求时刻写入
+     * restart.txt。与 writeStamp 同口径（v2.0.20）：先清本安
+     * 装拥有的全部 restart 候选再写一份、回读校验；返回是否
+     * 确认落盘。
+     */
+    fun writeRestartRequest(context: Context): Boolean {
+        val bytes = System.currentTimeMillis().toString().toByteArray(Charsets.UTF_8)
+        deleteOwnCandidates(context, RESTART_FILE_NAME)
+        if (!PublicStore.writeFile(
+                context, StampStore.STAMP_REL_DIR, StampStore.RESTART_NAME, bytes,
+            )
+        ) {
+            return false
+        }
+        return verifyOwnContent(context, RESTART_FILE_NAME, bytes)
     }
 
     /** 删除一个主题：清资产、摘登记、若是当前选中则清选中，最后重写 stamp。 */

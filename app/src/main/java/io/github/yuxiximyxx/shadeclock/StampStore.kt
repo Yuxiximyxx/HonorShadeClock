@@ -199,16 +199,47 @@ object StampStore {
     fun readStamp(): Stamp? {
         val winner = pickStampWinner() ?: return null
         lastStampSource = winner.file.name
-        if (winner.file.name != STAMP_NAME) {
-            // 修复收敛：把胜者内容回写正本（SystemUI 有普通文件
-            // 写权限）；失败无妨，候选采纳本身已保证读到新值。
+        // 收敛（v2.0.19 回写正本；v2.0.20 起连副本一并清掉）：
+        // 胜者内容回写正本后，把其余候选副本删掉——目录里最
+        // 终只剩正本一份，下一轮采纳不再有歧义。v2.0.19 真机
+        // 出现过「选了新主题、目录里却始终没有一份能被采纳
+        // 的最新戳记」：写入侧（设置 App 经 MediaStore）落盘
+        // 形态不可控，读者侧把存量副本收敛干净，至少保证已
+        // 落盘的写入不被一堆旧副本淹没。删除口径保守：只删
+        // 时间戳严格小于胜者、或与胜者内容完全相同的副本；
+        // 胜者副本本身仅在正本已确实持有其内容后才删。删除
+        // 失败无妨，采纳结果不受影响。
+        var canonicalHasWinner = winner.file.name == STAMP_NAME
+        if (!canonicalHasWinner) {
             try {
                 STAMP_FILE.writeText(winner.raw)
+                canonicalHasWinner = true
             } catch (t: Throwable) {
-                // 尽力而为
+                // 尽力而为：回写失败时保留胜者副本，不删它
             }
         }
+        try {
+            for (c in scanStampCandidates()) {
+                if (c.file.name == STAMP_NAME) continue
+                val isWinner = c.file.absolutePath == winner.file.absolutePath
+                if (isWinner && !canonicalHasWinner) continue
+                if (c.stamp.stamp < winner.stamp.stamp || c.raw == winner.raw) {
+                    c.file.delete()
+                }
+            }
+        } catch (t: Throwable) {
+            // 尽力而为
+        }
         return winner.stamp
+    }
+
+    /** 诊断用：全部戳记候选的摘要（文件名=themeId@时间戳），供预热日志留证候选全貌。 */
+    fun stampCandidatesSummary(): String {
+        val candidates = scanStampCandidates()
+        if (candidates.size <= 1) return ""
+        return candidates.joinToString(prefix = "[", postfix = "]") {
+            "${it.file.name}=${it.stamp.themeId}@${it.stamp.stamp}"
+        }
     }
 
     fun stampMtime(): Long = try {
@@ -264,7 +295,12 @@ object StampStore {
     fun consumeRestartRequest() {
         for (f in restartCandidateFiles()) {
             try {
-                f.writeText("0")
+                if (f.name == RESTART_NAME) {
+                    f.writeText("0")
+                } else if (!f.delete()) {
+                    // 副本删不掉就覆写判废，别留下可被误读的旧请求
+                    f.writeText("0")
+                }
             } catch (t: Throwable) {
                 // 尽力而为
             }
