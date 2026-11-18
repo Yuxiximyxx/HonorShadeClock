@@ -8,6 +8,7 @@ import android.graphics.Canvas
 import android.os.BatteryManager
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
@@ -215,6 +216,38 @@ import kotlin.math.roundToInt
  * 字段前后值，每进程上限 40 行），配合 stack check 的真量
  * 测验收。
  *
+ * v2.0.10：控制中心门控改两段（过渡开始即挂起、落定才恢复）
+ * ——v2.0.9 真机录屏：通知避让已确认可用，但通知中心↔控制
+ * 中心来回切换的过渡期时钟簇半透明压在控制中心瓷砖上。定案
+ * （反编译逐环）：横向页面切换由 HnSwipeSwitchControllerImpl
+ * 驱动——随指阶段 tracking() 直接给两页视图组设 alpha/
+ * translationX，松手后 swipeToControlCenter /
+ * swipeToNotificationCenter(float, boolean) 设置 mNextShowType
+ * 并 start 一对 AnimatorSet 交叉淡入淡出；动画结束才经其
+ * $3.onAnimationEnd → HwPanelControlImpl
+ * .notifySwipeTo*Finished → HnPanelViewControllerImpl
+ * .onSwipeTo* → notifyControlCenterPanelChange 分发，即现门控
+ * 用的 notify 是**落定**信号，过渡全程门控未触发，覆盖层
+ * （挂在头部父容器 HnColumeContainer 里、随容器一起被渐变）
+ * 就成了残影。改两段：①开始段——hook 同一分发枢纽
+ * HwPanelControlImpl.notifySwipeStart(int)：onTouch 字节码
+ * 核实它在横向切换 tracking 成立的那次 MOVE 里分发（mIsTracking
+ * 置位、mStartShowType 锁定之后，tracking() 移动页面之前），
+ * 是页面移动的最早信号；再 hook 引擎的 swipeToControlCenter /
+ * swipeToNotificationCenter（fling 提交与程序化切换的汇聚点，
+ * 动画集在方法内才 start）作第二开始信号，before 置位
+ * pageSwitching 并即时重评门控，过渡期整组 GONE、不参与
+ * 滑动/渐变。②落定段——清位只认落定：既有 notify（两方向的
+ * 动画结束都分发它）在其 hook 里清位并即时重评，恢复仍要求
+ * 落定值为通知页；取消切换的动画结束只分发
+ * notifySwipeCanceled(int)、不分发 notify，故单独 hook 它
+ * 清位。tick 兜底保留，并加防卡死：pageSwitching 置位超
+ * 1.5 秒且引擎既不在动画也不在 tracking 时清位记日志（面板
+ * 收起中途打断切换时 $3.onAnimationEnd 会早退、不分发任何
+ * 落定信号）。NotificationPanelView.setQsExpansion /
+ * onQsHeightChanged 是纵向展开分数、与横向页面切换无关，
+ * 不作信号。
+ *
  * 设置经 StampStore 的 stamp.txt 跨进程传递；覆盖层挂载时与每秒
  * tick 比对戳记，变了就重解析重载——切换主题免强停。
  * 全路径 try-catch：构建/渲染任何异常都卸下覆盖层、恢复原头部、
@@ -254,6 +287,14 @@ object HeaderOverlay {
     private const val COLUME_CONTAINER_CLASS =
         "com.android.systemui.statusbar.phone.HnColumeContainer"
 
+    // 页面切换门控（v2.0.10）：类名经反编译核实——
+    // HnSwipeSwitchControllerImpl 是通知中心↔控制中心横向切换的
+    // 动画引擎（一对 AnimatorSet + 随指 tracking），其
+    // swipeToControlCenter / swipeToNotificationCenter 是 fling
+    // 提交与程序化切换的汇聚点（动画集在方法内才 start）。
+    private const val SWIPE_SWITCH_IMPL_CLASS =
+        "com.android.systemui.statusbar.phone.HnSwipeSwitchControllerImpl"
+
     // 横幅门控（v2.0.6）：类名经反编译核实——HeadsUpManagerImpl
     // 是新场景架构的横幅管理器，setEntryPinned 是 pinned 状态
     // 变更的唯一汇聚点，聚合字段 mHasPinnedNotification 即
@@ -282,6 +323,23 @@ object HeaderOverlay {
     @Volatile
     private var headsUpManagerRef: WeakReference<Any>? = null
 
+    /**
+     * 页面切换过渡中（v2.0.10）：切换开始信号（notifySwipeStart /
+     * 引擎 swipeTo*）置位、落定信号（notifyControlCenterPanelChange /
+     * notifySwipeCanceled）清位；置位期间覆盖层挂起，不参与页面
+     * 切换的滑动/渐变。落定判定仍以 controlCenterExpand 为准。
+     */
+    @Volatile
+    private var pageSwitching = false
+
+    /** [pageSwitching] 的置位时刻（uptimeMillis），tick 防卡死兜底用。 */
+    @Volatile
+    private var pageSwitchSetAtMs = 0L
+
+    /** hook 回调捕获的 HnSwipeSwitchControllerImpl 实例（弱引用），供 tick 兜底直读其 mIsAnimationPlaying / mIsTracking。 */
+    @Volatile
+    private var swipeControllerRef: WeakReference<Any>? = null
+
     private class State(val header: ViewGroup) {
         var wrapper: FrameLayout? = null
         var mountParent: ViewGroup? = null
@@ -302,7 +360,7 @@ object HeaderOverlay {
         var diagTicks = 0
         /** 挂起中（锁屏或控制中心页）：覆盖层整组不可见、原头部保持原样，tick 继续跑以便条件解除后自动恢复。 */
         var suspended = false
-        /** 挂起原因："keyguard" / "control-center" / "heads-up"，日志与恢复判断用。 */
+        /** 挂起原因："keyguard" / "control-center" / "page-switch" / "heads-up"，日志与恢复判断用。 */
         var suspendReason: String? = null
         /** 通知栈（NSSL）及其 AmbientState 的反射句柄（找到后缓存）。 */
         var stackScroller: View? = null
@@ -411,6 +469,7 @@ object HeaderOverlay {
         }
         installKeyguardGate(lpparam, log)
         installControlCenterGate(lpparam, log)
+        installPageSwitchGate(lpparam, log)
         installHeadsUpGate(lpparam, log)
         installStackWriteInterceptor(lpparam, log)
     }
@@ -457,6 +516,9 @@ object HeaderOverlay {
      * 与 StatusBarStateControllerImpl.setState 同构），after 里记录
      * 新状态即可。hook 失败时 [isControlCenterActive] 仍可直接读
      * 头部父容器的镜像字段，不影响门控成立。
+     * v2.0.10 起它同时是页面切换门控的**落定段**：切换动画结束
+     * 才走到这里（见 [installPageSwitchGate]），after 里清过渡
+     * 标志并即时重评门控。
      */
     private fun installControlCenterGate(
         lpparam: XC_LoadPackage.LoadPackageParam,
@@ -470,12 +532,26 @@ object HeaderOverlay {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val z = param.args.getOrNull(0) as? Boolean ?: return
-                        if (z != controlCenterExpand) {
+                        val changed = z != controlCenterExpand
+                        if (changed) {
                             controlCenterExpand = z
                             log(
                                 "panel page -> " +
                                     if (z) "control-center" else "notification-center"
                             )
+                        }
+                        // 页面切换门控（v2.0.10）的落定段：notify 是
+                        // 切换动画结束的分发点（两方向都到），在此
+                        // 清过渡标志并即时重评——恢复仍由 applyGate
+                        // 按落定值判定（cc=true 继续以 control-center
+                        // 挂起、cc=false 才恢复挂载）。状态变化时
+                        // 也即时重评，不再只等 1 秒 tick。
+                        if (pageSwitching) {
+                            pageSwitching = false
+                            log("page switch settled (notify cc=$z)")
+                            reevaluateGatesNow()
+                        } else if (changed) {
+                            reevaluateGatesNow()
                         }
                     }
                 }
@@ -487,6 +563,109 @@ object HeaderOverlay {
                     "${t.javaClass.name}: ${t.message}"
             )
         }
+    }
+
+    /**
+     * 页面切换门控（v2.0.10）的开始段：通知中心↔控制中心横向
+     * 切换的过渡期挂起。两个开始信号（定案见类头 v2.0.10 段）：
+     * ①HwPanelControlImpl.notifySwipeStart(int)——与落定 notify
+     * 同一分发枢纽，切换 tracking 成立时在页面移动之前分发，
+     * 参数是 tracking 起始页（1=通知中心、2=控制中心）；两方向
+     * 的拖动都置位（从控制中心拖回时本来就以 control-center
+     * 挂起，置位无副作用）。
+     * ②HnSwipeSwitchControllerImpl.swipeToControlCenter /
+     * swipeToNotificationCenter(float, boolean)——fling 提交与
+     * 程序化切换（命令队列展开设置面板、NotificationPanelView
+     * .expandWithoutQs 等）的汇聚点，before 里置位（动画集在
+     * 方法内才 start，置位必然早于第一帧），同时捕获引擎实例
+     * 供 tick 防卡死兜底直读其动画/跟踪状态。
+     * 清位只在落定段：notifyControlCenterPanelChange 的 hook
+     * （动画结束分发）与这里的 notifySwipeCanceled(int)（取消
+     * 切换的动画结束只分发它）。各 hook 独立 try-catch，单个
+     * 失败不影响其余信号，日志写明。
+     */
+    private fun installPageSwitchGate(
+        lpparam: XC_LoadPackage.LoadPackageParam,
+        log: (String) -> Unit,
+    ) {
+        try {
+            val implClass = XposedHelpers.findClass(PANEL_CONTROL_IMPL_CLASS, lpparam.classLoader)
+            XposedHelpers.findAndHookMethod(
+                implClass, "notifySwipeStart",
+                Int::class.javaPrimitiveType,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val fromType = param.args.getOrNull(0) as? Int ?: return
+                        markPageSwitchStart("swipe tracking from type=$fromType")
+                    }
+                }
+            )
+            log("page-switch start hook installed (HwPanelControlImpl.notifySwipeStart)")
+        } catch (t: Throwable) {
+            log(
+                "page-switch start hook failed (notifySwipeStart): " +
+                    "${t.javaClass.name}: ${t.message}"
+            )
+        }
+        try {
+            val implClass = XposedHelpers.findClass(PANEL_CONTROL_IMPL_CLASS, lpparam.classLoader)
+            XposedHelpers.findAndHookMethod(
+                implClass, "notifySwipeCanceled",
+                Int::class.javaPrimitiveType,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (pageSwitching) {
+                            pageSwitching = false
+                            log(
+                                "page switch canceled " +
+                                    "(startType=${param.args.getOrNull(0)})"
+                            )
+                            reevaluateGatesNow()
+                        }
+                    }
+                }
+            )
+            log("page-switch cancel hook installed (HwPanelControlImpl.notifySwipeCanceled)")
+        } catch (t: Throwable) {
+            log(
+                "page-switch cancel hook failed (notifySwipeCanceled): " +
+                    "${t.javaClass.name}: ${t.message}"
+            )
+        }
+        try {
+            val switchClass = XposedHelpers.findClass(SWIPE_SWITCH_IMPL_CLASS, lpparam.classLoader)
+            for (method in arrayOf("swipeToControlCenter", "swipeToNotificationCenter")) {
+                XposedHelpers.findAndHookMethod(
+                    switchClass, method,
+                    Float::class.javaPrimitiveType, Boolean::class.javaPrimitiveType,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            param.thisObject?.let { swipeControllerRef = WeakReference(it) }
+                            markPageSwitchStart(method)
+                        }
+                    }
+                )
+            }
+            log(
+                "page-switch engine hooks installed " +
+                    "(HnSwipeSwitchControllerImpl.swipeToControlCenter/swipeToNotificationCenter)"
+            )
+        } catch (t: Throwable) {
+            log(
+                "page-switch engine hooks failed: " +
+                    "${t.javaClass.name}: ${t.message}"
+            )
+        }
+    }
+
+    /** 页面切换开始：置位过渡标志（首次置位记一行开始日志）并即时重评各 State 的门控。 */
+    private fun markPageSwitchStart(source: String) {
+        if (!pageSwitching) {
+            pageSwitching = true
+            pageSwitchSetAtMs = SystemClock.uptimeMillis()
+            logFn("page switch start: $source")
+        }
+        reevaluateGatesNow()
     }
 
     /**
@@ -614,12 +793,43 @@ object HeaderOverlay {
         return controlCenterExpand
     }
 
-    /** 挂起原因：null=可挂载；优先级 锁屏 > 控制中心 > 横幅（可同时成立，取先者记日志）。 */
+    /** 挂起原因：null=可挂载；优先级 锁屏 > 控制中心 > 页面切换 > 横幅（可同时成立，取先者记日志）。 */
     private fun suspendReason(header: ViewGroup): String? = when {
         isKeyguardActive(header.context) -> "keyguard"
         isControlCenterActive(header) -> "control-center"
+        pageSwitching -> "page-switch"
         isHeadsUpActive() -> "heads-up"
         else -> null
+    }
+
+    /**
+     * 页面切换标志防卡死（v2.0.10，tick 每秒调一次）：正常路径下
+     * 标志由落定 notify / 取消信号在动画结束时清掉（<1 秒）；若
+     * 切换被面板收起等动作中途打断，宿主的动画结束回调会早退、
+     * 不分发任何落定信号，标志会卡住、覆盖层在通知页回不来。
+     * 兜底条件从严：置位已超 1.5 秒（远超切换动画时长）、引擎
+     * 实例已捕获、且直读其 mIsAnimationPlaying / mIsTracking
+     * 均为 false（不在动画也不在随指拖动）才清位并记日志；
+     * 清位后本轮 applyGate 按落定页态决定恢复或继续挂起。
+     */
+    private fun maybeClearStuckPageSwitch() {
+        if (!pageSwitching) return
+        if (SystemClock.uptimeMillis() - pageSwitchSetAtMs < 1500L) return
+        val ctrl = swipeControllerRef?.get() ?: return
+        val playing = try {
+            XposedHelpers.getBooleanField(ctrl, "mIsAnimationPlaying")
+        } catch (t: Throwable) {
+            return
+        }
+        val tracking = try {
+            XposedHelpers.getBooleanField(ctrl, "mIsTracking")
+        } catch (t: Throwable) {
+            return
+        }
+        if (!playing && !tracking) {
+            pageSwitching = false
+            logFn("page switch flag cleared by tick fallback (no anim/tracking, settled state kept)")
+        }
     }
 
     /**
@@ -664,7 +874,7 @@ object HeaderOverlay {
             val st = synchronized(states) {
                 states.getOrPut(header) { State(header) }
             }
-            // 页态门控（v2.0.3 锁屏 / v2.0.4 控制中心 / v2.0.6 横幅）：头部在锁屏
+            // 页态门控（v2.0.3 锁屏 / v2.0.4 控制中心 / v2.0.6 横幅 / v2.0.10 页面切换过渡）：头部在锁屏
             // 通知区与控制中心页里同样存在，覆盖层挂上去会盖住锁屏
             // 自己的大时钟、压住控制中心瓷砖。本模块只管解锁后下拉
             // 的通知中心页——其余页态不挂覆盖层、不隐藏原头部，只
@@ -683,7 +893,7 @@ object HeaderOverlay {
                 logFn(
                     "overlay resumed: $prevReason cleared " +
                         "(state=$statusBarState, cc=${isControlCenterActive(header)}, " +
-                        "hun=${isHeadsUpActive()}) " +
+                        "sw=$pageSwitching, hun=${isHeadsUpActive()}) " +
                         "wrapperVis=${st.wrapper?.visibility}"
                 )
             }
@@ -1527,9 +1737,10 @@ object HeaderOverlay {
                         return
                     }
                     // 页态门控（v2.0.3 锁屏 / v2.0.4 控制中心 /
-                    // v2.0.6 横幅）：与横幅 hook 的即时重评共用
-                    // applyGate；挂起期保持整组 GONE，条件解除后
-                    // 经 attach 恢复。
+                    // v2.0.6 横幅 / v2.0.10 页面切换过渡）：与各
+                    // hook 的即时重评共用 applyGate；挂起期保持
+                    // 整组 GONE，条件解除后经 attach 恢复。
+                    maybeClearStuckPageSwitch()
                     if (applyGate(st)) {
                         st.handler.postDelayed(this, 1000L)
                         return
@@ -1684,7 +1895,7 @@ object HeaderOverlay {
     }
 
     /**
-     * 页态挂起（v2.0.3 锁屏 / v2.0.4 控制中心 / v2.0.6 横幅）：把覆盖层整组
+     * 页态挂起（v2.0.3 锁屏 / v2.0.4 控制中心 / v2.0.6 横幅 / v2.0.10 页面切换过渡）：把覆盖层整组
      * 藏起来、原头部内容与高度恢复原样，但保留 State 与
      * tick——回到通知中心页后 tick 会经 attach 自动恢复挂载。
      * 与 teardown 的区别：不摘状态、不停 tick。挂起/原因变化时各
@@ -1720,7 +1931,8 @@ object HeaderOverlay {
         if (!wasSuspended || prevReason != reason) {
             logFn(
                 "overlay suspended: $reason (state=$statusBarState, " +
-                    "cc=${isControlCenterActive(header)}, hun=${isHeadsUpActive()}) " +
+                    "cc=${isControlCenterActive(header)}, sw=$pageSwitching, " +
+                    "hun=${isHeadsUpActive()}) " +
                     "wrapperVis=${st.wrapper?.visibility}"
             )
         }

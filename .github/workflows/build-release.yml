@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.9-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.10-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.9-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.10-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,32 +68,31 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.9
-          name: HonorShadeClock 2.0.9 — 避让收敛时序根治（摘除再入的 notify）
+          tag_name: v2.0.10
+          name: HonorShadeClock 2.0.10 — 页面切换过渡残影修复（门控改两段）
           body: |
-            ## HonorShadeClock 2.0.9
+            ## HonorShadeClock 2.0.10
 
-            修 v2.0.8 真机残留：通知避让仍有「未收敛
-            窗口」——调整值已算对，但一段时间内字段被
-            盖回系统原值、通知压时钟，之后才靠运气
-            收敛。
+            修 v2.0.9 真机录屏残留：通知中心↔控制中心
+            来回切换的过渡过程中，时钟簇半透明地压在
+            控制中心瓷砖上，落定后才消失。
 
-            - 静态定案：写入口的调用方只有 7 处、全在
-              系统面板类内；逐个核对我们写回的五个更
-              新方法后确认，唯有 notifyHeightChangeListener
-              会同步拐回写入口（经面板高度更新链整圈
-              绕回），嵌套写把字段盖回原值、又被防重
-              入挡住补不了——这就是未收敛窗口的来源。
-            - 改法：写回更新组摘除该方法，只留经证实
-              不再入的四个纯计算/异步更新；任何一次系
-              统写入后，调整在同一调用栈内落定、不再
-              被盖回。延迟复查保留作兜底。
-            - 日志新增有界证据：写入口每次经过记一行
-              （来源分支 + 是否嵌套 + 字段前后值），配
-              合第一张通知卡的实测位置验收。
+            - 定案：页面状态的 notify 是切换动画结束
+              才分发的落定信号，过渡全程（随指拖动 +
+              松手后的交叉淡入淡出动画）门控都没触发，
+              覆盖层随头部父容器一起被渐变，成了残影。
+            - 改两段门控：切换一开始（横向拖动成立 /
+              切换动画启动）就挂起覆盖层、整组隐藏不
+              参与滑动与渐变；动画落定且确认回到通知
+              页才恢复。取消切换（拖一半松手弹回）也
+              有单独的清位信号，不会卡住不恢复。
+            - 日志可核对时序：page switch start /
+              settled / canceled 与既有 suspended /
+              resumed 行先后对应。
 
-            运营商隐藏、铃铛删除、三道门控（锁屏/
-            控制中心/横幅）、垂直偏移、主题背景图与
+            通知避让（v2.0.9 已确认可用）、运营商
+            隐藏、铃铛删除、三道门控（锁屏/控制
+            中心/横幅）、垂直偏移、主题背景图与
             小模块开关保持不变。
 
             生效方式：覆盖安装 → 强停一次系统界面 →
