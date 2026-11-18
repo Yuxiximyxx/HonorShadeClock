@@ -51,8 +51,10 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.ThemeController
 
 /**
- * 设置页（v2.0.3）：顶部样式（原系统头部 / 锁屏主题样式）、主题
- * 管理（导入/切换/删除）、区域高度三档、字号滑杆（原头部模式）。
+ * 设置页（v2.0.3 起）：顶部样式（原系统头部 / 锁屏主题样式）、主题
+ * 管理（导入/切换/删除）、区域高度三档、字号滑杆（原头部模式）；
+ * v2.0.7 加「垂直偏移」滑杆（-120dp～+40dp，覆盖层整体上下移，
+ * 经 stamp 第 7 行传 SystemUI 侧）。
  * 覆盖层相关设置经 stamp.txt（公共 Download 目录）传给 SystemUI
  * 侧，切换免强停；字号仍走 SharedPreferences「settings」，由 hook
  * 侧在 SystemUI 进程启动时经 XSharedPreferences 读取。
@@ -132,6 +134,12 @@ private fun SettingsScreen() {
     var showWidgets by remember {
         mutableStateOf(prefs.getBoolean(ThemeStore.KEY_SHOW_WIDGETS, false))
     }
+    var offsetDp by remember {
+        mutableIntStateOf(
+            prefs.getInt(ThemeStore.KEY_OFFSET_DP, 0)
+                .coerceIn(StampStore.OFFSET_DP_MIN, StampStore.OFFSET_DP_MAX)
+        )
+    }
     var themes by remember { mutableStateOf(ThemeStore.loadThemes(prefs)) }
     var selectedThemeId by remember {
         mutableStateOf(prefs.getString(ThemeStore.KEY_SELECTED_THEME, "") ?: "")
@@ -180,6 +188,13 @@ private fun SettingsScreen() {
     fun saveShowWidgets(value: Boolean) {
         showWidgets = value
         prefs.edit().putBoolean(ThemeStore.KEY_SHOW_WIDGETS, value).apply()
+        syncStamp()
+    }
+
+    fun saveOffsetDp(value: Int) {
+        if (value == offsetDp) return
+        offsetDp = value
+        prefs.edit().putInt(ThemeStore.KEY_OFFSET_DP, value).apply()
         syncStamp()
     }
 
@@ -261,7 +276,7 @@ private fun SettingsScreen() {
                 .padding(innerPadding),
         ) {
             Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-                SmallTitle(text = "正式版 v2.0.6", insideMargin = PaddingValues(start = 4.dp))
+                SmallTitle(text = "正式版 v2.0.7", insideMargin = PaddingValues(start = 4.dp))
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     cornerRadius = 20.dp,
@@ -309,6 +324,32 @@ private fun SettingsScreen() {
                         checked = showWidgets,
                         onCheckedChange = { saveShowWidgets(it) },
                     )
+                }
+
+                SmallTitle(
+                    text = "位置",
+                    insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
+                )
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    cornerRadius = 20.dp,
+                    insideMargin = PaddingValues(16.dp),
+                ) {
+                    Column {
+                        SizeSliderRow(
+                            title = "垂直偏移",
+                            value = offsetDp,
+                            min = StampStore.OFFSET_DP_MIN,
+                            max = StampStore.OFFSET_DP_MAX,
+                            onValueChange = { saveOffsetDp(it) },
+                        )
+                        Text(
+                            "负数上移、正数下移。主题顶部的留白是给锁屏天空的，在通知中心里显空时往上调；最多上移到时钟簇贴顶。",
+                            fontSize = 13.sp,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            modifier = Modifier.padding(top = 8.dp),
+                        )
+                    }
                 }
 
                 SmallTitle(
@@ -463,7 +504,7 @@ private fun SettingsScreen() {
                 ) {
                     Column {
                         Text(
-                            "切换主题、改区域高度、开关锁屏主题样式与主题背景图：下次下拉通知栏即生效（约 1 秒内自动刷新），不用强停系统界面。",
+                            "切换主题、改区域高度、调垂直偏移、开关锁屏主题样式与主题背景图：下次下拉通知栏即生效（约 1 秒内自动刷新），不用强停系统界面。",
                             fontSize = 14.sp,
                             color = MiuixTheme.colorScheme.onSurface,
                         )

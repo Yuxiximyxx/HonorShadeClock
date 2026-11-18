@@ -117,9 +117,26 @@ class ThemeRenderer(private val log: (String) -> Unit) {
     private val missingLogged = HashSet<String>()
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
 
-    /** 最近一次绘制的内容最下缘（根坐标 px），「跟随内容」高度用。 */
+    /** 最近一次绘制的内容最下缘（根坐标 px，含垂直偏移），「跟随内容」高度用。 */
     var contentBottomPx: Float = 0f
         private set
+
+    /**
+     * 最近一次绘制的内容簇最上缘（根坐标 px，与 [contentBottomPx]
+     * 同一统计口径：整屏级背景与屏幕底部区域的元素不计）。
+     * 无可统计元素时为 [Float.MAX_VALUE]。垂直偏移的钳制用
+     * （簇顶不小于 0，v2.0.7）。
+     */
+    var contentTopPx: Float = Float.MAX_VALUE
+        private set
+
+    /**
+     * 覆盖层垂直偏移（px，负值上移）：draw 时整体加到根 y 上，
+     * 所有元素连同内容顶/底统计一起平移（v2.0.7）。由
+     * HeaderOverlay 按 stamp 的 offsetDp 换算并钳制后赋值。
+     */
+    @Volatile
+    var offsetYPx: Float = 0f
 
     /** 最近一次 draw 实际绘制的可见元素数（覆盖层诊断用）。 */
     var lastDrawnElements: Int = 0
@@ -242,7 +259,7 @@ class ThemeRenderer(private val log: (String) -> Unit) {
         }
     }
 
-    /** 用一块空 Canvas 跑一遍量测，得到内容下缘（不真正绘制）。 */
+    /** 用一块空 Canvas 跑一遍量测，得到内容下缘（顺带簇顶 [contentTopPx]，不真正绘制）。 */
     fun measureContentBottom(env: RenderEnv): Float {
         draw(Canvas(), env)
         return contentBottomPx
@@ -252,10 +269,11 @@ class ThemeRenderer(private val log: (String) -> Unit) {
         val m = model ?: return
         val ctx = EvalContext(m, env)
         contentBottomPx = 0f
+        contentTopPx = Float.MAX_VALUE
         drawnCounter = 0
         backgroundHandled = false
         for (root in m.roots) {
-            drawNode(root, canvas, ctx, env, 0f, 0f, 1f, 1f)
+            drawNode(root, canvas, ctx, env, 0f, offsetYPx, 1f, 1f)
         }
         lastDrawnElements = drawnCounter
     }
@@ -441,9 +459,13 @@ class ThemeRenderer(private val log: (String) -> Unit) {
         if (!showBackgroundImage && !backgroundHandled) {
             val cw = env.screenWidthPx.toFloat()
             val ch = env.screenHeightPx.toFloat()
+            // 覆盖判定用偏移前的坐标（v2.0.7）：整体上移后 dst 顶/底
+            // 都平移了，不还原会漏判整幅背景图（开关关时被误画）。
+            val rawTop = dst.top - offsetYPx
+            val rawBottom = dst.bottom - offsetYPx
             if (cw > 0f && ch > 0f &&
-                dst.left <= cw * 0.05f && dst.top <= ch * 0.05f &&
-                dst.right >= cw * 0.95f && dst.bottom >= ch * 0.95f
+                dst.left <= cw * 0.05f && rawTop <= ch * 0.05f &&
+                dst.right >= cw * 0.95f && rawBottom >= ch * 0.95f
             ) {
                 backgroundHandled = true
                 drawnCounter--
@@ -732,13 +754,15 @@ class ThemeRenderer(private val log: (String) -> Unit) {
     }
 
     /**
-     * 内容下缘统计（「跟随内容」高度用）：整屏级背景（高 ≥ 屏高一半）
-     * 与屏幕底部区域的元素（锁屏底部按钮等）不计入。
+     * 内容顶/下缘统计（「跟随内容」高度与垂直偏移钳制用）：整屏级
+     * 背景（高 ≥ 屏高一半）与屏幕底部区域的元素（锁屏底部按钮等）
+     * 不计入——簇顶取时钟簇的最高元素，而不是整幅背景的 0。
      */
     private fun trackContent(env: RenderEnv, top: Float, bottom: Float, height: Float) {
         if (height >= env.screenHeightPx * 0.5f) return
         if (top >= env.screenHeightPx * 0.75f) return
         if (bottom > contentBottomPx) contentBottomPx = bottom
+        if (top < contentTopPx) contentTopPx = top
     }
 
     companion object {

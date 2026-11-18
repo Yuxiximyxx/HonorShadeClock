@@ -10,11 +10,13 @@ import java.io.File
  * 实证可行）。主题资产同样放在 /sdcard/Download/HonorShadeClock/
  * themes/<id>/（manifest.xml + 资产 + fonts/）。
  *
- * stamp.txt 格式（6 行）：themeId / stamp / heightMode / topStyle /
+ * stamp.txt 格式（7 行）：themeId / stamp / heightMode / topStyle /
  * showBackground（1=画主题整幅背景图、0=不画，v2.0.3 加；旧 4 行
  * 文件缺此行时按 0 处理，与设置页开关默认关一致）/
  * showWidgets（1=画温度/风向/电量数据小模块、0=不画，v2.0.5 加；
- * 旧 5 行文件缺此行时按 0 处理，与设置页开关默认关一致）。
+ * 旧 5 行文件缺此行时按 0 处理，与设置页开关默认关一致）/
+ * offsetDp（覆盖层垂直偏移，整数 dp，负值上移，v2.0.7 加；
+ * 旧 6 行文件缺此行时按 0 处理）。
  * SystemUI 侧每次覆盖层挂载与每秒 tick 比对文件 mtime 与内容，
  * 变了就重解析主题、重载位图——切换主题免强停系统界面。
  */
@@ -26,6 +28,10 @@ object StampStore {
     const val HEIGHT_FOLLOW = 0
     const val HEIGHT_THIRD = 1
     const val HEIGHT_HALF = 2
+
+    /** 覆盖层垂直偏移范围（dp）：负值上移、正值下移（v2.0.7）。 */
+    const val OFFSET_DP_MIN = -120
+    const val OFFSET_DP_MAX = 40
 
     /** MediaStore 相对目录（无首尾斜杠）。 */
     const val STAMP_REL_DIR = "Download/HonorShadeClock"
@@ -45,6 +51,8 @@ object StampStore {
         val showBackground: Boolean = false,
         /** 是否绘制温度/风向/电量数据小模块；默认 false（设置页开关默认关，v2.0.5）。 */
         val showWidgets: Boolean = false,
+        /** 覆盖层垂直偏移（dp，负值上移）；默认 0（v2.0.7）。 */
+        val offsetDp: Int = 0,
     )
 
     fun themeDir(id: String): File = File(THEMES_DIR, id)
@@ -56,9 +64,11 @@ object StampStore {
         topStyle: String,
         showBackground: Boolean,
         showWidgets: Boolean,
+        offsetDp: Int,
     ): String =
         "$themeId\n$stamp\n$heightMode\n$topStyle\n" +
-            "${if (showBackground) 1 else 0}\n${if (showWidgets) 1 else 0}\n"
+            "${if (showBackground) 1 else 0}\n${if (showWidgets) 1 else 0}\n" +
+            "${offsetDp.coerceIn(OFFSET_DP_MIN, OFFSET_DP_MAX)}\n"
 
     /** SystemUI 侧读取；文件不存在/内容不完整返回 null。 */
     fun readStamp(): Stamp? {
@@ -75,6 +85,9 @@ object StampStore {
                 showBackground = lines.getOrNull(4) == "1",
                 // 第 6 行缺失（v2.0.4 及更旧 stamp）按关处理，与开关默认一致
                 showWidgets = lines.getOrNull(5) == "1",
+                // 第 7 行缺失（v2.0.6 及更旧 stamp）按 0 处理
+                offsetDp = (lines.getOrNull(6)?.toIntOrNull() ?: 0)
+                    .coerceIn(OFFSET_DP_MIN, OFFSET_DP_MAX),
             )
         } catch (t: Throwable) {
             null

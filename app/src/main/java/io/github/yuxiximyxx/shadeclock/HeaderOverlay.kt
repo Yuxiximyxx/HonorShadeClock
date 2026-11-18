@@ -129,6 +129,34 @@ import kotlin.math.roundToInt
  * 本模块挂起时恢复的项目（wrapper 可见性、头部子视图可见性、
  * 头部高度、栈顶）完全 disjoint，挂起保持标准恢复、不打架。
  *
+ * v2.0.7 补全通知避让 + 垂直位置自定义：
+ * ①写路径枚举（dexdump 全 APK 扫 `iput …AmbientState.mTopPadding`）：
+ * 全包**只有一个写点**，就在已 hook 的 NotificationPanelView
+ * .requestScrollerTopPaddingUpdate(Z) 内（值三分支：通知页走
+ * NotifCenterInteractor.nsslTopPadding 流量=280；mBarState==2 或
+ * 场景标志关时走「calculateQsTopPadding」=dimen+刘海状态栏高
+ * =501；锁屏走 NSSL.mIntrinsicPadding——NSSL 本身没有
+ * setTopPadding 方法）。v2.0.6 漏网的 501 不是新写路径，而是
+ * **覆盖时序**：我们写回时调用的系统更新组会同步再入
+ * requestScrollerTopPaddingUpdate，嵌套写（501）在我们之后落
+ * 字段、其 after-hook 又被 stackAdjusting 重入保护挡掉——字段
+ * 停在 501、跟踪 adjusted=1050（真机 stack check #5 实数）。
+ * 对策：拦截在 stackAdjusting 期间不再静默丢弃嵌套写，改为
+ * 排一次延迟复查（scheduleStackReconcile，调用栈 unwind 后跑
+ * 同一套 reconcile、读回校验、未到位有限次重排）；每次拦截
+ * 处理完也排一次复查兜底。另按小乐点名：每次门控恢复与
+ * attach 完成时主动 reconcile 一次——挂起期系统写过的栈顶值
+ * （挂起中拦截是放行的）在恢复时当场补账，不等下一次系统写。
+ * reconcile 的原值判定保持状态无关：原值可能是 280/501 等
+ * 多个状态相关值，一律按与已跟踪 (原值, 调整值) 及当前 delta
+ * 的关系判定，不写死任何原值。
+ * ②垂直偏移（设置页滑杆 -120dp～+40dp、默认 0、stamp 第 7 行）：
+ * 主题设计顶部留白（云镜簇顶 335 设计px）是给锁屏天空的，
+ * 背景关掉后在通知中心显得空、整体偏低。渲染器整体平移
+ * （draw 根 y 加 dy，元素与顶/底统计一起动），dy 由 dp 换算
+ * 并钳制到簇顶不小于 0；跟随内容高度 = 含偏移的内容下缘，
+ * 头部随之上移变矮、栈 delta 机制自动跟随。只作用于覆盖层。
+ *
  * 设置经 StampStore 的 stamp.txt 跨进程传递；覆盖层挂载时与每秒
  * tick 比对戳记，变了就重解析重载——切换主题免强停。
  * 全路径 try-catch：构建/渲染任何异常都卸下覆盖层、恢复原头部、
@@ -236,6 +264,13 @@ object HeaderOverlay {
         var hookAdjustedTopPadding: Int? = null
         /** 写入口调整日志计数（有界，避免刷屏）。 */
         var interceptLogCount = 0
+        /** 延迟栈顶复查是否已在队列里（v2.0.7，防重复排队）。 */
+        var stackReconcilePosted = false
+        /** 延迟复查的连续重试次数（v2.0.7，上限后交给 tick 兜底）。 */
+        var stackReconcileRetries = 0
+        /** 已成功应用到渲染器的垂直偏移（dp）与对应主题（v2.0.7）；null=尚未应用。 */
+        var appliedOffsetDp: Int? = null
+        var offsetThemeId: String? = null
         /**
          * 栈顶写回重入保护（v2.0.5）：置位期间拦截/兜底一律跳过——
          * 我们调用的系统更新组会同步再触发写入口 hook，不挡住就
@@ -617,7 +652,16 @@ object HeaderOverlay {
             }
             st.appliedStamp = stamp
             st.stampMtimeSeen = StampStore.stampMtime()
+            // 垂直偏移同步（v2.0.7）：先于 applyHeight，跟随高度按
+            // 含偏移的内容下缘算（量不到环境时留待布局回调补）
+            applyVerticalOffset(st, stamp)
             applyHeight(header, st, stamp)
+            // 避让补账（v2.0.7）：门控恢复与每次 attach 完成时主动
+            // reconcile 一次——挂起期系统写过的栈顶值（挂起中拦截
+            // 放行）在恢复时当场补上，不等下一次系统写入；再排一
+            // 次布局后复查，兜住嵌套写覆盖的时序。
+            ensureStackAdjusted(st)
+            scheduleStackReconcile(st)
             startTicker(st)
             WeatherSource.start(header.context) { message -> logFn(message) }
             if (!st.mountLogged) {
@@ -690,6 +734,16 @@ object HeaderOverlay {
                 ) {
                     header.post {
                         if (st.wrapper != null) {
+                            // 垂直偏移补同步（v2.0.7）：首次 attach 时
+                            // 头部还没布局、量不到环境定不了偏移，
+                            // 布局完成后在这里补；(主题, offsetDp)
+                            // 没变时函数内直接返回，不空转。偏移改了
+                            // 内容下缘，跟随高度随之重算。
+                            val stampNow = st.appliedStamp
+                            if (stampNow != null && !st.suspended) {
+                                applyVerticalOffset(st, stampNow)
+                                applyHeight(header, st, stampNow)
+                            }
                             alignOverlay(st)
                             ensureStackAdjusted(st)
                             // 面板不可见时不重绘（v2.0.5 瘦身）
@@ -887,24 +941,74 @@ object HeaderOverlay {
         }
     }
 
+    /**
+     * 垂直偏移同步（v2.0.7）：把 stamp 的 offsetDp 换算成 px 写入
+     * 渲染器。先以 offset=0 量一遍内容簇的顶（rawTop），生效值
+     * 钳制为不小于 -rawTop（簇顶不小于 0——主题顶部留白最多吃
+     * 完，不会把时钟簇顶出画面）；再以生效值量一遍下缘，跟随
+     * 内容高度随后按含偏移的下缘算，头部上移变矮、通知随之上
+     * 来，栈 delta 机制自动跟随。只在 (主题, offsetDp) 变化或
+     * 尚未成功应用时才量测（量测是一遍空 Canvas 绘制，不能每
+     * tick 空转）；量不到环境（头部尚无宽度）时直接返回、留待
+     * 布局回调补。
+     */
+    private fun applyVerticalOffset(st: State, stamp: StampStore.Stamp) {
+        if (st.appliedOffsetDp == stamp.offsetDp &&
+            st.offsetThemeId == stamp.themeId
+        ) {
+            return
+        }
+        val r = st.renderer
+        if (!r.isLoaded) return
+        val env = buildEnv(st) ?: return
+        val density = st.header.resources.displayMetrics.density
+        val wantPx = stamp.offsetDp * density
+        r.offsetYPx = 0f
+        r.measureContentBottom(env)
+        val rawTop = r.contentTopPx
+        val dy = if (rawTop == Float.MAX_VALUE) {
+            wantPx
+        } else {
+            wantPx.coerceAtLeast(-rawTop)
+        }
+        r.offsetYPx = dy
+        r.measureContentBottom(env)
+        st.appliedOffsetDp = stamp.offsetDp
+        st.offsetThemeId = stamp.themeId
+        logFn(
+            "overlay vertical offset: setting=${stamp.offsetDp}dp " +
+                "want=${wantPx}px applied=$dy rawTop=$rawTop"
+        )
+    }
+
     // ---------- 通知栈顶（v2.0.3 第 6 项 / v2.0.4 改拦截写入口） ----------
     //
     // 机制（反编译逐环核实）：通知栈内容起始位置 = NSSL 的
     // AmbientState.mTopPadding，由 NotificationPanelView
-    // .requestScrollerTopPaddingUpdate(boolean) 写入（方法体内两处
-    // 写点：非锁屏走 NotifCenterInteractor.nsslTopPadding 流量值、
-    // 锁屏走 mIntrinsicPadding），值来自 Compose 场景里 Nssl 盒的
-    // window Y，由 Compose 布局量出的头部高度决定，不认 View 层
-    // 改的 lp.height。v2.0.3 用 tick 事后增量同步，真机未生效
-    // （通知从面板顶部压住时钟）——系统写入时机不受我们控制、
-    // tick 总慢半拍且基线捕获条件苛刻。v2.0.4 改拦截写入口：
-    // hook 该方法，after 里在同一次调用栈内读出系统刚写的值，
-    // 加上（当前头部高 - 原头部高）的增量后按系统同组更新方法
-    // 放行——系统每次更新都自带偏移，不再赛跑。挂起/卸载时只在
-    // 当前值仍是我们调整过的值时才恢复系统原值。
+    // .requestScrollerTopPaddingUpdate(boolean) 写入，值来自
+    // Compose 场景里 Nssl 盒的 window Y，由 Compose 布局量出的
+    // 头部高度决定，不认 View 层改的 lp.height。v2.0.3 用 tick
+    // 事后增量同步，真机未生效（通知从面板顶部压住时钟）——
+    // 系统写入时机不受我们控制、tick 总慢半拍且基线捕获条件
+    // 苛刻。v2.0.4 改拦截写入口：hook 该方法，after 里在同一次
+    // 调用栈内读出系统刚写的值，加上（当前头部高 - 原头部高）
+    // 的增量后按系统同组更新方法放行——系统每次更新都自带
+    // 偏移，不再赛跑。挂起/卸载时只在当前值仍是我们调整过的
+    // 值时才恢复系统原值。
     // v2.0.5 教训：v2.0.4 的拦截不幂等且会自激（见类头 v2.0.5
     // 段）——拦截与兜底统一走 reconcileStackTop 的写死判定，
     // writeTopPadding 带重入保护，目标值已在位时不调更新组。
+    // v2.0.7 写路径枚举（dexdump 全 APK 扫字段写指令）：AmbientState
+    // .mTopPadding 是 public 字段、无 setter，全包只有**一个**
+    // iput 写点，就在已 hook 的 requestScrollerTopPaddingUpdate
+    // 内（jadx 源码里非锁屏/锁屏两段写块在 dex 里是共享尾巴）；
+    // 值三分支：通知页 = NotifCenterInteractor.nsslTopPadding
+    // 流量（真机 280）；!SceneContainerFlag.isSceneEnabled ||
+    // mBarState==2 时 = calculateQsTopPadding（dimen
+    // 0x7f071469 + 刘海状态栏高，真机 421+80=501）；锁屏 =
+    // NSSL.mIntrinsicPadding。NSSL 没有 setTopPadding 方法。
+    // 故拦截落点不需换，漏网是时序问题（见类头 v2.0.7 段）：
+    // 延迟复查 + 恢复/attach 主动 reconcile 补齐。
 
     /** 定位 NSSL 并取其 AmbientState（从面板子树按类名找，找到后缓存）。 */
     private fun findStack(st: State): Boolean {
@@ -1039,10 +1143,19 @@ object HeaderOverlay {
         val st = synchronized(states) {
             states.values.firstOrNull { it.wrapper != null }
         } ?: return
-        // 我们自己写回引发的重入：整段跳过（v2.0.5 防自激）
-        if (st.stackAdjusting) return
+        // 我们自己写回引发的重入（v2.0.5 防自激）：当场不处理，
+        // 但不能静默丢弃——写回的系统更新组会同步再入写入口，
+        // 嵌套写（v2.0.6 实证的 501）在我们的调整之后落字段、
+        // 恰好就是被这层挡掉的那次，字段从此停在原值。改为排
+        // 一次延迟复查：等本次调用栈 unwind 后再跑同一套判定
+        // （v2.0.7）。
+        if (st.stackAdjusting) {
+            scheduleStackReconcile(st)
+            return
+        }
         // 挂起（锁屏/控制中心）时放行原值：锁屏分支写的是
-        // mIntrinsicPadding，绝不能加增量。
+        // mIntrinsicPadding，绝不能加增量。挂起期写过的值在
+        // 门控恢复/attach 时由主动 reconcile 补账（v2.0.7）。
         if (st.suspended) return
         if (panel != null) {
             val keyguardShowing = try {
@@ -1055,6 +1168,53 @@ object HeaderOverlay {
         if (!findStack(st)) return
         val cur = readTopPadding(st) ?: return
         reconcileStackTop(st, cur)
+        // 写后复查兜底（v2.0.7）：reconcile 的写回本身也可能被
+        // 更新组引发的嵌套写覆盖（同上时序），排一次延迟复查
+        // 读回校验；已在位时复查是零写入空转，不增开销。
+        scheduleStackReconcile(st)
+    }
+
+    /**
+     * 延迟栈顶复查（v2.0.7）：post 到 State 的 handler，等当前
+     * 调用栈（系统写入口/我们的写回更新组）unwind 后再跑一次
+     * [ensureStackAdjusted]——专治「嵌套写在我们调整之后落字段、
+     * 其 hook 又被重入保护挡掉」的覆盖时序（v2.0.6 的 501 漏
+     * 网）。复查后读回校验：跟踪调整值与字段不一致且重试未尽
+     * 时递增间隔再排一次（嵌套写只在面板活跃重排时出现，布局
+     * 落定后我们的写即粘住）；上限后交给每秒 tick 兜底。挂起
+     * 中/状态已卸载时不动作（恢复路径另有主动 reconcile）。
+     */
+    private fun scheduleStackReconcile(st: State) {
+        if (st.stackReconcilePosted) return
+        st.stackReconcilePosted = true
+        st.handler.post {
+            st.stackReconcilePosted = false
+            try {
+                val registered = synchronized(states) { states[st.header] === st }
+                if (!registered || st.suspended) return@post
+                ensureStackAdjusted(st)
+                val adj = st.hookAdjustedTopPadding
+                val cur = if (adj != null) readTopPadding(st) else null
+                if (adj != null && cur != null && cur != adj &&
+                    st.stackReconcileRetries < 3
+                ) {
+                    st.stackReconcileRetries++
+                    val delay = 50L * st.stackReconcileRetries
+                    st.handler.postDelayed({
+                        if (synchronized(states) { states[st.header] === st }) {
+                            scheduleStackReconcile(st)
+                        }
+                    }, delay)
+                } else {
+                    st.stackReconcileRetries = 0
+                }
+            } catch (t: Throwable) {
+                logFn(
+                    "stack deferred reconcile failed: " +
+                        "${t.javaClass.name}: ${t.message}"
+                )
+            }
+        }
     }
 
     /** 拦截/兜底共用的有界日志（避免动画期间逐帧刷屏）。 */

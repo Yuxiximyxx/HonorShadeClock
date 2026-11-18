@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.6-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.7-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.6-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.7-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,24 +68,29 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.6
-          name: HonorShadeClock 2.0.6 — 横幅通知时不显示时间样式（第三道门控）
+          tag_name: v2.0.7
+          name: HonorShadeClock 2.0.7 — 通知避让补全 + 垂直位置可调
           body: |
-            ## HonorShadeClock 2.0.6
+            ## HonorShadeClock 2.0.7
 
-            修 v2.0.5 真机：弹出横幅通知时时间样式
-            也会出现、压在横幅卡片上。口径不变——
-            时间样式只在通知中心页出现，其它界面都
-            不许出现，本版补上第三道门控：
+            修 v2.0.6 真机两点（横幅门控已确认通过）：
 
-            - 横幅门控：跟踪系统横幅管理器的聚合呈
-              现状态（与系统自己的「横幅显示中」窗
-              口状态同源、呈现进入/退出即时变化），
-              横幅呈现中整组挂起覆盖层（头部高度与
-              通知栈顶恢复系统原值），横幅消失自动
-              恢复；状态变化即时生效，不等每秒轮询。
-            - 前两道门控（锁屏、控制中心页）与卡顿
-              修复、小模块开关保持不变。
+            - 通知避让补全：系统写通知栈顶位置其实
+              只有一个写点（已全量核查），漏网的是
+              时序——我们调整后系统的一次嵌套写入又
+              把值盖回去。本版加延迟复查（调整后自
+              动读回校验、没到位自动补）与恢复时主
+              动补账：挂起期间系统写过的值，回到通
+              知中心页时当场修正，通知不再压时钟。
+            - 新增「垂直偏移」滑杆（设置页「位置」，
+              -120dp～+40dp，默认 0）：主题顶部留白
+              是给锁屏天空的，在通知中心显空、时间
+              整体偏低时可整体上移，最多移到时钟簇
+              贴顶；头部高度与通知位置自动跟随，下
+              拉即生效、不用强停。
+
+            三道门控（锁屏/控制中心/横幅）、主题背
+            景图与小模块开关保持不变。
 
             生效方式：覆盖安装 → 强停一次系统界面 →
             下拉通知中心查看（主题与设置沿用已导入
