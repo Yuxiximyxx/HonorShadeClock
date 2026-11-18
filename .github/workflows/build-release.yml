@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.10-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.11-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.10-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.11-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,32 +68,33 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.10
-          name: HonorShadeClock 2.0.10 — 页面切换过渡残影修复（门控改两段）
+          tag_name: v2.0.11
+          name: HonorShadeClock 2.0.11 — 下拉首显即时化 + 页面切换跟随
           body: |
-            ## HonorShadeClock 2.0.10
+            ## HonorShadeClock 2.0.11
 
-            修 v2.0.9 真机录屏残留：通知中心↔控制中心
-            来回切换的过渡过程中，时钟簇半透明地压在
-            控制中心瓷砖上，落定后才消失。
+            修 v2.0.10 真机录屏三点：下拉首显迟滞、
+            切换去程样式消失太突兀、回程要等落定才出现。
 
-            - 定案：页面状态的 notify 是切换动画结束
-              才分发的落定信号，过渡全程（随指拖动 +
-              松手后的交叉淡入淡出动画）门控都没触发，
-              覆盖层随头部父容器一起被渐变，成了残影。
-            - 改两段门控：切换一开始（横向拖动成立 /
-              切换动画启动）就挂起覆盖层、整组隐藏不
-              参与滑动与渐变；动画落定且确认回到通知
-              页才恢复。取消切换（拖一半松手弹回）也
-              有单独的清位信号，不会卡住不恢复。
-            - 日志可核对时序：page switch start /
-              settled / canceled 与既有 suspended /
-              resumed 行先后对应。
+            - 首显即时：模块加载阶段就在后台把主题
+              解析与整套图片预解码做完，下拉挂载时
+              零 IO 直接采纳；首轮刷新不再延迟 1 秒，
+              挂载完成当帧就排首绘。
+            - 切换跟随（撤掉 v2.0.10 的开始即整组
+              隐藏）：过渡期间覆盖层跟随通知页的逐帧
+              透明度与平移同步淡出/淡入——滑向控制
+              中心时随通知页一起淡出，滑回时一起淡
+              入；落定控制中心仍整组隐藏、落定回通
+              知页恢复完全不透明（终态门控不变）。
+            - 同框闪烁：原头部内容在下拉展开时会被
+              系统重新置可见、与覆盖层同框一帧——改
+              为每帧绘制前同频断言隐藏，闪烁不再
+              依赖 1 秒轮询纠正。
 
-            通知避让（v2.0.9 已确认可用）、运营商
-            隐藏、铃铛删除、三道门控（锁屏/控制
-            中心/横幅）、垂直偏移、主题背景图与
-            小模块开关保持不变。
+            通知避让、运营商隐藏、铃铛删除、三道
+            终态门控（锁屏/控制中心落定/横幅）、
+            垂直偏移、主题背景图与小模块开关保持
+            不变。
 
             生效方式：覆盖安装 → 强停一次系统界面 →
             下拉通知中心查看（主题与设置沿用已导入

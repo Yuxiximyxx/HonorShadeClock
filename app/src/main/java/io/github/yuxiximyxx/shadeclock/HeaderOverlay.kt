@@ -11,6 +11,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewTreeObserver
 import android.widget.FrameLayout
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedHelpers
@@ -248,6 +249,48 @@ import kotlin.math.roundToInt
  * onQsHeightChanged 是纵向展开分数、与横向页面切换无关，
  * 不作信号。
  *
+ * v2.0.11 修 v2.0.10 真机三点（录屏逐帧）：
+ * ①下拉首显迟滞约 1 秒（录屏里先只有通知、时钟簇迟到，且出现
+ * 的那一帧原头部内容同框闪过）。根子是冷路径全压在 attach 与
+ * 1 秒 tick 上：attach 时同步读 stamp、解析 manifest、加载
+ * 字体，位图又是首绘懒解码；ThemeView 首绘若赶上 env 未就绪
+ * （宽 0）只录得空帧，下一次重绘要等 tick。改：install 阶段
+ * 就在后台线程预热——读 stamp、load 主题、把主题目录图片逐个
+ * 预解码进缓存（ThemeRenderer.warmBitmapCache），attach 时
+ * 戳记吻合就整套采纳（adoptFrom）、零 IO；不吻合/预热失败仍
+ * 走原同步 load 并顺手再排一次预热，预热不是唯一路径。tick
+ * 首轮改立即执行（不再 +1000ms），attach 完成后按可见状态
+ * 立即 invalidate；门控状态未知（进程刚起、状态机还没来过
+ * 事件）不阻塞首显——各门控的未知值本就按「不挂起」兜底
+ * （锁屏走 KeyguardManager 实查），预热与首绘不等任何信号。
+ * ②页面切换改「跟随」而非「开始即整组 GONE」：v2.0.10 的开始
+ * 即挂起太急——通知页还大半可见时样式就整组消失；回程又要等
+ * 落定才出现。逐帧进度源定案（反编译 HnSwipeSwitchControllerImpl
+ * 逐环）：随指 tracking() 与松手 AnimatorSet 的每一帧都经
+ * setViewAlpha(view, f) 设 alpha，view 是通知头部时它不设
+ * View.alpha、而是调 NotifCenterHeaderInteractor
+ * .updateAnimValueCommonAlpha(f) 驱动 Compose 状态——这正是
+ * 原头部内容淡入淡出的逐帧值，也是覆盖层（普通 View、不参与
+ * 场景合成）此前跟不上的原因。hook 该方法（Impl 类）的 after
+ * 记录 alpha 并在过渡期逐帧同步给 wrapper（alpha＝该值、
+ * translationX＝头部当前 translationX，头部本体在切换中被
+ * 引擎平移、覆盖层是同级视图须自己跟）。page-switch 的开始/
+ * 落定信号保留作终态判定：过渡期不再整组 GONE；控制中心终态
+ * 门控改为「落定（!pageSwitching）才硬挂起」——回程拖动中随
+ * alpha 从挂起恢复为跟随显示，落定到控制中心的终态仍由
+ * notify 后的 applyGate 整组挂起，落定回通知页在清位点统一
+ * 复位 alpha=1/translationX=0。跟随 hook 装不上时的兜底：
+ * OnPreDraw 里按帧采样头部 translationX 占面板宽的比例换算
+ * alpha（帧回调采样、非 tick），双向对称。
+ * ③同框闪烁：原头部 Compose 子视图在下拉展开/场景激活过程
+ * 中会被宿主在帧频上重新置可见（或重建子视图），旧对策只有
+ * attach 与 1 秒 tick 两次 hideComposeChildren，闪烁最长可
+ * 达一拍 tick。改同频断言：头部注册 OnPreDrawListener——
+ * 每帧绘制前（挂起期除外）重断言子视图 INVISIBLE（只在真
+ * 被改回时才写，并有界记日志留证：纠正次数与子视图类名）、
+ * ThemeView 尚无有效首绘（drawCalls=0 或 env 曾缺失）时顺手
+ * invalidate，不用任何轮询硬压。
+ *
  * 设置经 StampStore 的 stamp.txt 跨进程传递；覆盖层挂载时与每秒
  * tick 比对戳记，变了就重解析重载——切换主题免强停。
  * 全路径 try-catch：构建/渲染任何异常都卸下覆盖层、恢复原头部、
@@ -324,10 +367,13 @@ object HeaderOverlay {
     private var headsUpManagerRef: WeakReference<Any>? = null
 
     /**
-     * 页面切换过渡中（v2.0.10）：切换开始信号（notifySwipeStart /
-     * 引擎 swipeTo*）置位、落定信号（notifyControlCenterPanelChange /
-     * notifySwipeCanceled）清位；置位期间覆盖层挂起，不参与页面
-     * 切换的滑动/渐变。落定判定仍以 controlCenterExpand 为准。
+     * 页面切换过渡中（v2.0.10 置位/清位口径不变）：切换开始信号
+     * （notifySwipeStart / 引擎 swipeTo*）置位、落定信号
+     * （notifyControlCenterPanelChange / notifySwipeCanceled）
+     * 清位。v2.0.11 起置位期间不再挂起——覆盖层走跟随（逐帧
+     * alpha/平移同步，见 [installHeaderAlphaFollow]），本标志
+     * 改作跟随窗口与终态门控（控制中心落定才硬挂起）的判定。
+     * 落定页态仍以 controlCenterExpand 为准。
      */
     @Volatile
     private var pageSwitching = false
@@ -339,6 +385,39 @@ object HeaderOverlay {
     /** hook 回调捕获的 HnSwipeSwitchControllerImpl 实例（弱引用），供 tick 兜底直读其 mIsAnimationPlaying / mIsTracking。 */
     @Volatile
     private var swipeControllerRef: WeakReference<Any>? = null
+
+    // 切换跟随（v2.0.11）：类名经反编译核实——通知头部的逐帧
+    // alpha 不走 View.alpha，而是 HnSwipeSwitchControllerImpl
+    // .setViewAlpha 对头部调 NotifCenterHeaderInteractor
+    // .updateAnimValueCommonAlpha(f) 驱动 Compose 状态（随指
+    // tracking 与松手 AnimatorSet 每一帧都经此 funnel）。
+    private const val HEADER_INTERACTOR_IMPL_CLASS =
+        "com.android.systemui.statusbar.notification.panelheader.NotifCenterHeaderInteractorImpl"
+
+    /**
+     * 通知头部最近一帧的切换 alpha（[installHeaderAlphaFollow]
+     * 的 hook 逐帧更新；1=通知页完全在位）。只在 [pageSwitching]
+     * 期间被应用到 wrapper，其余时刻 wrapper 恒为不透明。
+     */
+    @Volatile
+    private var headerAnimAlpha = 1f
+
+    /** 跟随主路径（interactor alpha hook）是否装上；没装上时 OnPreDraw 走 translationX 采样兜底。 */
+    @Volatile
+    private var followAlphaHookActive = false
+
+    /** 预热好的主题（install 阶段后台线程 load + 位图预解码完成），attach 时按 (themeId, stamp) 吻合采纳。 */
+    private class PreheatedTheme(
+        val themeId: String,
+        val stamp: Long,
+        val renderer: ThemeRenderer,
+    )
+
+    @Volatile
+    private var preheatedTheme: PreheatedTheme? = null
+
+    @Volatile
+    private var preheatInFlight = false
 
     private class State(val header: ViewGroup) {
         var wrapper: FrameLayout? = null
@@ -357,10 +436,14 @@ object HeaderOverlay {
         var batteryReceiver: BroadcastReceiver? = null
         var mountLogged = false
         var layoutListener: View.OnLayoutChangeListener? = null
+        /** 帧频断言监听（v2.0.11）：头部 OnPreDraw——同框纠正 + 首绘补 invalidate + 跟随兜底采样。 */
+        var preDrawListener: ViewTreeObserver.OnPreDrawListener? = null
+        /** Compose 子视图被宿主改回可见后、我们重新压回的纠正次数（有界日志用，v2.0.11）。 */
+        var childCorrectionLogCount = 0
         var diagTicks = 0
         /** 挂起中（锁屏或控制中心页）：覆盖层整组不可见、原头部保持原样，tick 继续跑以便条件解除后自动恢复。 */
         var suspended = false
-        /** 挂起原因："keyguard" / "control-center" / "page-switch" / "heads-up"，日志与恢复判断用。 */
+        /** 挂起原因："keyguard" / "control-center" / "heads-up"，日志与恢复判断用（页面切换自 v2.0.11 起走跟随、不再挂起）。 */
         var suspendReason: String? = null
         /** 通知栈（NSSL）及其 AmbientState 的反射句柄（找到后缓存）。 */
         var stackScroller: View? = null
@@ -472,6 +555,139 @@ object HeaderOverlay {
         installPageSwitchGate(lpparam, log)
         installHeadsUpGate(lpparam, log)
         installStackWriteInterceptor(lpparam, log)
+        installHeaderAlphaFollow(lpparam, log)
+        // 首显预热（v2.0.11）：进程启动就在后台把 stamp 读取与
+        // 主题加载（解析/字体/位图预解码）做完，attach 零 IO。
+        startPreheat()
+    }
+
+    /**
+     * 主题预热（v2.0.11）：后台线程读 stamp → ThemeRenderer.load
+     * → warmBitmapCache，结果存 [preheatedTheme] 供 attach 按
+     * (themeId, stamp) 吻合时整套采纳（adoptFrom）。失败只记
+     * 一行、不存缓存，attach 走原同步 load——预热不是唯一路径；
+     * attach 发现戳记不吻合（主题/设置刚改）时也会再排一次，
+     * 让下一次挂载命中。同一时刻只跑一条预热线程。
+     */
+    private fun startPreheat() {
+        if (preheatInFlight) return
+        preheatInFlight = true
+        val t = Thread({
+            try {
+                preheatWorker()
+            } catch (t: Throwable) {
+                logFn("overlay preheat failed: ${t.javaClass.name}: ${t.message}")
+            } finally {
+                preheatInFlight = false
+            }
+        }, "shadeclock-preheat")
+        t.isDaemon = true
+        t.start()
+    }
+
+    private fun preheatWorker() {
+        val stamp = StampStore.readStamp() ?: return
+        if (stamp.topStyle != StampStore.TOP_STYLE_THEME || stamp.themeId.isEmpty()) return
+        val dir = StampStore.themeDir(stamp.themeId)
+        if (!dir.isDirectory) return
+        val renderer = ThemeRenderer { message -> logFn(message) }
+        renderer.showBackgroundImage = stamp.showBackground
+        renderer.showWidgets = stamp.showWidgets
+        if (!renderer.load(dir)) return
+        renderer.warmBitmapCache()
+        preheatedTheme = PreheatedTheme(stamp.themeId, stamp.stamp, renderer)
+        logFn("overlay preheat ready: theme=${stamp.themeId}, stamp=${stamp.stamp}")
+    }
+
+    /**
+     * 切换跟随的逐帧进度源（v2.0.11）：hook
+     * NotifCenterHeaderInteractorImpl.updateAnimValueCommonAlpha
+     * (float)——反编译定案：HnSwipeSwitchControllerImpl 的
+     * setViewAlpha 对通知头部不设 View.alpha、只调这个方法把
+     * 每帧 alpha 写进 Compose 状态（随指 tracking() 里逐 MOVE
+     * 调、松手 AnimatorSet 的 update 监听里逐帧调，动画结束的
+     * onAnimationEnd 还会以终值各调一次）。after 里记录该值，
+     * 过渡期（[pageSwitching]）逐帧同步给各 State 的 wrapper：
+     * alpha＝该值、translationX＝头部本体当前 translationX
+     * （头部在切换中被引擎平移，覆盖层是同级视图、不跟随父级
+     * 以外的变换，须自己抄）。挂起中的 State 跳过（终态门控
+     * 优先）。hook 在宿主 UI 线程回调（动画/触摸都在主线程），
+     * 写 View 属性即同帧生效。装失败只记一行，OnPreDraw 的
+     * translationX 采样兜底自动接管（见 ensureWrapper）。
+     */
+    private fun installHeaderAlphaFollow(
+        lpparam: XC_LoadPackage.LoadPackageParam,
+        log: (String) -> Unit,
+    ) {
+        try {
+            val implClass = XposedHelpers.findClass(HEADER_INTERACTOR_IMPL_CLASS, lpparam.classLoader)
+            XposedHelpers.findAndHookMethod(
+                implClass, "updateAnimValueCommonAlpha",
+                Float::class.javaPrimitiveType,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val f = (param.args.getOrNull(0) as? Float) ?: return
+                        headerAnimAlpha = f.coerceIn(0f, 1f)
+                        if (!pageSwitching) return
+                        val snapshot = synchronized(states) { states.values.toList() }
+                        for (st in snapshot) {
+                            if (st.suspended) continue
+                            try {
+                                applyFollowTransform(st)
+                            } catch (t: Throwable) {
+                                // 跟随失败不许影响宿主动画
+                            }
+                        }
+                    }
+                }
+            )
+            followAlphaHookActive = true
+            log("header alpha follow hook installed (NotifCenterHeaderInteractorImpl.updateAnimValueCommonAlpha)")
+        } catch (t: Throwable) {
+            log(
+                "header alpha follow hook failed, pre-draw translationX sampling fallback: " +
+                    "${t.javaClass.name}: ${t.message}"
+            )
+        }
+    }
+
+    /** 把当前跟随帧同步给一个 State 的 wrapper：alpha＝头部逐帧 alpha、translationX＝头部本体平移。 */
+    private fun applyFollowTransform(st: State) {
+        val wrapper = st.wrapper ?: return
+        val a = headerAnimAlpha
+        if (wrapper.alpha != a) wrapper.alpha = a
+        val tx = st.header.translationX
+        if (wrapper.translationX != tx) wrapper.translationX = tx
+    }
+
+    /**
+     * 跟随兜底（v2.0.11，OnPreDraw 帧回调里采样）：跟随主 hook
+     * 没装上时，按头部 translationX 占面板宽的比例换算通知页
+     * alpha——引擎自带的 calculateNotificationCenterAlpha 就是
+     * (面板宽 − |位移|) / 面板宽，与方向无关、双向对称。面板
+     * 宽取头部父容器宽（即两页滑动的总行程量级）。
+     */
+    private fun applyFallbackFollow(st: State) {
+        val wrapper = st.wrapper ?: return
+        val header = st.header
+        val tx = header.translationX
+        if (wrapper.translationX != tx) wrapper.translationX = tx
+        val panelW = (header.parent as? View)?.width?.takeIf { it > 0 }
+            ?: header.width.takeIf { it > 0 }
+            ?: return
+        val a = (1f - abs(tx) / panelW).coerceIn(0f, 1f)
+        if (wrapper.alpha != a) wrapper.alpha = a
+    }
+
+    /** 落定复位（v2.0.11）：过渡结束（notify/取消/防卡死清位）时把跟随变换收回稳态——alpha=1、translationX=0；挂起中的不动（其 wrapper 是 GONE）。 */
+    private fun resetFollowTransforms() {
+        val snapshot = synchronized(states) { states.values.toList() }
+        for (st in snapshot) {
+            if (st.suspended) continue
+            val wrapper = st.wrapper ?: continue
+            if (wrapper.alpha != 1f) wrapper.alpha = 1f
+            if (wrapper.translationX != 0f) wrapper.translationX = 0f
+        }
     }
 
     /**
@@ -549,6 +765,11 @@ object HeaderOverlay {
                         if (pageSwitching) {
                             pageSwitching = false
                             log("page switch settled (notify cc=$z)")
+                            // 跟随复位（v2.0.11）：落定回通知页才
+                            // 复位为完全不透明；落定到控制中心不
+                            // 复位——随后的 applyGate 会整组挂起，
+                            // 先复位反而可能在挂起前闪一帧全显。
+                            if (!z) resetFollowTransforms()
                             reevaluateGatesNow()
                         } else if (changed) {
                             reevaluateGatesNow()
@@ -566,8 +787,9 @@ object HeaderOverlay {
     }
 
     /**
-     * 页面切换门控（v2.0.10）的开始段：通知中心↔控制中心横向
-     * 切换的过渡期挂起。两个开始信号（定案见类头 v2.0.10 段）：
+     * 页面切换门控的开始段（v2.0.10 定案；v2.0.11 起置位语义
+     * 改为「进入跟随窗口」而非挂起，见类头 v2.0.11 段）。
+     * 两个开始信号（定案见类头 v2.0.10 段）：
      * ①HwPanelControlImpl.notifySwipeStart(int)——与落定 notify
      * 同一分发枢纽，切换 tracking 成立时在页面移动之前分发，
      * 参数是 tracking 起始页（1=通知中心、2=控制中心）；两方向
@@ -620,6 +842,10 @@ object HeaderOverlay {
                                 "page switch canceled " +
                                     "(startType=${param.args.getOrNull(0)})"
                             )
+                            // 取消即回到起始页：起始页是通知页才
+                            // 复位；起始页是控制中心时不复位（同
+                            // notify 落定 cc 的理由，防挂起前闪帧）。
+                            if (!controlCenterExpand) resetFollowTransforms()
                             reevaluateGatesNow()
                         }
                     }
@@ -793,11 +1019,21 @@ object HeaderOverlay {
         return controlCenterExpand
     }
 
-    /** 挂起原因：null=可挂载；优先级 锁屏 > 控制中心 > 页面切换 > 横幅（可同时成立，取先者记日志）。 */
+    /**
+     * 挂起原因：null=可挂载；优先级 锁屏 > 控制中心 > 横幅
+     * （可同时成立，取先者记日志）。
+     * v2.0.11 起页面切换过渡不再是挂起原因：过渡期走跟随
+     * （见 [installHeaderAlphaFollow]），整组 GONE 太突兀；
+     * 控制中心也只在**落定**（!pageSwitching）时才硬挂起——
+     * 回程拖动中 isControlCenterExpand 仍为 true，但覆盖层要
+     * 随通知页 alpha 一起淡入，故切换中放行、由 applyGate 把
+     * 已挂起的 State 经 attach 恢复为跟随显示；落定信号清掉
+     * pageSwitching 后，本函数即恢复 cc 硬挂起（终态不变）。
+     * 锁屏与横幅是终态门控，过渡期照样硬挂起、不参与跟随。
+     */
     private fun suspendReason(header: ViewGroup): String? = when {
         isKeyguardActive(header.context) -> "keyguard"
-        isControlCenterActive(header) -> "control-center"
-        pageSwitching -> "page-switch"
+        isControlCenterActive(header) && !pageSwitching -> "control-center"
         isHeadsUpActive() -> "heads-up"
         else -> null
     }
@@ -828,6 +1064,7 @@ object HeaderOverlay {
         }
         if (!playing && !tracking) {
             pageSwitching = false
+            resetFollowTransforms()
             logFn("page switch flag cleared by tick fallback (no anim/tracking, settled state kept)")
         }
     }
@@ -908,9 +1145,23 @@ object HeaderOverlay {
             if (st.loadedThemeId != stamp.themeId ||
                 st.appliedStamp?.stamp != stamp.stamp
             ) {
-                if (!st.renderer.load(themeDir)) {
+                // 首显预热采纳（v2.0.11）：install/上次 attach 已在
+                // 后台把同 (themeId, stamp) 的主题 load + 位图预
+                // 解码好就整套接过来、attach 零 IO；不吻合才走
+                // 同步 load（原路径保留），并再排一次预热供下次
+                // 命中——预热不是唯一路径，失败不影响挂载。
+                val pre = preheatedTheme
+                if (pre != null && pre.themeId == stamp.themeId &&
+                    pre.stamp == stamp.stamp
+                ) {
+                    st.renderer.adoptFrom(pre.renderer)
+                    preheatedTheme = null
+                    logFn("overlay: theme adopted from preheat cache (zero-IO attach)")
+                } else if (!st.renderer.load(themeDir)) {
                     teardown(header)
                     return
+                } else {
+                    startPreheat()
                 }
                 st.loadedThemeId = stamp.themeId
                 // 先量一遍内容下缘，跟随模式下首帧前就把高度定对
@@ -929,6 +1180,24 @@ object HeaderOverlay {
             ensureStackAdjusted(st)
             scheduleStackReconcile(st)
             startTicker(st)
+            // 跟随变换对齐（v2.0.11）：过渡中恢复挂载的，按当前
+            // 逐帧 alpha/头部平移接上跟随；稳态则确保变换复位
+            // （防上次跟随的残值把覆盖层留在半透明/偏移位）。
+            if (pageSwitching) {
+                applyFollowTransform(st)
+            } else {
+                val w = st.wrapper
+                if (w != null) {
+                    if (w.alpha != 1f) w.alpha = 1f
+                    if (w.translationX != 0f) w.translationX = 0f
+                }
+            }
+            // 首显即时（v2.0.11）：挂载完成不等 tick——本帧就把
+            // 首绘排上（面板当前可见才有意义，不可见时预抽断言
+            // 与首轮 tick 会在可见首帧补上）。
+            if (st.wrapper?.isShown == true) {
+                st.themeView?.invalidate()
+            }
             WeatherSource.start(header.context) { message -> logFn(message) }
             if (!st.mountLogged) {
                 st.mountLogged = true
@@ -1019,6 +1288,43 @@ object HeaderOverlay {
             }
             header.addOnLayoutChangeListener(listener)
             st.layoutListener = listener
+        }
+        // 帧频断言（v2.0.11）：每帧绘制前在头部的绘制通道上做
+        // 三件轻活（挂起期全跳过——挂起时原头部本就该可见）：
+        // ①重断言 Compose 子视图 INVISIBLE：宿主在下拉展开/
+        // 场景激活时会在帧频上把子视图重新置可见（或重建），
+        // 旧对策只有 attach 与 1 秒 tick 两次隐藏、闪烁最长达
+        // 一拍 tick；预抽在绘制前纠正，被改回的子视图根本不会
+        // 被画出来，不是轮询硬压（无帧就不跑、只在真不对时写）；
+        // ②ThemeView 还没有效首绘（没画过、或首绘时 env 未
+        // 就绪只录了空帧）且头部已有宽度时补一发 invalidate，
+        // 首显不等 tick；③跟随主 hook 没装上时按帧采样头部
+        // translationX 换算 alpha 兜底（applyFallbackFollow）。
+        if (st.preDrawListener == null) {
+            val listener = ViewTreeObserver.OnPreDrawListener {
+                try {
+                    // teardown 已摘状态的监听必须失效（观察者合并
+                    // 后 remove 可能落空，靠注册校验兜底 inert）。
+                    val registered = synchronized(states) { states[header] === st }
+                    if (registered && !st.suspended && st.wrapper != null) {
+                        hideComposeChildren(header, st, fromPreDraw = true)
+                        val tv = st.themeView
+                        if (tv != null && header.width > 0 &&
+                            (tv.drawCalls == 0 || tv.lastEnvMissing)
+                        ) {
+                            tv.invalidate()
+                        }
+                        if (pageSwitching && !followAlphaHookActive) {
+                            applyFallbackFollow(st)
+                        }
+                    }
+                } catch (t: Throwable) {
+                    // 断言失败不许影响宿主绘制
+                }
+                true
+            }
+            header.viewTreeObserver.addOnPreDrawListener(listener)
+            st.preDrawListener = listener
         }
         mountOverlay(header, st)
     }
@@ -1120,7 +1426,7 @@ object HeaderOverlay {
             // bounds 未变（稳态 tick 与重复布局回调的绝大多数情况）：
             // 只做廉价的可见性/z 序自愈，不写 LayoutParams、不触发
             // requestLayout（v2.0.5 瘦身，防布局自激）。
-            healWrapperVisibility(wrapper, parent)
+            healWrapperVisibility(st, wrapper, parent)
             return
         }
         // LayoutParams 只在数值真变化时才写；定位完全交给父容器
@@ -1151,24 +1457,56 @@ object HeaderOverlay {
                 parent.requestLayout()
             }
         }
-        healWrapperVisibility(wrapper, parent)
+        healWrapperVisibility(st, wrapper, parent)
     }
 
-    /** 可见性/z 序自愈：wrapper 被改 INVISIBLE/透明或别的子视图后加进来盖住它时恢复并顶回最前（只在状态真不对时才写）。 */
-    private fun healWrapperVisibility(wrapper: View, parent: ViewGroup) {
+    /**
+     * 可见性/z 序自愈：wrapper 被改 INVISIBLE/透明或别的子视图后加进来盖住它时恢复并顶回最前（只在状态真不对时才写）。
+     * v2.0.11：alpha/平移的目标值随跟随状态走——过渡期以逐帧
+     * alpha 与头部平移为准（自愈不许把跟随中的 wrapper 拉回
+     * 不透明/原位），稳态才复位 alpha=1、translationX=0。
+     */
+    private fun healWrapperVisibility(st: State, wrapper: View, parent: ViewGroup) {
         if (wrapper.visibility != View.VISIBLE) wrapper.visibility = View.VISIBLE
-        if (wrapper.alpha != 1f) wrapper.alpha = 1f
+        if (pageSwitching) {
+            if (wrapper.alpha != headerAnimAlpha) wrapper.alpha = headerAnimAlpha
+            val tx = st.header.translationX
+            if (wrapper.translationX != tx) wrapper.translationX = tx
+        } else {
+            if (wrapper.alpha != 1f) wrapper.alpha = 1f
+            if (wrapper.translationX != 0f) wrapper.translationX = 0f
+        }
         if (parent.indexOfChild(wrapper) != parent.childCount - 1) {
             wrapper.bringToFront()
         }
     }
 
-    private fun hideComposeChildren(header: ViewGroup, st: State) {
+    private fun hideComposeChildren(
+        header: ViewGroup,
+        st: State,
+        fromPreDraw: Boolean = false,
+    ) {
         val wrapper = st.wrapper ?: return
         for (i in 0 until header.childCount) {
             val child = header.getChildAt(i)
             if (child !== wrapper && child.visibility != View.INVISIBLE) {
+                val was = child.visibility
                 child.visibility = View.INVISIBLE
+                // 同框核查留证（v2.0.11）：只记预抽路径纠正到的
+                // ——那是帧频上被宿主改回可见的实锤（attach/tick
+                // 的隐藏含首次挂载与挂起恢复等正常场景，不计数，
+                // 免得挤占留证名额）；覆盖层已完整挂载过
+                // （appliedStamp 非空）才算数，有界记前 10 次
+                // （子视图类名与原可见性），供真机日志定案。
+                if (fromPreDraw && st.appliedStamp != null &&
+                    st.childCorrectionLogCount < 10
+                ) {
+                    st.childCorrectionLogCount++
+                    logFn(
+                        "compose child re-hidden #${st.childCorrectionLogCount}: " +
+                            "${child.javaClass.name} was vis=$was"
+                    )
+                }
             }
         }
     }
@@ -1737,9 +2075,11 @@ object HeaderOverlay {
                         return
                     }
                     // 页态门控（v2.0.3 锁屏 / v2.0.4 控制中心 /
-                    // v2.0.6 横幅 / v2.0.10 页面切换过渡）：与各
-                    // hook 的即时重评共用 applyGate；挂起期保持
-                    // 整组 GONE，条件解除后经 attach 恢复。
+                    // v2.0.6 横幅；页面切换自 v2.0.11 起不挂起、
+                    // 走跟随，applyGate 只负责把切换中被 cc 挂起
+                    // 的 State 恢复为跟随显示）：与各 hook 的即时
+                    // 重评共用 applyGate；挂起期保持整组 GONE，
+                    // 条件解除后经 attach 恢复。
                     maybeClearStuckPageSwitch()
                     if (applyGate(st)) {
                         st.handler.postDelayed(this, 1000L)
@@ -1797,7 +2137,10 @@ object HeaderOverlay {
             }
         }
         st.ticker = runnable
-        st.handler.postDelayed(runnable, 1000L)
+        // 首轮立即跑（v2.0.11 首显即时）：旧版首轮也延迟 1 秒，
+        // 下拉首显要等它才对齐/重绘；runnable 内部的再调度仍是
+        // 1 秒节律，稳态开销不变。
+        st.handler.post(runnable)
     }
 
     private fun stopTicker(st: State) {
@@ -1895,7 +2238,7 @@ object HeaderOverlay {
     }
 
     /**
-     * 页态挂起（v2.0.3 锁屏 / v2.0.4 控制中心 / v2.0.6 横幅 / v2.0.10 页面切换过渡）：把覆盖层整组
+     * 页态挂起（v2.0.3 锁屏 / v2.0.4 控制中心 / v2.0.6 横幅）：把覆盖层整组
      * 藏起来、原头部内容与高度恢复原样，但保留 State 与
      * tick——回到通知中心页后 tick 会经 attach 自动恢复挂载。
      * 与 teardown 的区别：不摘状态、不停 tick。挂起/原因变化时各
@@ -1948,6 +2291,14 @@ object HeaderOverlay {
             st.layoutListener?.let { listener ->
                 header.removeOnLayoutChangeListener(listener)
                 st.layoutListener = null
+            }
+            st.preDrawListener?.let { listener ->
+                try {
+                    header.viewTreeObserver.removeOnPreDrawListener(listener)
+                } catch (t: Throwable) {
+                    // 观察者已失效就算了
+                }
+                st.preDrawListener = null
             }
             unregisterBatteryReceiver(st)
             st.wrapper?.let { wrapper ->

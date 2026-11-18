@@ -246,6 +246,58 @@ class ThemeRenderer(private val log: (String) -> Unit) {
 
     val isLoaded: Boolean get() = model != null
 
+    /**
+     * 预热采纳（v2.0.11）：把另一个已 load 完成的渲染器（install
+     * 阶段在后台线程预热好的）的主题状态整体接过来——模型、字体、
+     * 已解码位图缓存、数据小模块跳过集——本实例的绘制开关
+     * （showBackgroundImage / showWidgets / offsetYPx）由调用方按
+     * stamp 另行赋值，不在此列。采纳后源实例不得再被使用。
+     */
+    fun adoptFrom(other: ThemeRenderer) {
+        themeDir = other.themeDir
+        model = other.model
+        typeface = other.typeface
+        bitmaps.clear()
+        bitmaps.putAll(other.bitmaps)
+        missingLogged.clear()
+        missingLogged.addAll(other.missingLogged)
+        widgetSkipNodes = other.widgetSkipNodes
+        backgroundHandled = false
+        backgroundSkipLogged = false
+        contentBottomPx = other.contentBottomPx
+        contentTopPx = other.contentTopPx
+    }
+
+    /**
+     * 位图预解码（v2.0.11 预热用）：位图本是首绘时懒解码
+     * （[bitmap]），冷进程首帧要现场解码整套图集，是下拉首显
+     * 迟滞的一环。这里把主题目录下的图片文件逐个按相对路径
+     * 预解码进缓存——[bitmap] 的缓存键就是解析后的相对路径，
+     * 遍历文件得到的相对路径与之天然一致，任何 manifest 能引用
+     * 到的文件都会命中。上限 512 个文件防病态主题目录。
+     * 只应在后台线程调用。
+     */
+    fun warmBitmapCache() {
+        val dir = themeDir ?: return
+        if (model == null) return
+        val exts = listOf(".png", ".jpg", ".jpeg", ".webp")
+        val files = try {
+            dir.walkTopDown().maxDepth(4)
+                .filter { f -> f.isFile && exts.any { f.name.endsWith(it, true) } }
+                .take(512)
+                .toList()
+        } catch (t: Throwable) {
+            log("theme bitmap warm scan failed: ${t.javaClass.name}: ${t.message}")
+            return
+        }
+        var warmed = 0
+        for (f in files) {
+            val rel = f.relativeTo(dir).path.replace(File.separatorChar, '/')
+            if (bitmap(rel) != null) warmed++
+        }
+        log("theme bitmap cache warmed: $warmed/${files.size} image(s)")
+    }
+
     private fun loadTypeface(dir: File): Typeface? {
         val fontsDir = File(dir, "fonts")
         val fontFile = fontsDir.listFiles()
