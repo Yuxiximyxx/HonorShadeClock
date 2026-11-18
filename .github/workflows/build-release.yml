@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.23-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.24-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.23-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.24-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,43 +68,34 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.23
-          name: HonorShadeClock 2.0.23 — 原头部下拉漏出修 + 星期编号按主题记 + 左右偏移
+          tag_name: v2.0.24
+          name: HonorShadeClock 2.0.24 — 返回闪烁修 + 垂直偏移放宽 + 设置页折叠分组
           body: |
-            ## HonorShadeClock 2.0.23
+            ## HonorShadeClock 2.0.24
 
             三件事：
 
-            1. 下拉最初一两帧原系统时钟漏出修复：场景激活
-            时宿主会把原头部重新置可见，旧版靠每帧绘制前
-            断言纠正、真机日志里从未真正纠正过一次。本版
-            把隐藏动作铺到场景激活的每个同步点（容器显示
-            翻转、样式亮相、布局回调、每帧绘制前），并让
-            帧频断言的登记跟随头部重挂载，不再静默失效。
+            1. 返回（收起）闪烁修复：真机日志定案——收起
+            时原系统头部是被系统在行程中途先行隐藏的，而
+            覆盖层此前要等面板完全收完才撤，于是独自以全
+            不透明多留了约十几帧、末段被裁成残条。本版改
+            为：关闭行程中系统一藏原头部，覆盖层同刻撤下
+            （打开方向不受影响，下拉第一帧仍是加载好的成
+            品图）。
 
-            2. 星期差一天修复 + 按主题记编号口径：星期基
-            线改回系统引擎口径（周日=1），AAA 这类按周日
-            =1 编号的主题装上即对。主题文件不声明星期编
-            号口径，云镜这类按周一=1 编号的主题，在设置
-            页「位置」卡里对该主题开一次「星期编号按周一
-            起算」即可，设置按主题记住。
+            2. 垂直偏移范围放宽：-120dp～+40dp 改为
+            -400dp～+160dp。有些主题的时钟本身在画布中
+            部偏下，原范围拉满仍偏下；已存的偏移值原样有
+            效，仍按主题各记各的，偏移最多把时钟簇推到贴
+            边、不会移出画面。
 
-            3. 左右偏移：设置页「位置」卡新增「左右偏移」
-            滑杆（-120～+120dp，负左移、正右移），与垂
-            直偏移一样按主题各记各的；偏移不会把样式推
-            出画面。
-
-            另说明：上版反馈里「收起末段顶部残影」经核对，
-            那份录屏与日志实际是 2.0.21 在跑（2.0.22 当时
-            刚下载完、还没装上），残影是 2.0.21 的已知问
-            题、2.0.22 已修，本版未动该修法；录屏中段与
-            桌面大时钟的重影是桌面小部件透过半透明通知栏
-            背景，非本模块可改。
+            3. 设置页改可折叠分组：点分组标题展开/收起，
+            展开状态会记住。默认展开「主题管理」「位置」，
+            其余默认收起；「重启系统界面」不折叠、常显。
+            所有设置项与原有行为不变。
 
             生效方式：覆盖安装 → 打开一次设置页 → 用
-            「重启系统界面」按钮重载 → 下拉确认。云镜用
-            户另在「位置」卡对云镜开一次「星期编号按周一
-            起算」。
+            「重启系统界面」按钮重载 → 下拉确认。
             关闭办法：在 LSPosed 里停用模块再重启一次
             系统界面，即恢复原样。
           files: dist/*.apk
