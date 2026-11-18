@@ -26,10 +26,12 @@ import kotlin.math.roundToInt
  *    getDimensionPixelSize，替换直接生效。DimensionReplacement 的
  *    单位按 API 82 签名 (float, int unit) 传
  *    TypedValue.COMPLEX_UNIT_DIP，即 dp 语义。
- * 2. 居中（摆放 lambda 替换）：见 HeaderCentering——带结构自检与异常
- *    回退地复刻头部 SubcomposeLayout 的摆放逻辑，只改 dateAndTime
- *    的 x。仅当设置 center_clock=true 时安装；false 时不装 hook，
- *    摆放完全走系统原逻辑。
+ * 2. 居中（MeasurePolicy 替换）：见 PolicyCentering——带结构自检与
+ *    异常回退地复刻 DateAndTime 内部 MeasurePolicy 的 measure，
+ *    只给时钟/日期在盒内的摆放 x 整体加居中偏移（v1.1.2 起的新
+ *    路线；v1.0–v1.1.1 在外层 Lambda9 挪盒子的路线已撤销，稳态下
+ *    盒子本身满宽、挪盒子居中不了）。仅当设置 center_clock=true
+ *    时安装；false 时不装 hook，摆放完全走系统原逻辑。
  *
  * 设置来自模块 App 的 SharedPreferences（名 settings），经
  * XSharedPreferences 在 SystemUI 进程启动时读取一次（改设置后强停
@@ -159,12 +161,12 @@ class ShadeClockHook : IXposedHookLoadPackage, IXposedHookInitPackageResources {
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != TARGET_PACKAGE) return
-        diag("=== HonorShadeClock v1.1.1 loaded in $TARGET_PACKAGE ===")
+        diag("=== HonorShadeClock v1.1.2 loaded in $TARGET_PACKAGE ===")
         installDimenDiagnostic(lpparam)
         if (settings().centerClock) {
-            HeaderCentering.install(lpparam) { message -> diag(message) }
+            PolicyCentering.install(lpparam) { message -> diag(message) }
         } else {
-            diag("centering hook not installed: center_clock=false in settings")
+            diag("policy centering hook not installed: center_clock=false in settings")
         }
     }
 

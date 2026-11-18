@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-1.1.1-release.apk
+          cp "$SRC" dist/HonorShadeClock-1.1.2-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-1.1.1-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-1.1.2-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,27 +68,27 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.1.1
-          name: HonorShadeClock 1.1.1 — 居中加几何判别 + 诊断
+          tag_name: v1.1.2
+          name: HonorShadeClock 1.1.2 — 居中下沉到时钟组内部
           body: |
-            ## HonorShadeClock 1.1.1
+            ## HonorShadeClock 1.1.2
 
-            修复 v1.1.0 真机现象：居中 hook 已装上、头部时钟却
-            没动，且第一条通知上方多出一个半透明的幽灵大时钟。
+            修复 v1.1.1 真机现象：居中判别与诊断日志显示，
+            稳态下时钟组盒子被日期撑到满宽，外层挪盒子的
+            居中量被吃掉，头部时钟仍不动。
 
-            - 审计结论：复刻与系统原版摆放逻辑逐行比对后，
-              测量约束、摆放顺序、状态回写全部一致，唯一
-              差异就是时钟组的摆放 x；幽灵疑似面板转场/背景
-              层借用同一头部界面时的另一轮摆放被居中 x
-              挪进了可见区。
-            - 对策：改 x 前加几何判别——只有布局高度符合
-              通知中心头部特征（定高 80dp）且时钟组窄于
-              可用宽时才居中，其余轮次逐字走系统原逻辑，
-              幽灵层不再被挪动。
-            - 新增有界诊断：每进程前 5 次摆放向
-              /sdcard/Download/shadeclock_probe.log 记录
-              布局宽高与三个子项的测得宽高、最终 x，
-              便于继续定位。
+            - 根因（源码+字节码审计）：时钟组盒宽 = 时钟宽
+              + 日期宽；日期按剩余宽测量、自然宽不小于
+              剩余宽时测得宽被约束收紧到恰好剩余宽，于是
+              盒子恰好满宽，字形只占盒内左侧——在外层挪
+              盒子永远居中不了。
+            - 新路线：居中下沉到时钟组内部的 MeasurePolicy，
+              复刻其测量与基线对齐，只把时钟与日期在盒内
+              的摆放整体右移 (容器宽 − 内容宽) / 2；容器
+              尺寸、y 坐标、状态回写逐字照原版。
+            - v1.0–v1.1.1 的外层 Lambda9 改 x 已整体撤销，
+              外层摆放恢复系统原逻辑；保险不变（结构自检、
+              异常回退原方法），并带新的有界诊断日志。
             - 自定义设置（居中开关、时钟/日期字号滑杆）
               与放大保持不变。
 
