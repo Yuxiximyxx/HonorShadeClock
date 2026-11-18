@@ -24,8 +24,8 @@ android {
         applicationId = "io.github.yuxiximyxx.shadeclock"
         minSdk = 34   // Android 14 (MagicOS 8 起，与 MagicPods 一致)
         targetSdk = 35
-        versionCode = 10
-        versionName = "2.0.1"
+        versionCode = 11
+        versionName = "2.0.2"
     }
 
     signingConfigs {

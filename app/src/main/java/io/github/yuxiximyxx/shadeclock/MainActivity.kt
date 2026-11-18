@@ -51,7 +51,7 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.ThemeController
 
 /**
- * 设置页（v2.0.1）：顶部样式（原系统头部 / 锁屏主题样式）、主题
+ * 设置页（v2.0.2）：顶部样式（原系统头部 / 锁屏主题样式）、主题
  * 管理（导入/切换/删除）、区域高度三档、字号滑杆（原头部模式）。
  * 覆盖层相关设置经 stamp.txt（公共 Download 目录）传给 SystemUI
  * 侧，切换免强停；字号仍走 SharedPreferences「settings」，由 hook
@@ -243,7 +243,7 @@ private fun SettingsScreen() {
                 .padding(innerPadding),
         ) {
             Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-                SmallTitle(text = "正式版 v2.0.1", insideMargin = PaddingValues(start = 4.dp))
+                SmallTitle(text = "正式版 v2.0.2", insideMargin = PaddingValues(start = 4.dp))
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     cornerRadius = 20.dp,

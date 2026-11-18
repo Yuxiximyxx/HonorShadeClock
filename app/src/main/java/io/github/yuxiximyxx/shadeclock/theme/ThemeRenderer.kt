@@ -121,6 +121,11 @@ class ThemeRenderer(private val log: (String) -> Unit) {
     var contentBottomPx: Float = 0f
         private set
 
+    /** 最近一次 draw 实际绘制的可见元素数（覆盖层诊断用）。 */
+    var lastDrawnElements: Int = 0
+        private set
+    private var drawnCounter = 0
+
     fun load(dir: File): Boolean {
         themeDir = dir
         bitmaps.clear()
@@ -161,9 +166,11 @@ class ThemeRenderer(private val log: (String) -> Unit) {
         val m = model ?: return
         val ctx = EvalContext(m, env)
         contentBottomPx = 0f
+        drawnCounter = 0
         for (root in m.roots) {
             drawNode(root, canvas, ctx, env, 0f, 0f, 1f, 1f)
         }
+        lastDrawnElements = drawnCounter
     }
 
     // ---------- 递归绘制 ----------
@@ -189,6 +196,7 @@ class ThemeRenderer(private val log: (String) -> Unit) {
             alpha = (alpha * alphaFactor(Expr.eval(alphaExpr, ctx))).coerceIn(0f, 1f)
             if (alpha <= 0f) return
         }
+        if (node.tag in VISUAL_TAGS) drawnCounter++
         when (node.tag) {
             "Group" -> {
                 val dx = numAttr(node, "x", ctx)

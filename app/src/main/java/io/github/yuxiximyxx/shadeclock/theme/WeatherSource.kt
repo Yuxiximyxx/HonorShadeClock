@@ -24,10 +24,13 @@ import kotlin.math.roundToInt
  * 表格 cursor（temperature/weather_text/weather_icon 列）。
  * 刷新触发：WEATHER_CHANGE 广播 + ContentObserver + 30 分钟缓存。
  *
- * mintemp/maxtemp/winddirDes 的确切 JSON 键名未被公开代码证实：
- * 本类在 day 对象里按候选键名 + 语义启发式尽力找；每进程首次拿到
- * JSON 时把原文（截断约 4KB）以 "weather json dump: " 打一行日志，
- * 供真机定案键名。找不到的键不进结果表，对应文字渲染为空。
+ * 键名已由真机 JSON dump 定案（2026-11-18，哈尔滨当日预报，
+ * day_index==1）：今日最低温 curr_lowtemp、最高温 curr_hightemp、
+ * 当前温度 current_temperature；wind_direction 是数字码字符串，
+ * 按 0=北风…7=西北风 映射中文（码 7 与锁屏实物「西北风」对上）。
+ * 每进程首次拿到 JSON 仍把原文（截断约 4KB）以
+ * "weather json dump: " 打一行日志备查。缺失的键不进结果表，
+ * 对应文字渲染为空。
  */
 object WeatherSource {
 
@@ -35,6 +38,11 @@ object WeatherSource {
     private const val ACTION_WEATHER_CHANGE = "com.hihonor.android.action.WEATHER_CHANGE"
     private const val CACHE_MS = 30 * 60 * 1000L
     private const val EVENT_MIN_INTERVAL_MS = 10 * 1000L
+
+    /** wind_direction 数字码 → 中文风向（下标即码值，码 7=西北风已对实物核实）。 */
+    private val WIND_DIRECTIONS = arrayOf(
+        "北风", "东北风", "东风", "东南风", "南风", "西南风", "西风", "西北风",
+    )
 
     private val executor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "ShadeClock-Weather").apply { isDaemon = true }
@@ -176,68 +184,32 @@ object WeatherSource {
         val des = day.optString("${prefix}weather_native_des", "").trim()
         if (des.isNotEmpty()) out["Weather.today.weatherIconDes"] = EVal.Str(des)
 
-        findTemperature(day, isMax = true)?.let {
+        // 定案键名直读（见类头注释），不再候选猜测
+        jsonDouble(day, "curr_hightemp")?.let {
             out["Weather.today.maxtemp"] = EVal.Num(tempOf(it).roundToInt().toDouble())
         }
-        findTemperature(day, isMax = false)?.let {
+        jsonDouble(day, "curr_lowtemp")?.let {
             out["Weather.today.mintemp"] = EVal.Num(tempOf(it).roundToInt().toDouble())
         }
-        findWindDirection(day)?.let {
+        windDirectionText(day)?.let {
             out["Weather.today.winddirDes"] = EVal.Str(it)
         }
         return if (out.isEmpty()) null else out
     }
 
-    /** 在 day 对象里找最高/最低温：候选键名直查 → 语义启发式扫键。 */
-    private fun findTemperature(day: JSONObject, isMax: Boolean): Double? {
-        val exact = if (isMax) {
-            listOf(
-                "day_temperature", "max_temperature", "temperature_max",
-                "day_max_temperature", "high_temperature", "maxtemp",
-            )
+    /**
+     * 风向文字：JSON 的 wind_direction 是数字码（实测为字符串
+     * "7"），按定案映射转中文。未知码给空串、键缺失则不进
+     * 结果表——两种情况对应文字都渲染为空，不显示假值。
+     */
+    private fun windDirectionText(day: JSONObject): String? {
+        if (!day.has("wind_direction") || day.isNull("wind_direction")) return null
+        val code = jsonInt(day, "wind_direction")
+        return if (code != null && code in WIND_DIRECTIONS.indices) {
+            WIND_DIRECTIONS[code]
         } else {
-            listOf(
-                "night_temperature", "min_temperature", "temperature_min",
-                "night_min_temperature", "low_temperature", "mintemp",
-            )
+            ""
         }
-        for (key in exact) {
-            jsonDouble(day, key)?.let { return it }
-        }
-        val keys = day.keys()
-        var dayNightFallback: Double? = null
-        while (keys.hasNext()) {
-            val key = keys.next()
-            val lk = key.lowercase()
-            if (!lk.contains("temp")) continue
-            val v = jsonDouble(day, key) ?: continue
-            if (isMax && lk.contains("max")) return v
-            if (!isMax && lk.contains("min")) return v
-            if (isMax && lk.contains("day") && !lk.contains("night")) dayNightFallback = v
-            if (!isMax && lk.contains("night")) dayNightFallback = v
-        }
-        return dayNightFallback
-    }
-
-    /** 在 day 对象里找风向描述：候选键名直查 → 第一个含 wind 的字符串值。 */
-    private fun findWindDirection(day: JSONObject): String? {
-        val exact = listOf(
-            "wind_direction_des", "wind_dir_des", "winddirection_des",
-            "wind_native_des", "wind_direction", "wind_dir", "winddirDes",
-            "day_wind_direction_des", "day_wind_direction",
-        )
-        for (key in exact) {
-            val v = day.optString(key, "").trim()
-            if (v.isNotEmpty() && v.toDoubleOrNull() == null) return v
-        }
-        val keys = day.keys()
-        while (keys.hasNext()) {
-            val key = keys.next()
-            if (!key.lowercase().contains("wind")) continue
-            val v = day.optString(key, "").trim()
-            if (v.isNotEmpty() && v.toDoubleOrNull() == null) return v
-        }
-        return null
     }
 
     private fun jsonDouble(obj: JSONObject, key: String): Double? {

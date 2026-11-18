@@ -40,6 +40,18 @@ import kotlin.math.roundToInt
  * 可加子视图的 ViewGroup 祖先。头部本体保留占位（内容隐藏、高度
  * 改为覆盖层目标高度），布局流仍由头部高度驱动、通知被推到下面。
  * 每秒 tick 把覆盖层 bounds 与头部重新对齐一次。
+ *
+ * v2.0.2 修「挂载成功但覆盖层不可见」：v2.0.1 真机日志
+ * `bounds=null`——attach 发生在头部布局之前（宽高为 0），
+ * alignOverlay 直接早退、mountBounds 一直是 null，初始
+ * LayoutParams 只能用兜底值，后续只靠 tick 的手动 layout()
+ * 校正，与父容器随后的布局 pass 互相覆盖，不可靠。改法：
+ * 给头部注册 OnLayoutChangeListener，头部 bounds 一旦有效
+ * 或变化，就在本帧布局结束后（post）重新对齐并重绘；
+ * alignOverlay 每轮顺带把 wrapper 顶回父容器最前并恢复
+ * VISIBLE/alpha=1（防别的子视图后加进来盖住）。tick 前
+ * 5 次各打一行 overlay diag（头部/wrapper/ThemeView 的
+ * bounds、可见性、onDraw 次数与实绘元素数），供定位。
  * 右上角复刻铃铛（点击反射调用宿主
  * HwNotificationUtils.getManageNotificationsIntent()，与原
  * ViewModel.onClickNotifMgeBtn 的主路径一致；失败退化为系统
@@ -85,6 +97,8 @@ object HeaderOverlay {
         var batteryState: Int = 0
         var batteryReceiver: BroadcastReceiver? = null
         var mountLogged = false
+        var layoutListener: View.OnLayoutChangeListener? = null
+        var diagTicks = 0
     }
 
     /** 自绘层：每帧按当前环境（时间/电量/天气）让渲染器画一遍。 */
@@ -98,11 +112,31 @@ object HeaderOverlay {
 
         private var lastContentBottom = -1f
 
+        /** 诊断计数：onDraw 被调用次数（v2.0.2 overlay diag 用）。 */
+        var drawCalls = 0
+            private set
+
+        /** 最近一帧实际绘制的元素数；env 缺失时为 0。 */
+        var lastDrawnElements = 0
+            private set
+
+        /** 最近一帧是否因 env 缺失（视图/头部尚无宽度）而未绘制。 */
+        var lastEnvMissing = false
+            private set
+
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
+            drawCalls++
             try {
-                val env = envProvider() ?: return
+                val env = envProvider()
+                if (env == null) {
+                    lastEnvMissing = true
+                    lastDrawnElements = 0
+                    return
+                }
+                lastEnvMissing = false
                 renderer.draw(canvas, env)
+                lastDrawnElements = renderer.lastDrawnElements
                 val cb = renderer.contentBottomPx
                 if (abs(cb - lastContentBottom) > 2f) {
                     lastContentBottom = cb
@@ -241,6 +275,27 @@ object HeaderOverlay {
                 }
             })
         }
+        // 对齐时机改到头部布局完成之后：attach 时头部多半还没
+        // 布局（宽高 0），监听其 bounds 一旦有效/变化，本帧布局
+        // 结束后再对齐一次（v2.0.2，修 bounds=null 不可见）。
+        if (st.layoutListener == null) {
+            val listener = View.OnLayoutChangeListener {
+                    _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
+                if (right - left > 0 && bottom - top > 0 &&
+                    (left != oldLeft || top != oldTop ||
+                        right != oldRight || bottom != oldBottom)
+                ) {
+                    header.post {
+                        if (st.wrapper != null) {
+                            alignOverlay(st)
+                            st.themeView?.invalidate()
+                        }
+                    }
+                }
+            }
+            header.addOnLayoutChangeListener(listener)
+            st.layoutListener = listener
+        }
         mountOverlay(header, st)
     }
 
@@ -353,6 +408,13 @@ object HeaderOverlay {
             wrapper.bottom != bounds[1] + bounds[3]
         ) {
             wrapper.layout(bounds[0], bounds[1], bounds[0] + bounds[2], bounds[1] + bounds[3])
+        }
+        // 可见性/z 序自愈：wrapper 被改 INVISIBLE/透明或别的子视图
+        // 后加进来盖住它时，每轮对齐都恢复并顶回父容器最前。
+        if (wrapper.visibility != View.VISIBLE) wrapper.visibility = View.VISIBLE
+        if (wrapper.alpha != 1f) wrapper.alpha = 1f
+        if (parent.indexOfChild(wrapper) != parent.childCount - 1) {
+            wrapper.bringToFront()
         }
     }
 
@@ -586,6 +648,7 @@ object HeaderOverlay {
                             st.bell?.let { trySetBellDrawable(st.header, st, it) }
                         }
                     }
+                    logDiag(st)
                     WeatherSource.maybeRefresh(st.header.context)
                     st.themeView?.invalidate()
                 } catch (t: Throwable) {
@@ -604,12 +667,48 @@ object HeaderOverlay {
         st.ticker = null
     }
 
+    /**
+     * 覆盖层诊断（v2.0.2）：每进程前 5 次 tick 各一行，记录头部、
+     * wrapper、ThemeView 的 bounds/可见性与 onDraw 实绘情况，
+     * 用于定位「挂上了但看不见」卡在哪一环。
+     * visibility 数值：0=VISIBLE、4=INVISIBLE、8=GONE。
+     */
+    private fun logDiag(st: State) {
+        if (st.diagTicks >= 5) return
+        st.diagTicks++
+        val header = st.header
+        val wrapper = st.wrapper
+        val tv = st.themeView
+        val parent = wrapper?.parent as? ViewGroup
+        val childIdx = if (parent != null && wrapper != null) {
+            parent.indexOfChild(wrapper)
+        } else {
+            -1
+        }
+        logFn(
+            "overlay diag #${st.diagTicks}: " +
+                "header=[${header.left},${header.top},${header.width}x${header.height}] " +
+                "vis=${header.visibility} | " +
+                "wrapper=[${wrapper?.left},${wrapper?.top},${wrapper?.right},${wrapper?.bottom}] " +
+                "vis=${wrapper?.visibility} alpha=${wrapper?.alpha} " +
+                "child=$childIdx/${parent?.childCount} clip=${parent?.clipChildren} | " +
+                "themeView=[${tv?.width}x${tv?.height}] vis=${tv?.visibility} " +
+                "alpha=${tv?.alpha} drawCalls=${tv?.drawCalls} " +
+                "drawn=${tv?.lastDrawnElements} envNull=${tv?.lastEnvMissing} | " +
+                "mountBounds=${st.mountBounds?.joinToString(",")}"
+        )
+    }
+
     // ---------- 卸载/回退 ----------
 
     private fun teardown(header: ViewGroup) {
         val st = synchronized(states) { states.remove(header) } ?: return
         try {
             stopTicker(st)
+            st.layoutListener?.let { listener ->
+                header.removeOnLayoutChangeListener(listener)
+                st.layoutListener = null
+            }
             unregisterBatteryReceiver(st)
             st.wrapper?.let { wrapper ->
                 (wrapper.parent as? ViewGroup)?.removeView(wrapper)

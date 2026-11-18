@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.1-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.2-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.1-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.2-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,34 +68,40 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.1
-          name: HonorShadeClock 2.0.1 — 覆盖层改同级挂载
+          tag_name: v2.0.2
+          name: HonorShadeClock 2.0.2 — 修覆盖层不可见 + 天气三值接实
           body: |
-            ## HonorShadeClock 2.0.1
+            ## HonorShadeClock 2.0.2
 
-            修 v2.0.0 覆盖层挂载失败：头部继承
-            BasicComposeView、禁止 addView，v2.0.0 把覆盖层
-            加进头部内部被拒（真机日志实证），回退机制虽
-            保住了原头部，但覆盖层始终没生效。
+            修 v2.0.1「同级挂载成功但覆盖层不可见」：
+            真机日志 bounds=null——attach 发生在头部
+            布局之前（宽高为 0），对齐逻辑直接早退，
+            初始位置尺寸只能用兜底值，后续仅靠每秒
+            tick 的手动摆放与父容器布局 pass 互相
+            覆盖，不可靠。
 
-            - 挂载改「同级覆盖」：覆盖层不再进头部内部，
-              改加到头部的父容器（HnColumeContainer，
-              FrameLayout 子类）里、z 序在头部之后，位置
-              尺寸与头部对齐；头部本体保留占位（内容
-              隐藏、高度改为覆盖层目标高度），通知仍被
-              推到下面。父容器若同样拒绝 addView，逐级
-              向上找第一个可加子视图的祖先容器兜底。
-            - 每秒 tick 新增 bounds 对齐：覆盖层位置尺寸
-              与头部重新对齐一次，防配置变更/重测后错位；
-              覆盖层被摘下时自动重挂。
-            - 自动停用阈值由连续失败 3 次放宽到 8 次，
-              成功挂载后失败计数归零。
-            - 渲染器、主题导入/切换、天气、铃铛、设置页
-              与 v2.0.0 完全一致，未动。
+            - 对齐时机改到头部布局完成之后：给头部
+              注册布局监听，头部 bounds 一旦有效或
+              变化，本帧布局结束后再对齐并重绘；
+              每秒 tick 重对齐保留。
+            - 每轮对齐顺带自愈：wrapper 被改隐藏/
+              透明或被后加的子视图盖住时，恢复可见
+              并顶回父容器最前。
+            - 新增诊断日志：每进程前 5 次 tick 各
+              一行 overlay diag（头部/wrapper/自绘
+              层的 bounds、可见性、onDraw 次数与
+              实绘元素数），供定位残余问题。
+            - 天气三值按真机数据定案接实：最低温
+              curr_lowtemp、最高温 curr_hightemp、
+              风向由 wind_direction 数字码映射中文
+              （7=西北风，与锁屏实物一致）；当前
+              温度 current_temperature 核对无误。
+              云镜主题的温度/风向文字自本版起有
+              真数据。
 
             生效方式：覆盖安装 → 强停一次系统界面 →
-            下拉通知中心查看（主题与设置沿用 v2.0.0 的
-            已导入状态，无需重导）。
+            下拉通知中心查看（主题与设置沿用已导入
+            状态，无需重导）。
             关闭办法：在 LSPosed 里停用模块再强停一次
             系统界面，即恢复原样。
           files: dist/*.apk
