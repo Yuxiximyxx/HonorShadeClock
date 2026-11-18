@@ -10,7 +10,6 @@ import android.graphics.drawable.GradientDrawable
 import android.os.BatteryManager
 import android.os.Handler
 import android.os.Looper
-import android.provider.Settings
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
@@ -367,7 +366,7 @@ object HeaderOverlay {
             )
             try {
                 ctx.startActivity(
-                    Intent(Settings.ACTION_NOTIFICATION_SETTINGS)
+                    Intent("android.settings.NOTIFICATION_SETTINGS")
                         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 )
             } catch (t2: Throwable) {

@@ -101,7 +101,7 @@ object ThemeParser {
 
     /**
      * 解析主题目录里的 manifest.xml。目录结构（由 App 导入时抽好）：
-     * <dir>/manifest.xml、<dir>/<资产相对路径>、<dir>/fonts/*.ttf。
+     * <dir>/manifest.xml、<dir>/<资产相对路径>、<dir>/fonts/ 下的 ttf。
      * 解析失败返回 null（调用方回退原头部）。
      */
     fun load(themeDir: File): ThemeModel? {

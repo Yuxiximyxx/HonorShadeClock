@@ -399,7 +399,7 @@ class ThemeRenderer(private val log: (String) -> Unit) {
     }
 
     private fun safeFormat(format: String, args: List<EVal>): String {
-        val converted = args.map { v ->
+        val converted: List<Any> = args.map { v ->
             when (v) {
                 is EVal.Num -> if (v.v == Math.floor(v.v)) v.v.toLong() else v.v
                 is EVal.Str -> v.s
