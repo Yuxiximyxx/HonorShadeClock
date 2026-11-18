@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.2-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.3-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.2-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.3-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,36 +68,37 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.2
-          name: HonorShadeClock 2.0.2 — 修覆盖层不可见 + 天气三值接实
+          tag_name: v2.0.3
+          name: HonorShadeClock 2.0.3 — 时钟步进/小字切边/铃铛/锁屏泄漏/背景图开关/通知避让
           body: |
-            ## HonorShadeClock 2.0.2
+            ## HonorShadeClock 2.0.3
 
-            修 v2.0.1「同级挂载成功但覆盖层不可见」：
-            真机日志 bounds=null——attach 发生在头部
-            布局之前（宽高为 0），对齐逻辑直接早退，
-            初始位置尺寸只能用兜底值，后续仅靠每秒
-            tick 的手动摆放与父容器布局 pass 互相
-            覆盖，不可靠。
+            修 v2.0.2 真机四处问题 + 两项新点名：
 
-            - 对齐时机改到头部布局完成之后：给头部
-              注册布局监听，头部 bounds 一旦有效或
-              变化，本帧布局结束后再对齐并重绘；
-              每秒 tick 重对齐保留。
-            - 每轮对齐顺带自愈：wrapper 被改隐藏/
-              透明或被后加的子视图盖住时，恢复可见
-              并顶回父容器最前。
-            - 新增诊断日志：每进程前 5 次 tick 各
-              一行 overlay diag（头部/wrapper/自绘
-              层的 bounds、可见性、onDraw 次数与
-              实绘元素数），供定位残余问题。
-            - 天气三值按真机数据定案接实：最低温
-              curr_lowtemp、最高温 curr_hightemp、
-              风向由 wind_direction 数字码映射中文
-              （7=西北风，与锁屏实物一致）；当前
-              温度 current_temperature 核对无误。
-              云镜主题的温度/风向文字自本版起有
-              真数据。
+            - 时钟步进：Time 图集改按位图自然宽
+              （140）排位，不再取 XML 的 w=170，
+              时钟不再压住右侧秒数图集与星期图。
+            - 小字切边：跟随内容模式的内容高度
+              统计改口径——Text/DateTime 下缘按
+              「y + 字号实测行高」计，不再少算
+              约半行，三小模块文字不再被切。
+            - 铃铛：主题模式下克隆图标加白色
+              tint，深色背景上看得见了。
+            - 锁屏泄漏：覆盖层只在解锁后的下拉
+              面板生效；锁屏（含锁屏下拉）时自动
+              挂起、原头部保持原样，解锁后自动
+              恢复。信号取宿主状态栏状态机
+              （StatusBarStateController）。
+            - 主题背景图开关（新，默认关）：关时
+              不画主题的整幅背景图（云镜那张蓝天
+              图），只画时钟等元素、透出通知栏
+              原背景；在设置页「顶部样式」里可
+              打开恢复整幅背景。
+            - 通知避让：通知栈顶现在跟随变高后
+              的头部下缘，通知不再钻到覆盖层
+              底下（栈顶 topPadding 按头部高度
+              增量同步，挂起/切回原样式时恢复
+              系统原值）。
 
             生效方式：覆盖安装 → 强停一次系统界面 →
             下拉通知中心查看（主题与设置沿用已导入

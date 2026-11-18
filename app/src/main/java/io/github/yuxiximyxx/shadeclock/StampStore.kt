@@ -10,7 +10,9 @@ import java.io.File
  * 实证可行）。主题资产同样放在 /sdcard/Download/HonorShadeClock/
  * themes/<id>/（manifest.xml + 资产 + fonts/）。
  *
- * stamp.txt 格式（4 行）：themeId / stamp / heightMode / topStyle。
+ * stamp.txt 格式（5 行）：themeId / stamp / heightMode / topStyle /
+ * showBackground（1=画主题整幅背景图、0=不画，v2.0.3 加；旧 4 行
+ * 文件缺此行时按 0 处理，与设置页开关默认关一致）。
  * SystemUI 侧每次覆盖层挂载与每秒 tick 比对文件 mtime 与内容，
  * 变了就重解析主题、重载位图——切换主题免强停系统界面。
  */
@@ -37,12 +39,20 @@ object StampStore {
         val stamp: Long,
         val heightMode: Int,
         val topStyle: String,
+        /** 是否绘制主题的整幅背景图；默认 false（设置页开关默认关）。 */
+        val showBackground: Boolean = false,
     )
 
     fun themeDir(id: String): File = File(THEMES_DIR, id)
 
-    fun formatStamp(themeId: String, stamp: Long, heightMode: Int, topStyle: String): String =
-        "$themeId\n$stamp\n$heightMode\n$topStyle\n"
+    fun formatStamp(
+        themeId: String,
+        stamp: Long,
+        heightMode: Int,
+        topStyle: String,
+        showBackground: Boolean,
+    ): String =
+        "$themeId\n$stamp\n$heightMode\n$topStyle\n${if (showBackground) 1 else 0}\n"
 
     /** SystemUI 侧读取；文件不存在/内容不完整返回 null。 */
     fun readStamp(): Stamp? {
@@ -55,6 +65,8 @@ object StampStore {
                 stamp = lines[1].toLongOrNull() ?: 0L,
                 heightMode = lines[2].toIntOrNull() ?: HEIGHT_FOLLOW,
                 topStyle = lines[3].ifEmpty { TOP_STYLE_ORIGINAL },
+                // 第 5 行缺失（旧版 stamp）按关处理，与开关默认一致
+                showBackground = lines.getOrNull(4) == "1",
             )
         } catch (t: Throwable) {
             null

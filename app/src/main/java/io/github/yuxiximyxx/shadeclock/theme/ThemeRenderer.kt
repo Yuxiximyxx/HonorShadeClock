@@ -126,6 +126,18 @@ class ThemeRenderer(private val log: (String) -> Unit) {
         private set
     private var drawnCounter = 0
 
+    /**
+     * 是否绘制主题的整幅背景图（设置页「主题背景图」开关，v2.0.3）。
+     * false 时：文档顺序里第一个 dst 覆盖画布 ≥95% 的 Image 视为
+     * 背景、跳过不画（云镜的蓝天整图 xr.png 即此），其余元素照常；
+     * 通知栏透出原背景，不再是一块硬边矩形。true 时与 v2.0.2 一致。
+     * 由 HeaderOverlay 按 stamp 在每次挂载时赋值。
+     */
+    @Volatile
+    var showBackgroundImage: Boolean = true
+    private var backgroundHandled = false
+    private var backgroundSkipLogged = false
+
     fun load(dir: File): Boolean {
         themeDir = dir
         bitmaps.clear()
@@ -137,6 +149,7 @@ class ThemeRenderer(private val log: (String) -> Unit) {
             null
         }
         typeface = loadTypeface(dir)
+        backgroundSkipLogged = false
         if (model == null) log("theme load failed: no valid manifest.xml in $dir")
         return model != null
     }
@@ -167,6 +180,7 @@ class ThemeRenderer(private val log: (String) -> Unit) {
         val ctx = EvalContext(m, env)
         contentBottomPx = 0f
         drawnCounter = 0
+        backgroundHandled = false
         for (root in m.roots) {
             drawNode(root, canvas, ctx, env, 0f, 0f, 1f, 1f)
         }
@@ -344,6 +358,27 @@ class ThemeRenderer(private val log: (String) -> Unit) {
             else -> anchorY
         }
         val dst = RectF(left, top, left + rw, top + rh)
+        // 主题背景图开关（v2.0.3）：关时跳过文档顺序里第一个覆盖画布
+        // ≥95% 的 Image（整幅背景图）。覆盖判定：dst 罩住画布
+        // （#screen_width × #screen_height）的 95% 区域。云镜的
+        // xr.png 即此；hwt 的 b.png 全屏拼贴也会被跳过（已知取舍，
+        // 开关打开即恢复）。跳过后其余全屏图仍照常画。
+        if (!showBackgroundImage && !backgroundHandled) {
+            val cw = env.screenWidthPx.toFloat()
+            val ch = env.screenHeightPx.toFloat()
+            if (cw > 0f && ch > 0f &&
+                dst.left <= cw * 0.05f && dst.top <= ch * 0.05f &&
+                dst.right >= cw * 0.95f && dst.bottom >= ch * 0.95f
+            ) {
+                backgroundHandled = true
+                drawnCounter--
+                if (!backgroundSkipLogged) {
+                    backgroundSkipLogged = true
+                    log("theme background image skipped (switch off): $path")
+                }
+                return
+            }
+        }
         paint.reset()
         paint.isAntiAlias = true
         paint.alpha = (alpha * 255).roundToInt().coerceIn(0, 255)
@@ -481,7 +516,13 @@ class ThemeRenderer(private val log: (String) -> Unit) {
             else -> anchorY - fm.ascent
         }
         canvas.drawText(content, drawX, baseline, paint)
-        trackContent(env, baseline + fm.ascent, baseline + fm.descent, fm.descent - fm.ascent)
+        // 内容下缘统计口径（v2.0.3）：Text/DateTime 按「y + 字号实测
+        // 行高（descent - ascent）」计下缘。v2.0.2 按 baseline+descent
+        // 计，alignV=center 时只算半行高，跟随内容模式下头部高度少算
+        // 约半行——云镜三小模块文字（y=888、size 15）下缘实际约 906、
+        // 旧口径只算到约 898，文字被盒子下缘切掉一半（真机实证）。
+        val lineHeight = fm.descent - fm.ascent
+        trackContent(env, anchorY, anchorY + lineHeight, lineHeight)
     }
 
     private fun makeTypeface(bold: Boolean): Typeface {
@@ -527,7 +568,12 @@ class ThemeRenderer(private val log: (String) -> Unit) {
         val minute = env.now.get(Calendar.MINUTE)
         val digits = intArrayOf(hour24 / 10, hour24 % 10, minute / 10, minute % 10)
         val firstBmp = bitmap(variantPath(src, digits[0].toString())) ?: return
-        val cellW = if (hasNumAttr(node, "w")) numAttr(node, "w", ctx) else firstBmp.width.toFloat()
+        // 步进与绘制宽都用位图自然宽，不取 XML 的 w：云镜 Time 写
+        // w=170 但 time_*.png 实宽 140，引擎按位图原宽排位；按 170
+        // 步进会把时钟撑宽，压住右侧固定位置的秒数图集（x≈663 起）
+        // 与星期图（x≈661 起）——v2.0.2 真机实证，v2.0.3 改。
+        // 按 140 步进：时钟右缘 = x 起点 + 560，与两者都不重叠。
+        val cellW = firstBmp.width.toFloat()
         val cellH = if (hasNumAttr(node, "h")) numAttr(node, "h", ctx) else firstBmp.height.toFloat()
         if (cellW <= 0f || cellH <= 0f) return
         val dotBmp = bitmap(variantPath(src, "dot"))

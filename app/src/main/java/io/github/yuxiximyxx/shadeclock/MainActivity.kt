@@ -51,7 +51,7 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.ThemeController
 
 /**
- * 设置页（v2.0.2）：顶部样式（原系统头部 / 锁屏主题样式）、主题
+ * 设置页（v2.0.3）：顶部样式（原系统头部 / 锁屏主题样式）、主题
  * 管理（导入/切换/删除）、区域高度三档、字号滑杆（原头部模式）。
  * 覆盖层相关设置经 stamp.txt（公共 Download 目录）传给 SystemUI
  * 侧，切换免强停；字号仍走 SharedPreferences「settings」，由 hook
@@ -126,6 +126,9 @@ private fun SettingsScreen() {
     var heightMode by remember {
         mutableIntStateOf(prefs.getInt(ThemeStore.KEY_HEIGHT_MODE, StampStore.HEIGHT_FOLLOW))
     }
+    var showBackground by remember {
+        mutableStateOf(prefs.getBoolean(ThemeStore.KEY_SHOW_BACKGROUND, false))
+    }
     var themes by remember { mutableStateOf(ThemeStore.loadThemes(prefs)) }
     var selectedThemeId by remember {
         mutableStateOf(prefs.getString(ThemeStore.KEY_SELECTED_THEME, "") ?: "")
@@ -162,6 +165,12 @@ private fun SettingsScreen() {
     fun saveHeightMode(mode: Int) {
         heightMode = mode
         prefs.edit().putInt(ThemeStore.KEY_HEIGHT_MODE, mode).apply()
+        syncStamp()
+    }
+
+    fun saveShowBackground(value: Boolean) {
+        showBackground = value
+        prefs.edit().putBoolean(ThemeStore.KEY_SHOW_BACKGROUND, value).apply()
         syncStamp()
     }
 
@@ -243,7 +252,7 @@ private fun SettingsScreen() {
                 .padding(innerPadding),
         ) {
             Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-                SmallTitle(text = "正式版 v2.0.2", insideMargin = PaddingValues(start = 4.dp))
+                SmallTitle(text = "正式版 v2.0.3", insideMargin = PaddingValues(start = 4.dp))
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     cornerRadius = 20.dp,
@@ -278,6 +287,12 @@ private fun SettingsScreen() {
                         summary = "开：用导入的锁屏主题渲染顶部；关：系统原头部",
                         checked = topStyleTheme,
                         onCheckedChange = { saveTopStyle(it) },
+                    )
+                    SuperSwitch(
+                        title = "主题背景图",
+                        summary = "开：连主题的整幅背景图一起画；关：只画时钟等元素，透出通知栏原背景",
+                        checked = showBackground,
+                        onCheckedChange = { saveShowBackground(it) },
                     )
                 }
 
@@ -433,7 +448,7 @@ private fun SettingsScreen() {
                 ) {
                     Column {
                         Text(
-                            "切换主题、改区域高度、开关锁屏主题样式：下次下拉通知栏即生效（约 1 秒内自动刷新），不用强停系统界面。",
+                            "切换主题、改区域高度、开关锁屏主题样式与主题背景图：下次下拉通知栏即生效（约 1 秒内自动刷新），不用强停系统界面。",
                             fontSize = 14.sp,
                             color = MiuixTheme.colorScheme.onSurface,
                         )

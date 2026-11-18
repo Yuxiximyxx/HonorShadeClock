@@ -57,6 +57,19 @@ import kotlin.math.roundToInt
  * ViewModel.onClickNotifMgeBtn 的主路径一致；失败退化为系统
  * 通知设置页。原铃铛在有前台服务包时的弹窗分支不复刻）。
  *
+ * v2.0.3：①铃铛图标加白色 tint（主题深色背景上原深色图标看不见）；
+ * ②锁屏门控——hook 宿主 StatusBarStateControllerImpl.setState
+ * 跟踪状态栏状态（反编译核实：0=SHADE、1=KEYGUARD、2=SHADE_LOCKED、
+ * 3=FS_USRSW），锁屏侧状态时挂起覆盖层并保持原头部原样，解锁后
+ * tick 自动恢复；状态未知时以 KeyguardManager.isKeyguardLocked
+ * 兜底。本模块只管解锁后的下拉面板，不管锁屏。
+ * ③主题背景图开关（设置页默认关）：关时渲染器跳过文档顺序里
+ * 第一个覆盖画布 ≥95% 的 Image（整幅背景图），经 stamp 第 5 行
+ * 传递；④通知栈顶同步——头部变高后把 NSSL 的
+ * AmbientState.mTopPadding 按「基线 + 高度增量」同步（系统原配
+ * 值只认 Compose 场景量出的头部高度、不认 View 层 lp.height，
+ * 详见 syncStackTop 处注释），挂起/卸载时恢复基线。
+ *
  * 设置经 StampStore 的 stamp.txt 跨进程传递；覆盖层挂载时与每秒
  * tick 比对戳记，变了就重解析重载——切换主题免强停。
  * 全路径 try-catch：构建/渲染任何异常都卸下覆盖层、恢复原头部、
@@ -72,10 +85,33 @@ object HeaderOverlay {
     private const val WRAPPER_MARKER = "shadeclock_overlay_wrapper"
     private const val MAX_FAILURES = 8
 
+    // 锁屏门控（v2.0.3）：状态值与宿主 StatusBarState 的反编译源码
+    // 逐一核对过（0=SHADE、1=KEYGUARD、2=SHADE_LOCKED、3=FS_USRSW）。
+    private const val STATE_CONTROLLER_CLASS =
+        "com.android.systemui.statusbar.StatusBarStateControllerImpl"
+    private const val STATE_SHADE = 0
+    private const val STATE_KEYGUARD = 1
+    private const val STATE_SHADE_LOCKED = 2
+    private const val STATE_FS_USRSW = 3
+
+    // 通知栈顶同步（v2.0.3 第 6 项）：类名经反编译核实。
+    private const val PANEL_CLASS_NAME =
+        "com.android.systemui.statusbar.phone.NotificationPanelView"
+    private const val STACK_CLASS_NAME =
+        "com.android.systemui.statusbar.notification.stack.NotificationStackScrollLayout"
+
+    /** 系统原配的栈 topPadding 基线（头部原高时捕获、全进程共享）；-1=未捕获。 */
+    @Volatile
+    private var stackBaselineTopPadding = -1
+
     private lateinit var logFn: (String) -> Unit
     private val states = WeakHashMap<View, State>()
     @Volatile
     private var processFailureCount = 0
+
+    /** 宿主状态栏状态（StatusBarStateControllerImpl.setState 跟踪）；-1=尚未知。 */
+    @Volatile
+    private var statusBarState = -1
     @Volatile
     private var bellClickLogCount = 0
 
@@ -99,6 +135,13 @@ object HeaderOverlay {
         var mountLogged = false
         var layoutListener: View.OnLayoutChangeListener? = null
         var diagTicks = 0
+        /** 锁屏挂起中：覆盖层不可见、原头部保持原样，tick 继续跑以便解锁后自动恢复。 */
+        var keyguardSuspended = false
+        /** 通知栈（NSSL）及其 AmbientState 的反射句柄（找到后缓存）。 */
+        var stackScroller: View? = null
+        var stackAmbient: Any? = null
+        /** 本 State 上次写入栈的 topPadding；恢复时只认自己写过的值。 */
+        var stackSyncedValue: Int? = null
     }
 
     /** 自绘层：每帧按当前环境（时间/电量/天气）让渲染器画一遍。 */
@@ -173,6 +216,61 @@ object HeaderOverlay {
         } catch (t: Throwable) {
             log("overlay hook install failed: ${t.javaClass.name}: ${t.message}")
         }
+        installKeyguardGate(lpparam, log)
+    }
+
+    /**
+     * 锁屏门控的信号源（v2.0.3）：hook 宿主
+     * StatusBarStateControllerImpl.setState(int)——反编译源码核实它
+     * 是状态转换的唯一入口（校验 0..3、同值直接返回、更新 mState 后
+     * 通知监听者），after 里记录新状态即可。hook 失败时
+     * [isKeyguardActive] 自动退化为 KeyguardManager 轮询。
+     */
+    private fun installKeyguardGate(
+        lpparam: XC_LoadPackage.LoadPackageParam,
+        log: (String) -> Unit,
+    ) {
+        try {
+            val stateClass = XposedHelpers.findClass(STATE_CONTROLLER_CLASS, lpparam.classLoader)
+            XposedHelpers.findAndHookMethod(
+                stateClass, "setState", Int::class.javaPrimitiveType,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val newState = param.args.getOrNull(0) as? Int ?: return
+                        if (newState in 0..3 && newState != statusBarState) {
+                            statusBarState = newState
+                            log("status bar state -> $newState")
+                        }
+                    }
+                }
+            )
+            log("keyguard gate hook installed (StatusBarStateControllerImpl.setState)")
+        } catch (t: Throwable) {
+            log(
+                "keyguard gate hook failed, fallback to KeyguardManager polling: " +
+                    "${t.javaClass.name}: ${t.message}"
+            )
+        }
+    }
+
+    /**
+     * 当前是否处于锁屏态：状态机已知时以它为准（KEYGUARD /
+     * SHADE_LOCKED / FS_USRSW 都算锁屏侧——本模块只管解锁后的下拉
+     * 面板）；尚未知（进程刚起、还没等到第一次状态转换）时用系统
+     * KeyguardManager.isKeyguardLocked 兜底。
+     */
+    private fun isKeyguardActive(context: Context): Boolean {
+        return when (statusBarState) {
+            STATE_KEYGUARD, STATE_SHADE_LOCKED, STATE_FS_USRSW -> true
+            STATE_SHADE -> false
+            else -> try {
+                val km = context.getSystemService(Context.KEYGUARD_SERVICE)
+                    as? android.app.KeyguardManager
+                km?.isKeyguardLocked == true
+            } catch (t: Throwable) {
+                false
+            }
+        }
     }
 
     // ---------- 挂载 ----------
@@ -197,6 +295,22 @@ object HeaderOverlay {
             val st = synchronized(states) {
                 states.getOrPut(header) { State(header) }
             }
+            // 锁屏门控（v2.0.3）：头部在锁屏的通知区里同样存在，覆盖层
+            // 挂上去会盖住锁屏自己的大时钟。本模块只管解锁后的下拉
+            // 面板——锁屏态不挂覆盖层、不隐藏原头部，只保持 tick 运行，
+            // 解锁（状态转 SHADE）后自动恢复挂载。
+            if (isKeyguardActive(header.context)) {
+                suspendOverlay(header, st)
+                st.stampMtimeSeen = StampStore.stampMtime()
+                startTicker(st)
+                return
+            }
+            if (st.keyguardSuspended) {
+                st.keyguardSuspended = false
+                logFn("overlay resumed: keyguard dismissed (state=$statusBarState)")
+            }
+            // 主题背景图开关（v2.0.3）：stamp 每次挂载/变更时同步给渲染器
+            st.renderer.showBackgroundImage = stamp.showBackground
             ensureWrapper(header, st)
             // 走到这里说明覆盖层已成功挂到父容器上：失败计数归零
             if (processFailureCount != 0) processFailureCount = 0
@@ -288,6 +402,7 @@ object HeaderOverlay {
                     header.post {
                         if (st.wrapper != null) {
                             alignOverlay(st)
+                            syncStackTop(st)
                             st.themeView?.invalidate()
                         }
                     }
@@ -459,6 +574,160 @@ object HeaderOverlay {
         }
     }
 
+    // ---------- 通知栈顶同步（v2.0.3 第 6 项） ----------
+    //
+    // 机制（反编译逐环核实）：通知栈内容起始位置 = NSSL 的
+    // AmbientState.mTopPadding，由 NotificationPanelView
+    // .requestScrollerTopPaddingUpdate 写入，值来自
+    // NotifCenterInteractor.nsslTopPadding 流量——该流量是 Compose
+    // 场景里 Nssl 盒的 window Y，由 Compose 布局量出的头部高度
+    // 决定，不认 View 层改的 lp.height。所以头部变高后系统重算
+    // 也不会跟随，栈顶还停在原头部下缘，通知从覆盖层底下钻过去
+    // （v2.0.2 真机实证）。修法：增量同步——
+    //   mTopPadding(目标) = 基线 +（当前头部高 - 原头部高）
+    // 基线 = 头部原高时系统原配的 mTopPadding（与原头部下缘的差
+    // 是小量：场景间距/坐标系偏移），在运行中自校验捕获；写完后
+    // 调系统写字段后的同一组更新方法让新值立即生效。挂起/卸载时
+    // 只在当前值仍是我们写的值时才恢复基线，不踩系统自己的更新
+    // （如锁屏切 intrinsicPadding）。
+
+    /** 定位 NSSL 并取其 AmbientState（从面板子树按类名找，找到后缓存）。 */
+    private fun findStack(st: State): Boolean {
+        val cached = st.stackScroller
+        if (cached != null && cached.isAttachedToWindow && st.stackAmbient != null) {
+            return true
+        }
+        st.stackScroller = null
+        st.stackAmbient = null
+        // 搜索根：优先 NotificationPanelView 祖先的子树，找不到再退窗口根
+        var root: View = st.header
+        var v: View? = st.header
+        while (v != null) {
+            if (v.javaClass.name == PANEL_CLASS_NAME) {
+                root = v
+                break
+            }
+            root = v
+            v = v.parent as? View
+        }
+        val found = findViewByClassName(root, STACK_CLASS_NAME) ?: return false
+        val ambient = try {
+            XposedHelpers.getObjectField(found, "mAmbientState")
+        } catch (t: Throwable) {
+            logFn("stack sync: mAmbientState read failed: ${t.javaClass.name}: ${t.message}")
+            null
+        } ?: return false
+        st.stackScroller = found
+        st.stackAmbient = ambient
+        logFn("stack sync: NotificationStackScrollLayout located")
+        return true
+    }
+
+    private fun findViewByClassName(view: View, className: String): View? {
+        if (view.javaClass.name == className) return view
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) {
+                findViewByClassName(view.getChildAt(i), className)?.let { return it }
+            }
+        }
+        return null
+    }
+
+    private fun readTopPadding(st: State): Int? {
+        val ambient = st.stackAmbient ?: return null
+        return try {
+            XposedHelpers.getIntField(ambient, "mTopPadding")
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    private fun writeTopPadding(st: State, value: Int) {
+        val ambient = st.stackAmbient ?: return
+        val stack = st.stackScroller ?: return
+        try {
+            XposedHelpers.setIntField(ambient, "mTopPadding", value)
+            // 与系统 requestScrollerTopPaddingUpdate 写完字段后相同的
+            // 更新组（方法名经反编译核实），逐个尽力调用。
+            runCatching { XposedHelpers.callMethod(stack, "updateAlgorithmHeightAndPadding") }
+            runCatching { XposedHelpers.callMethod(stack, "updateContentHeight") }
+            runCatching { XposedHelpers.callMethod(stack, "updateStackPosition\$1") }
+                .onFailure {
+                    runCatching { XposedHelpers.callMethod(stack, "updateStackPosition") }
+                }
+            runCatching { XposedHelpers.callMethod(stack, "requestChildrenUpdate") }
+            runCatching {
+                val evClass = XposedHelpers.findClass(
+                    "com.android.systemui.statusbar.notification.row.ExpandableView",
+                    stack.javaClass.classLoader,
+                )
+                XposedHelpers.callMethod(
+                    stack, "notifyHeightChangeListener",
+                    arrayOf(evClass, Boolean::class.javaPrimitiveType),
+                    null, false,
+                )
+            }
+        } catch (t: Throwable) {
+            logFn("stack sync: write failed: ${t.javaClass.name}: ${t.message}")
+        }
+    }
+
+    /** 把栈顶同步到跟随当前头部下缘（增量式，tick 与布局回调里调用）。 */
+    private fun syncStackTop(st: State) {
+        if (st.keyguardSuspended || st.originalHeight <= 0) return
+        if (!findStack(st)) return
+        val cur = readTopPadding(st) ?: return
+        val header = st.header
+        val delta = header.height - st.originalHeight
+        val loc = IntArray(2)
+        header.getLocationOnScreen(loc)
+        val stockBottom = loc[1] + st.originalHeight
+        val synced = st.stackSyncedValue
+        when {
+            synced != null && cur == synced -> {
+                // 仍是我们写的值：头部高度再变时按新 delta 调整
+                // （delta 回到 0 时即恢复基线）
+                if (stackBaselineTopPadding >= 0) {
+                    val target = stackBaselineTopPadding + maxOf(delta, 0)
+                    if (target != cur) {
+                        writeTopPadding(st, target)
+                        st.stackSyncedValue = target
+                        logFn("stack sync: topPadding $cur -> $target (header height changed)")
+                    }
+                }
+            }
+            loc[1] > 0 && cur > 0 && abs(cur - stockBottom) <= 240 -> {
+                // 系统原配值（或刚被系统重算复位）：记基线并按 delta 同步
+                stackBaselineTopPadding = cur
+                if (delta > 0) {
+                    val target = cur + delta
+                    writeTopPadding(st, target)
+                    st.stackSyncedValue = target
+                    logFn(
+                        "stack sync: baseline=$cur topPadding -> $target " +
+                            "(delta=$delta, headerBottom=${loc[1] + header.height})"
+                    )
+                }
+            }
+            else -> {
+                // 锁屏 intrinsicPadding 等未知值：不动，等系统回到原配值再同步
+            }
+        }
+    }
+
+    /** 恢复栈顶：只在当前值仍是我们写的值时写回基线（挂起/卸载时调用）。 */
+    private fun restoreStackTop(st: State) {
+        val synced = st.stackSyncedValue ?: return
+        st.stackSyncedValue = null
+        if (stackBaselineTopPadding < 0) return
+        if (!findStack(st)) return
+        val cur = readTopPadding(st) ?: return
+        if (cur == synced) {
+            writeTopPadding(st, stackBaselineTopPadding)
+            logFn("stack sync: topPadding restored to baseline $stackBaselineTopPadding")
+        }
+    }
+
     // ---------- 铃铛 ----------
 
     private fun buildBell(header: ViewGroup, st: State): ImageButton {
@@ -479,6 +748,12 @@ object HeaderOverlay {
         bell.background = circle
         bell.setPadding(dp(7), dp(7), dp(7), dp(7))
         bell.scaleType = ImageView.ScaleType.FIT_CENTER
+        // 主题背景多为深色（云镜是蓝天图），克隆来的原铃铛图标是深色
+        // 描画、在半透明深色圆底上几乎看不见：统一白色 tint（v2.0.3）。
+        // imageTintList 与 drawable 解耦，后续 tick 里补设图标也生效。
+        bell.imageTintList = android.content.res.ColorStateList.valueOf(
+            android.graphics.Color.WHITE
+        )
         bell.contentDescription = "通知管理"
         trySetBellDrawable(header, st, bell)
         bell.setOnClickListener { onBellClick(header) }
@@ -623,6 +898,28 @@ object HeaderOverlay {
         val runnable = object : Runnable {
             override fun run() {
                 try {
+                    // 状态已被 teardown 摘除时这条 tick 必须停（否则会把
+                    // 已卸载的覆盖层重新挂回去）。
+                    val registered = synchronized(states) { states[st.header] === st }
+                    if (!registered) {
+                        st.ticker = null
+                        return
+                    }
+                    // 锁屏门控（v2.0.3）：锁屏态挂起、解锁后经 attach 恢复。
+                    if (isKeyguardActive(st.header.context)) {
+                        if (!st.keyguardSuspended) suspendOverlay(st.header, st)
+                        val mtimeKg = StampStore.stampMtime()
+                        if (st.stampMtimeSeen >= 0 && mtimeKg != st.stampMtimeSeen) {
+                            attach(st.header)
+                        }
+                        st.handler.postDelayed(this, 1000L)
+                        return
+                    }
+                    if (st.keyguardSuspended) {
+                        attach(st.header)
+                        st.handler.postDelayed(this, 1000L)
+                        return
+                    }
                     val wrapper = st.wrapper
                     if (wrapper == null) {
                         st.ticker = null
@@ -644,6 +941,8 @@ object HeaderOverlay {
                         st.appliedStamp?.let { applyHeight(st.header, st, it) }
                         // 每秒把覆盖层 bounds 与头部重新对齐一次
                         alignOverlay(st)
+                        // 通知栈顶跟随头部实际下缘（第 6 项）
+                        syncStackTop(st)
                         if (!st.bellDrawableSet) {
                             st.bell?.let { trySetBellDrawable(st.header, st, it) }
                         }
@@ -695,14 +994,88 @@ object HeaderOverlay {
                 "themeView=[${tv?.width}x${tv?.height}] vis=${tv?.visibility} " +
                 "alpha=${tv?.alpha} drawCalls=${tv?.drawCalls} " +
                 "drawn=${tv?.lastDrawnElements} envNull=${tv?.lastEnvMissing} | " +
+                "bgShown=${st.appliedStamp?.showBackground} | " +
                 "mountBounds=${st.mountBounds?.joinToString(",")}"
         )
+        // 高度核对（v2.0.3）：计算高度 vs 元素最大下缘，验证跟随内容
+        // 模式下 Text 下缘新口径是否把内容完整包住。
+        val computed = st.appliedStamp?.let { desiredHeight(header, st, it) }
+        logFn(
+            "overlay height check #${st.diagTicks}: computed=$computed " +
+                "contentMaxBottom=${st.renderer.contentBottomPx} headerH=${header.height}"
+        )
+        // 栈顶核对（v2.0.3 第 6 项）：头部下缘 vs 栈顶实际 Y（均为
+        // window 坐标）；同步生效后 gap 应等于系统原有间距
+        // （基线 - 原头部下缘），而不是负数（通知钻进覆盖层）。
+        val stack = st.stackScroller
+        val ambient = st.stackAmbient
+        if (stack != null && ambient != null) {
+            val hLoc = IntArray(2)
+            header.getLocationOnScreen(hLoc)
+            val sLoc = IntArray(2)
+            stack.getLocationOnScreen(sLoc)
+            val tp = readTopPadding(st)
+            val translation = try {
+                XposedHelpers.getFloatField(ambient, "mStackTranslation")
+            } catch (t: Throwable) {
+                0f
+            }
+            val headerBottom = hLoc[1] + header.height
+            val stackTop = if (tp != null) {
+                sLoc[1] + tp + translation.roundToInt()
+            } else {
+                -1
+            }
+            logFn(
+                "overlay stack check #${st.diagTicks}: headerBottom=$headerBottom " +
+                    "stackTop=$stackTop gap=${stackTop - headerBottom} " +
+                    "topPadding=$tp baseline=$stackBaselineTopPadding"
+            )
+        } else {
+            logFn("overlay stack check #${st.diagTicks}: stack not located yet")
+        }
+    }
+
+    /**
+     * 锁屏挂起（v2.0.3）：把覆盖层藏起来、原头部内容与高度恢复原样，
+     * 但保留 State 与 tick——解锁后 tick 会经 attach 自动恢复挂载。
+     * 与 teardown 的区别：不摘状态、不停 tick、不写恢复日志（只在
+     * 状态翻转时各记一行）。
+     */
+    private fun suspendOverlay(header: ViewGroup, st: State) {
+        val wasSuspended = st.keyguardSuspended
+        st.keyguardSuspended = true
+        // 栈顶同步停手并恢复系统原值，别误伤锁屏自己的布局（第 6 项）
+        restoreStackTop(st)
+        try {
+            st.wrapper?.let { wrapper ->
+                if (wrapper.visibility != View.GONE) wrapper.visibility = View.GONE
+            }
+            for (i in 0 until header.childCount) {
+                val child = header.getChildAt(i)
+                if (child.visibility == View.INVISIBLE) {
+                    child.visibility = View.VISIBLE
+                }
+            }
+            val lp = header.layoutParams
+            if (lp != null && st.originalHeight > 0 && lp.height != st.originalHeight) {
+                lp.height = st.originalHeight
+                header.layoutParams = lp
+                header.requestLayout()
+            }
+        } catch (t: Throwable) {
+            logFn("overlay suspend failed: ${t.javaClass.name}: ${t.message}")
+        }
+        if (!wasSuspended) {
+            logFn("overlay suspended: keyguard active (state=$statusBarState)")
+        }
     }
 
     // ---------- 卸载/回退 ----------
 
     private fun teardown(header: ViewGroup) {
         val st = synchronized(states) { states.remove(header) } ?: return
+        restoreStackTop(st)
         try {
             stopTicker(st)
             st.layoutListener?.let { listener ->
