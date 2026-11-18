@@ -733,6 +733,13 @@ object HeaderOverlay {
          * -1=无待确认，见 [updateCloseTailLatch]。
          */
         var gateLatchReleaseAtMs = -1L
+        /**
+         * 开门/latch 解除的时间确认复评是否已在主线程队列里
+         * （v2.0.26）：确认起点一落就排一发延迟复评，确认的
+         * 完成由时间驱动、不依赖下一发自然评估何时到来，
+         * 见 [scheduleGateConfirmRecheck]。
+         */
+        var gateConfirmRecheckPosted = false
         /** 上一次采样的展开比例（判「正在下落」用），null=尚无采样。 */
         var gateLastFraction: Float? = null
         /** 面板本体（头部祖先 NotificationPanelView）与展开比例字段句柄（v2.0.22 收尾门用，懒定位、定位失败保持 null 走旧口径）。 */
@@ -881,6 +888,9 @@ object HeaderOverlay {
                     val since = st.gateLatchReleaseAtMs
                     if (since < 0L) {
                         st.gateLatchReleaseAtMs = now
+                        // 解除确认同样排一发时间驱动复评
+                        // （v2.0.26）：不依赖下一发自然评估。
+                        scheduleGateConfirmRecheck(st)
                     } else if (now - since >= OPEN_CONFIRM_MS) {
                         st.gateTailLatched = false
                         st.gateLatchReleaseAtMs = -1L
@@ -894,6 +904,42 @@ object HeaderOverlay {
                 st.gateTailFraction = fraction
             }
         }
+    }
+
+    /**
+     * 时间确认的延迟复评（v2.0.26）：开门确认或 latch 解除
+     * 确认的起点一落，就往主线程排一发 [OPEN_CONFIRM_MS]+2ms
+     * 后的 [applyWrapperVisibility]——确认的完成由时间驱动，
+     * 不依赖下一发自然评估（预抽/漏斗/tick）何时到来。缘由：
+     * v2.0.25 真机全灭定案之一是确认只能等自然评估、评估来源
+     * 稀疏时确认悬空（主因是确认起点被同调用尾部清零，见
+     * [applyWrapperVisibility] 注）；本版双保险。复评时状态已
+     * 被摘除/挂起就直接作罢；判据已回落（尖峰消散）时复评只
+     * 会确认「仍关」、无副作用。已排队时不重复排。
+     */
+    private fun scheduleGateConfirmRecheck(st: State) {
+        if (st.gateConfirmRecheckPosted) return
+        st.gateConfirmRecheckPosted = true
+        st.handler.postDelayed({
+            st.gateConfirmRecheckPosted = false
+            val registered = synchronized(states) { states[st.header] === st }
+            if (!registered || st.suspended) return@postDelayed
+            try {
+                applyWrapperVisibility(st)
+                // 复评后确认仍悬着（起点被中途的判据翻转重启
+                // 过、本发未到期）就再排一发，直到确认完成或
+                // 判据回落把起点清零——链条自持、不依赖外部
+                // 评估，但也绝不空转：起点活着必然意味着判
+                // 据正持续「想开/想解除」，下一发必能落定。
+                if (st.gateOpenConfirmAtMs >= 0L ||
+                    st.gateLatchReleaseAtMs >= 0L
+                ) {
+                    scheduleGateConfirmRecheck(st)
+                }
+            } catch (t: Throwable) {
+                // 复评失败不许影响宿主
+            }
+        }, OPEN_CONFIRM_MS + 2L)
     }
 
     /**
@@ -912,28 +958,48 @@ object HeaderOverlay {
         }
         updateCloseTailLatch(st)
         var closed = shadeSettledClosed(st)
-        // 开门时间确认（v2.0.25）：门已关落定时重新打开，
-        // 须「想开」判定持续成立 ≥ OPEN_CONFIRM_MS（约半
-        // 帧）才放行——关落定后宿主复位打出的比例尖峰只
-        // 持续一发评估（定案见 updateCloseTailLatch 注），
-        // 等不到确认就回落；真实下拉/手势反转是持续过
-        // 程、评估帧频密集，确认只迟约一帧，且位图早已
-        // 离屏渲好、第一帧仍是成品。挂起恢复与 attach 首
-        // 应用不走确认（gateClosed 非 true：挂起分支已置
-        // null），行为与旧版一致。
-        if (!closed && st.gateClosed == true) {
+        // 开门时间确认（v2.0.25 立、v2.0.26 修死锁）：门已关
+        // 落定时重新打开，须「想开」判定持续成立
+        // ≥ OPEN_CONFIRM_MS（约半帧）才放行——关落定后宿
+        // 主复位打出的比例尖峰只持续一发评估（定案见
+        // updateCloseTailLatch 注），等不到确认就回落；真实
+        // 下拉/手势反转是持续过程，确认只迟约一帧，且位图
+        // 早已离屏渲好、第一帧仍是成品。挂起恢复与 attach
+        // 首应用不走确认（gateClosed 非 true：挂起分支已
+        // 置 null），行为与旧版一致。
+        //
+        // v2.0.26 死锁定案（v2.0.25 真机全灭：任何主题都不
+        // 显示、只剩原头部）：旧写法把「确认中被摁住的
+        // closed=true」与「判据本身的 closed」混在一起，确
+        // 认块之后那句 `if (closed) gateOpenConfirmAtMs =
+        // -1L` 在同一次调用里就把刚记下的确认起点清零（起
+        // 点分支与未到期分支都中招）——每次评估都从零重
+        // 记、永远等不到「持续 ≥8ms」的第二发，attach 时
+        // 面板关着先把 gateClosed 落成 true 的 State 从此
+        // 永不开门。日志实证：.25 两会话「open -> wrapper
+        // VISIBLE」零行（.24 会话有 22 行）、diag 的 cfm
+        // 恒 false（起点活不过一次调用）、wrapper 恒
+        // GONE、drawCalls 恒 0，而挂载/主题/戳记/栈顶全
+        // 正常。修法：清零只认判据本身的 closed（尖峰回
+        // 落、确认作废走这条）；确认摁住的 closed 不许清
+        // 起点。另加时间驱动兜底：起点一落就排延迟复评
+        // （scheduleGateConfirmRecheck），确认完成不依赖
+        // 下一发自然评估的到来时机。
+        if (closed) {
+            st.gateOpenConfirmAtMs = -1L
+        } else if (st.gateClosed == true) {
             val now = SystemClock.uptimeMillis()
             val since = st.gateOpenConfirmAtMs
             if (since < 0L) {
                 st.gateOpenConfirmAtMs = now
                 closed = true
+                scheduleGateConfirmRecheck(st)
             } else if (now - since < OPEN_CONFIRM_MS) {
                 closed = true
             } else {
                 st.gateOpenConfirmAtMs = -1L
             }
         }
-        if (closed) st.gateOpenConfirmAtMs = -1L
         if (st.gateClosed == closed && wrapper.visibility ==
             if (closed) View.GONE else View.VISIBLE
         ) {
