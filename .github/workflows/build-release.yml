@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.7-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.8-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.7-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.8-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,29 +68,30 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.7
-          name: HonorShadeClock 2.0.7 — 通知避让补全 + 垂直位置可调
+          tag_name: v2.0.8
+          name: HonorShadeClock 2.0.8 — 避让来源追踪 + 删铃铛 + 隐藏运营商文字
           body: |
-            ## HonorShadeClock 2.0.7
+            ## HonorShadeClock 2.0.8
 
-            修 v2.0.6 真机两点（横幅门控已确认通过）：
+            修 v2.0.7 真机三点：
 
-            - 通知避让补全：系统写通知栈顶位置其实
-              只有一个写点（已全量核查），漏网的是
-              时序——我们调整后系统的一次嵌套写入又
-              把值盖回去。本版加延迟复查（调整后自
-              动读回校验、没到位自动补）与恢复时主
-              动补账：挂起期间系统写过的值，回到通
-              知中心页时当场修正，通知不再压时钟。
-            - 新增「垂直偏移」滑杆（设置页「位置」，
-              -120dp～+40dp，默认 0）：主题顶部留白
-              是给锁屏天空的，在通知中心显空、时间
-              整体偏低时可整体上移，最多移到时钟簇
-              贴顶；头部高度与通知位置自动跟随，下
-              拉即生效、不用强停。
+            - 通知避让根治：旧版对系统写回的栈顶值靠
+              猜判定身份，碰上 QS 分支的 501 会误判并
+              锁死。这版改「来源追踪」——系统每次经唯
+              一写入口写下的原始值都被记录，调整量恒
+              为「原值 + 头部增量」，不再猜；验收日志
+              改为直接量第一张通知卡的实际位置。
+            - 删除覆盖层右上角自制的通知铃铛按钮（按
+              点名）：不再绘制、不再响应点击。原头部
+              自己的铃铛不受影响。
+            - 新增「隐藏运营商文字」开关（默认开）：
+              锁屏、控制中心、通知中心左上角的运营商
+              文字（中国联通等）一并隐藏，三处共用同
+              一个系统运营商视图、一处 hook 统管；
+              在设置页「顶部样式」卡里可关。
 
-            三道门控（锁屏/控制中心/横幅）、主题背
-            景图与小模块开关保持不变。
+            三道门控（锁屏/控制中心/横幅）、垂直偏移、
+            主题背景图与小模块开关保持不变。
 
             生效方式：覆盖安装 → 强停一次系统界面 →
             下拉通知中心查看（主题与设置沿用已导入

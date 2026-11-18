@@ -5,16 +5,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Canvas
-import android.graphics.drawable.Drawable
-import android.graphics.drawable.GradientDrawable
 import android.os.BatteryManager
 import android.os.Handler
 import android.os.Looper
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
-import android.widget.ImageButton
-import android.widget.ImageView
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
@@ -157,6 +153,41 @@ import kotlin.math.roundToInt
  * 并钳制到簇顶不小于 0；跟随内容高度 = 含偏移的内容下缘，
  * 头部随之上移变矮、栈 delta 机制自动跟随。只作用于覆盖层。
  *
+ * v2.0.8：①避让改「来源追踪」根治误判——v2.0.7 真机实锤：
+ * reconcile 的 ±240 合理性窗口把 QS 分支值 501 误判为「已含
+ * 增量的调整值」、反推出根本不存在的原值 232 并锁定，
+ * topPadding 从此停在 501。猜测启发式是病根，本版废除：
+ * 写入口每次经过（含嵌套再入）都把系统刚写下的原始值记为
+ * lastSystemOriginal（我们自己的调整是直接写字段、不经此
+ * 方法，天然可区分；唯一防回声的护栏是「值等于我们刚写的
+ * 目标时不记录」），延迟复查与 tick 兜底只用
+ * target = lastSystemOriginal + delta 计算，不再有任何窗口
+ * 猜测。分支语义（反编译逐环核实）：流量分支的值是
+ * HnNotifCenterComposeImpl 的 Nssl 盒 onPlaced 回调传的
+ * localToWindow(Offset.Zero).y——栈内容起始的窗口绝对 Y
+ * （= 场景状态栏条高 + 原头部高 280，展开稳态实测 501、
+ * 收起/过渡态 280）；QS 分支（SceneContainerFlag 静态属性
+ * sys.config.scene.switchOn 关或 mBarState==2 时）=
+ * HwNotchStatusBar 高 + dimen notification_panelview_margin_top
+ * （80dp=280px，v2.0.7 记的 421+80 分解有误）。两分支的值都是
+ * 「原头部高」分量加上各自的状态条分量、写进同一字段按同一
+ * 语义解读，故统一以最后写入为准 + delta。②验收量测改真
+ * 量测：stack check 不再用 topPadding 回声拼 stackTop，改
+ * 直接量第一张通知卡的实际 window Y 与 headerBottom 比
+ * realGap。③按小乐点名删掉自制铃铛（克隆图标/点击反射整段
+ * 摘除；原头部自己的铃铛随原头部隐藏/恢复的现状不变）。
+ * ④隐藏运营商文字（默认开，stamp 第 8 行）在 CarrierHider：
+ * 三处（锁屏/控制中心/通知中心）共用同一个运营商容器视图
+ * HwOperatorNameParentView（布局 hw_operator_name_parent 被
+ * 锁屏的 HwKeyguardStatusBarView 与下拉面板的
+ * HwNotchStatusBar 各自的 HwStatusbarContents include），其
+ * setOperatorVisibility(boolean) 是可见性统一入口（方法内
+ * 日志原文 "show keyguard & notch operator"，且 Keyguard 与
+ * panel-header 两类实例会被类型逻辑强制显示、改参数无效，
+ * 故在 after 里把容器与三个运营商名 TextView 压 GONE）；
+ * ShadeCarrier 经查在本构建无布局声明、无实例化，是死代码，
+ * 不挂钩。
+ *
  * 设置经 StampStore 的 stamp.txt 跨进程传递；覆盖层挂载时与每秒
  * tick 比对戳记，变了就重解析重载——切换主题免强停。
  * 全路径 try-catch：构建/渲染任何异常都卸下覆盖层、恢复原头部、
@@ -167,17 +198,8 @@ object HeaderOverlay {
 
     private const val HEADER_CLASS_NAME =
         "com.android.systemui.statusbar.notification.header.HnNotificationCenterHeader"
-    private const val HW_UTILS_CLASS =
-        "com.android.systemui.statusbar.notification.HwNotificationUtils"
     private const val WRAPPER_MARKER = "shadeclock_overlay_wrapper"
     private const val MAX_FAILURES = 8
-
-    /**
-     * 栈顶值定性的合理性窗口（v2.0.5）：系统原值应约等于原头部
-     * 高度、含增量的值应约等于当前头部高度，允许 ±240 的系统
-     * 自有间距（沿用 v2.0.3 基线捕获的容差）。
-     */
-    private const val STACK_PLAUSIBLE_SLACK = 240
 
     // 锁屏门控（v2.0.3）：状态值与宿主 StatusBarState 的反编译源码
     // 逐一核对过（0=SHADE、1=KEYGUARD、2=SHADE_LOCKED、3=FS_USRSW）。
@@ -228,16 +250,12 @@ object HeaderOverlay {
     /** hook 回调捕获的 HeadsUpManagerImpl 实例（弱引用），供轮询直读其 mHasPinnedNotification 字段。 */
     @Volatile
     private var headsUpManagerRef: WeakReference<Any>? = null
-    @Volatile
-    private var bellClickLogCount = 0
 
     private class State(val header: ViewGroup) {
         var wrapper: FrameLayout? = null
         var mountParent: ViewGroup? = null
         var mountBounds: IntArray? = null
         var themeView: ThemeView? = null
-        var bell: ImageButton? = null
-        var bellDrawableSet = false
         var originalHeight: Int = 0
         var appliedStamp: StampStore.Stamp? = null
         var loadedThemeId: String? = null
@@ -258,10 +276,15 @@ object HeaderOverlay {
         /** 通知栈（NSSL）及其 AmbientState 的反射句柄（找到后缓存）。 */
         var stackScroller: View? = null
         var stackAmbient: Any? = null
-        /** 写入口拦截跟踪：系统最近一次写入的 topPadding 原值（未加增量）。 */
-        var hookSystemTopPadding: Int? = null
-        /** 写入口拦截跟踪：我们调整后放行的值；恢复时只认这个值。 */
-        var hookAdjustedTopPadding: Int? = null
+        /**
+         * 来源追踪（v2.0.8）：系统最近一次经写入口写下的 topPadding
+         * 原始值（未加增量）。我们自己的调整是直接写字段、不经写
+         * 入口方法，故入口 after 里读到的（且不等于我们刚写的目标
+         * 的）值必然是系统原值——不再做任何窗口猜测。
+         */
+        var lastSystemOriginal: Int? = null
+        /** 我们最近一次写下的调整目标值；恢复时只认这个值。 */
+        var lastAdjustedWritten: Int? = null
         /** 写入口调整日志计数（有界，避免刷屏）。 */
         var interceptLogCount = 0
         /** 延迟栈顶复查是否已在队列里（v2.0.7，防重复排队）。 */
@@ -628,7 +651,7 @@ object HeaderOverlay {
                     "overlay resumed: $prevReason cleared " +
                         "(state=$statusBarState, cc=${isControlCenterActive(header)}, " +
                         "hun=${isHeadsUpActive()}) " +
-                        "wrapperVis=${st.wrapper?.visibility} bellVis=${st.bell?.visibility}"
+                        "wrapperVis=${st.wrapper?.visibility}"
                 )
             }
             // 主题背景图开关（v2.0.3）：stamp 每次挂载/变更时同步给渲染器
@@ -704,11 +727,8 @@ object HeaderOverlay {
                     FrameLayout.LayoutParams.MATCH_PARENT,
                 ),
             )
-            val bell = buildBell(header, st)
-            wrapper.addView(bell)
             st.wrapper = wrapper
             st.themeView = themeView
-            st.bell = bell
 
             wrapper.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
                 override fun onViewAttachedToWindow(v: View) {
@@ -996,19 +1016,23 @@ object HeaderOverlay {
     // 偏移，不再赛跑。挂起/卸载时只在当前值仍是我们调整过的
     // 值时才恢复系统原值。
     // v2.0.5 教训：v2.0.4 的拦截不幂等且会自激（见类头 v2.0.5
-    // 段）——拦截与兜底统一走 reconcileStackTop 的写死判定，
-    // writeTopPadding 带重入保护，目标值已在位时不调更新组。
+    // 段）——拦截与兜底统一走一套判定，writeTopPadding 带重入
+    // 保护，目标值已在位时不调更新组。
     // v2.0.7 写路径枚举（dexdump 全 APK 扫字段写指令）：AmbientState
     // .mTopPadding 是 public 字段、无 setter，全包只有**一个**
     // iput 写点，就在已 hook 的 requestScrollerTopPaddingUpdate
-    // 内（jadx 源码里非锁屏/锁屏两段写块在 dex 里是共享尾巴）；
-    // 值三分支：通知页 = NotifCenterInteractor.nsslTopPadding
-    // 流量（真机 280）；!SceneContainerFlag.isSceneEnabled ||
-    // mBarState==2 时 = calculateQsTopPadding（dimen
-    // 0x7f071469 + 刘海状态栏高，真机 421+80=501）；锁屏 =
-    // NSSL.mIntrinsicPadding。NSSL 没有 setTopPadding 方法。
-    // 故拦截落点不需换，漏网是时序问题（见类头 v2.0.7 段）：
-    // 延迟复查 + 恢复/attach 主动 reconcile 补齐。
+    // 内（jadx 源码里非锁屏/锁屏两段写块在 dex 里是共享尾巴）。
+    // NSSL 没有 setTopPadding 方法。
+    // v2.0.8 来源追踪（见类头 v2.0.8 段）：判定不再靠与头部
+    // 高度的关系猜值的身份——写入口每次经过都记录系统原值
+    // lastSystemOriginal，调整目标恒为 原值 + delta。分支语义
+    // 已逐环核实：流量分支 = Nssl 盒 onPlaced 的
+    // localToWindow(Offset.Zero).y（窗口绝对 Y）；QS 分支
+    // （!SceneContainerFlag.isSceneEnabled || mBarState==2，
+    // 前者是静态属性 sys.config.scene.switchOn）=
+    // HwNotchStatusBar 高 + dimen(notification_panelview_
+    // margin_top=80dp=280px)；锁屏分支（mKeyguardShowing）=
+    // mIntrinsicPadding，拦截不记录、不调整。
 
     /** 定位 NSSL 并取其 AmbientState（从面板子树按类名找，找到后缓存）。 */
     private fun findStack(st: State): Boolean {
@@ -1138,25 +1162,23 @@ object HeaderOverlay {
         }
     }
 
-    /** 系统刚写完一次 mTopPadding：覆盖层激活时按统一判定处理。 */
+    /**
+     * 系统刚写完一次 mTopPadding：先做来源记录，再（非挂起时）
+     * 按来源追踪调整（v2.0.8）。
+     *
+     * 来源记录的原理：全包唯一的 mTopPadding 写点就在这个方法
+     * 里，我们自己的调整是直接写字段、从不经此方法——所以
+     * after 里读到的字段值，只要不等于我们刚写下的目标值，
+     * 就必然是系统本次写下的原始值，记为 lastSystemOriginal。
+     * 嵌套再入（我们写回的更新组同步触发）时同样先记录（嵌套
+     * 写落的正是系统最新原值），但不在嵌套栈里调更新组，只排
+     * 延迟复查。锁屏分支（面板 mKeyguardShowing）写的是
+     * mIntrinsicPadding、语义不同，不记录、不调整。
+     */
     private fun onSystemTopPaddingWrite(panel: View?) {
         val st = synchronized(states) {
             states.values.firstOrNull { it.wrapper != null }
         } ?: return
-        // 我们自己写回引发的重入（v2.0.5 防自激）：当场不处理，
-        // 但不能静默丢弃——写回的系统更新组会同步再入写入口，
-        // 嵌套写（v2.0.6 实证的 501）在我们的调整之后落字段、
-        // 恰好就是被这层挡掉的那次，字段从此停在原值。改为排
-        // 一次延迟复查：等本次调用栈 unwind 后再跑同一套判定
-        // （v2.0.7）。
-        if (st.stackAdjusting) {
-            scheduleStackReconcile(st)
-            return
-        }
-        // 挂起（锁屏/控制中心）时放行原值：锁屏分支写的是
-        // mIntrinsicPadding，绝不能加增量。挂起期写过的值在
-        // 门控恢复/attach 时由主动 reconcile 补账（v2.0.7）。
-        if (st.suspended) return
         if (panel != null) {
             val keyguardShowing = try {
                 XposedHelpers.getBooleanField(panel, "mKeyguardShowing")
@@ -1167,22 +1189,37 @@ object HeaderOverlay {
         }
         if (!findStack(st)) return
         val cur = readTopPadding(st) ?: return
-        reconcileStackTop(st, cur)
-        // 写后复查兜底（v2.0.7）：reconcile 的写回本身也可能被
-        // 更新组引发的嵌套写覆盖（同上时序），排一次延迟复查
-        // 读回校验；已在位时复查是零写入空转，不增开销。
+        // 来源记录（回声护栏：值等于我们刚写的目标时，可能是方法
+        // 体因「值未变」没写、after 读到的是我们的值，不记录）
+        if (cur != st.lastAdjustedWritten) {
+            st.lastSystemOriginal = cur
+        }
+        // 我们自己写回引发的嵌套再入（v2.0.5 防自激）：只记录 +
+        // 排延迟复查，不在嵌套栈里做调整——嵌套写（v2.0.6 实证
+        // 的 501）落字段后，等调用栈 unwind 由复查按最新原值补。
+        if (st.stackAdjusting) {
+            scheduleStackReconcile(st)
+            return
+        }
+        // 挂起（控制中心/横幅）时只记录不调整：挂起期系统写的
+        // 值在门控恢复/attach 时由主动 reconcile 补账（v2.0.7）。
+        if (st.suspended) return
+        reconcileFromSource(st)
+        // 写后复查兜底（v2.0.7）：我们的写回也可能被更新组引发
+        // 的嵌套写覆盖（同上时序），排一次延迟复查读回校验；
+        // 已在位时复查是零写入空转，不增开销。
         scheduleStackReconcile(st)
     }
 
     /**
-     * 延迟栈顶复查（v2.0.7）：post 到 State 的 handler，等当前
-     * 调用栈（系统写入口/我们的写回更新组）unwind 后再跑一次
-     * [ensureStackAdjusted]——专治「嵌套写在我们调整之后落字段、
-     * 其 hook 又被重入保护挡掉」的覆盖时序（v2.0.6 的 501 漏
-     * 网）。复查后读回校验：跟踪调整值与字段不一致且重试未尽
-     * 时递增间隔再排一次（嵌套写只在面板活跃重排时出现，布局
-     * 落定后我们的写即粘住）；上限后交给每秒 tick 兜底。挂起
-     * 中/状态已卸载时不动作（恢复路径另有主动 reconcile）。
+     * 延迟栈顶复查（v2.0.7，v2.0.8 改按来源追踪校验）：post 到
+     * State 的 handler，等当前调用栈（系统写入口/我们的写回
+     * 更新组）unwind 后再跑一次 [ensureStackAdjusted]。复查后
+     * 读回校验：字段值与「lastSystemOriginal + 当前 delta」不
+     * 一致且重试未尽时递增间隔再排一次（嵌套写只在面板活跃
+     * 重排时出现，布局落定后我们的写即粘住）；上限后交给每秒
+     * tick 兜底。挂起中/状态已卸载时不动作（恢复路径另有主动
+     * reconcile）。
      */
     private fun scheduleStackReconcile(st: State) {
         if (st.stackReconcilePosted) return
@@ -1193,9 +1230,15 @@ object HeaderOverlay {
                 val registered = synchronized(states) { states[st.header] === st }
                 if (!registered || st.suspended) return@post
                 ensureStackAdjusted(st)
-                val adj = st.hookAdjustedTopPadding
-                val cur = if (adj != null) readTopPadding(st) else null
-                if (adj != null && cur != null && cur != adj &&
+                val sys = st.lastSystemOriginal
+                val target = if (sys != null && st.originalHeight > 0) {
+                    val delta = st.header.height - st.originalHeight
+                    if (delta > 0) sys + delta else sys
+                } else {
+                    null
+                }
+                val cur = if (target != null) readTopPadding(st) else null
+                if (target != null && cur != null && cur != target &&
                     st.stackReconcileRetries < 3
                 ) {
                     st.stackReconcileRetries++
@@ -1226,240 +1269,71 @@ object HeaderOverlay {
     }
 
     /**
-     * 栈顶统一判定（v2.0.5，拦截与 tick 兜底共用，判定规则写死）：
-     * 维护 (hookSystemTopPadding=系统原值, hookAdjustedTopPadding=
-     * 调整值) 一对跟踪值，对当前值 cur 按当前头部增量 delta 定性：
-     * - delta ≤ 0：cur 即原值，校准基准；若 cur 还是我们旧的调整
-     *   值且头部已复原，写回原值清残值。
-     * - cur == 调整值：回声（系统把调整过的值又写回来/我们写回的
-     *   同步回读），已正确跳过；仅当 delta 已变（头部又长高/缩回）
-     *   时按新 delta 重算一次。
-     * - cur == 原值：纯系统原值，加增量放行。
-     * - cur == 原值 + delta：系统已按变高后的头部量出（SystemUI
-     *   重启过渡期实证：先量出 909）、增量已含，认作已正确不加，
-     *   只把跟踪调整值更新为 cur（v2.0.4 在这里误当原值再加，
-     *   1538/2167 即此）。
-     * - 其余未知值：按合理性窗口定性一次——约等于当前头部高度
-     *   （±[STACK_PLAUSIBLE_SLACK]）视为已含增量并反推原值；约
-     *   等于原头部高度视为原值并加增量；都对不上则原样采用为
-     *   原值候选、本轮不加，等后续确切匹配再处理。
-     * 任何分支里目标值与现值相同都不调用系统更新组（见
-     * [applyStackDelta]）。
+     * 栈顶调整（v2.0.8 来源追踪，拦截/延迟复查/tick 兜底共用）：
+     * 目标恒为 lastSystemOriginal + delta（delta = 当前头部高 −
+     * 原头部高）——系统最后写入的原值就是它对当前状态的答案，
+     * 我们的头部在同一坐标系里长高了 delta，栈顶随之加 delta，
+     * 不对值的身份做任何猜测（v2.0.5–v2.0.7 的 ±240 窗口定性
+     * 已废除：它曾把 501 误判成含增量的值、反推出不存在的
+     * 原值 232 并锁定）。
+     * - 还没记录到系统原值：不动，等写入口先经过。
+     * - delta ≤ 0（头部已复原）：当前值若仍是我们写过的调整
+     *   值，写回系统原值清残值。
+     * - 当前值已等于目标：只更新跟踪，绝不调用系统更新组
+     *   （面板动画期间逐帧整套重排是卡顿主因之一，v2.0.5）。
      */
-    private fun reconcileStackTop(st: State, cur: Int) {
+    private fun reconcileFromSource(st: State) {
         if (st.stackAdjusting) return
-        val origH = st.originalHeight
-        if (origH <= 0) return
-        val delta = st.header.height - origH
-        val sys = st.hookSystemTopPadding
-        val adj = st.hookAdjustedTopPadding
-        when {
-            delta <= 0 -> {
-                if (adj != null && cur == adj && sys != null) {
-                    writeTopPadding(st, sys)
-                    st.hookAdjustedTopPadding = null
-                    logFn("stack sync: topPadding restored to system value $sys (delta back to 0)")
-                } else if (cur != adj) {
-                    st.hookSystemTopPadding = cur
-                    st.hookAdjustedTopPadding = null
-                }
-            }
-            adj != null && cur == adj -> {
-                if (sys != null && adj != sys + delta) {
-                    applyStackDelta(st, sys)
-                }
-            }
-            sys != null && cur == sys -> {
-                applyStackDelta(st, cur)
-            }
-            sys != null && cur == sys + delta -> {
-                st.hookAdjustedTopPadding = cur
-                logIntercept(
-                    st,
-                    "stack write already includes delta: value=$cur " +
-                        "(system=$sys + delta=$delta), left as-is",
-                )
-            }
-            else -> {
-                when {
-                    abs(cur - st.header.height) <= STACK_PLAUSIBLE_SLACK -> {
-                        st.hookSystemTopPadding = cur - delta
-                        st.hookAdjustedTopPadding = cur
-                        logIntercept(
-                            st,
-                            "stack write adopted as already-adjusted: value=$cur, " +
-                                "derived system=${cur - delta} (delta=$delta)",
-                        )
-                    }
-                    abs(cur - origH) <= STACK_PLAUSIBLE_SLACK -> {
-                        st.hookSystemTopPadding = cur
-                        applyStackDelta(st, cur)
-                    }
-                    else -> {
-                        st.hookSystemTopPadding = cur
-                        st.hookAdjustedTopPadding = null
-                        logIntercept(
-                            st,
-                            "stack write adopted as-is (unclassified): value=$cur delta=$delta",
-                        )
-                    }
-                }
-            }
-        }
-    }
-
-    /** 把系统原值加上头部高度增量写回（增量 ≤0 时不写、保持原值）。 */
-    private fun applyStackDelta(st: State, systemValue: Int) {
         if (st.originalHeight <= 0) return
+        val sys = st.lastSystemOriginal ?: return
         val delta = st.header.height - st.originalHeight
-        if (delta <= 0) return
-        val target = systemValue + delta
-        // 目标值已在位：只更新跟踪，绝不调用那套更新方法（v2.0.5；
-        // 面板动画期间系统逐帧写栈顶，每帧整套重排是卡顿主因之一）
-        if (readTopPadding(st) == target) {
-            st.hookAdjustedTopPadding = target
+        val cur = readTopPadding(st) ?: return
+        if (delta <= 0) {
+            val adj = st.lastAdjustedWritten
+            if (adj != null && cur == adj && cur != sys) {
+                writeTopPadding(st, sys)
+                logFn("stack sync: topPadding restored to system value $sys (delta back to 0)")
+            }
+            if (cur == sys) st.lastAdjustedWritten = null
+            return
+        }
+        val target = sys + delta
+        if (cur == target) {
+            st.lastAdjustedWritten = target
             return
         }
         writeTopPadding(st, target)
-        st.hookAdjustedTopPadding = target
+        st.lastAdjustedWritten = target
         logIntercept(
             st,
-            "stack write adjusted: system=$systemValue + delta=$delta -> $target",
+            "stack write adjusted: system=$sys + delta=$delta -> $target",
         )
     }
 
     /**
-     * tick/布局兜底（v2.0.5）：写入口拦截是主路径；这里只把当前值
-     * 交给同一套判定（[reconcileStackTop]）——稳态下当前值恒等于
-     * 调整值，走回声分支零写入；漏网的系统复位/高度变化会被它
-     * 识别并补一次，绝不叠加双加。
+     * tick/布局兜底（v2.0.5 起）：写入口拦截是主路径；这里只跑
+     * 同一套来源追踪调整（[reconcileFromSource]）——稳态下当前
+     * 值恒等于目标，零写入；系统在挂起期/漏网时机写过的值会
+     * 按记录的原值补一次，绝不叠加双加（没有记录就不动）。
      */
     private fun ensureStackAdjusted(st: State) {
         if (st.suspended || st.originalHeight <= 0) return
         if (st.stackAdjusting) return
         if (!findStack(st)) return
-        val cur = readTopPadding(st) ?: return
-        reconcileStackTop(st, cur)
+        reconcileFromSource(st)
     }
 
     /** 恢复栈顶：只在当前值仍是我们调整过的值时写回系统原值（挂起/卸载时调用）。 */
     private fun restoreStackTop(st: State) {
         if (st.stackAdjusting) return
-        val adjusted = st.hookAdjustedTopPadding ?: return
-        st.hookAdjustedTopPadding = null
-        val sys = st.hookSystemTopPadding ?: return
+        val adjusted = st.lastAdjustedWritten ?: return
+        st.lastAdjustedWritten = null
+        val sys = st.lastSystemOriginal ?: return
         if (!findStack(st)) return
         val cur = readTopPadding(st) ?: return
         if (cur == adjusted) {
             writeTopPadding(st, sys)
             logFn("stack sync: topPadding restored to system value $sys")
-        }
-    }
-
-    // ---------- 铃铛 ----------
-
-    private fun buildBell(header: ViewGroup, st: State): ImageButton {
-        val ctx = header.context
-        val density = ctx.resources.displayMetrics.density
-        fun dp(v: Int): Int = (v * density).roundToInt()
-        val bell = ImageButton(ctx)
-        val size = dp(34)
-        val lp = FrameLayout.LayoutParams(size, size)
-        lp.gravity = android.view.Gravity.TOP or android.view.Gravity.END
-        lp.topMargin = dp(34)
-        lp.rightMargin = dp(20)
-        bell.layoutParams = lp
-        val circle = GradientDrawable().apply {
-            shape = GradientDrawable.OVAL
-            setColor(0x59000000)
-        }
-        bell.background = circle
-        bell.setPadding(dp(7), dp(7), dp(7), dp(7))
-        bell.scaleType = ImageView.ScaleType.FIT_CENTER
-        // 主题背景多为深色（云镜是蓝天图），克隆来的原铃铛图标是深色
-        // 描画、在半透明深色圆底上几乎看不见：统一白色 tint（v2.0.3）。
-        // imageTintList 与 drawable 解耦，后续 tick 里补设图标也生效。
-        bell.imageTintList = android.content.res.ColorStateList.valueOf(
-            android.graphics.Color.WHITE
-        )
-        bell.contentDescription = "通知管理"
-        trySetBellDrawable(header, st, bell)
-        bell.setOnClickListener { onBellClick(header) }
-        return bell
-    }
-
-    /** 铃铛图标：优先克隆头部里真实 NotifMgeBtn 的图，其次按资源名找。 */
-    private fun trySetBellDrawable(header: ViewGroup, st: State, bell: ImageButton) {
-        if (st.bellDrawableSet) return
-        try {
-            findRealBellDrawable(header, st.wrapper)?.let {
-                bell.setImageDrawable(it)
-                st.bellDrawableSet = true
-                return
-            }
-            val res = header.resources
-            for (name in listOf("ic_hnnotification_setting_filled", "notif_settings_button")) {
-                val id = res.getIdentifier(name, "drawable", "com.android.systemui")
-                if (id != 0) {
-                    bell.setImageDrawable(res.getDrawable(id, header.context.theme))
-                    st.bellDrawableSet = true
-                    logFn("overlay bell icon: drawable $name")
-                    return
-                }
-            }
-        } catch (t: Throwable) {
-            logFn("overlay bell icon resolve failed: ${t.javaClass.name}: ${t.message}")
-        }
-    }
-
-    private fun findRealBellDrawable(root: View, exclude: View?): Drawable? {
-        if (root === exclude) return null
-        if (root.javaClass.name.endsWith("NotifMgeBtn")) {
-            (root as? ImageView)?.drawable?.let { return cloneDrawable(it) }
-            root.background?.let { return cloneDrawable(it) }
-            if (root is ViewGroup) {
-                for (i in 0 until root.childCount) {
-                    (root.getChildAt(i) as? ImageView)?.drawable?.let { return cloneDrawable(it) }
-                }
-            }
-        }
-        if (root is ViewGroup) {
-            for (i in 0 until root.childCount) {
-                findRealBellDrawable(root.getChildAt(i), exclude)?.let { return it }
-            }
-        }
-        return null
-    }
-
-    private fun cloneDrawable(d: Drawable): Drawable =
-        d.constantState?.newDrawable() ?: d
-
-    private fun onBellClick(header: ViewGroup) {
-        val ctx = header.context
-        try {
-            val utilsClass = XposedHelpers.findClass(HW_UTILS_CLASS, ctx.classLoader)
-            val intent = XposedHelpers.callStaticMethod(
-                utilsClass, "getManageNotificationsIntent"
-            ) as Intent
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            ctx.startActivity(intent)
-            if (bellClickLogCount < 3) {
-                bellClickLogCount++
-                logFn("bell click: opened manage-notifications intent from HwNotificationUtils")
-            }
-        } catch (t: Throwable) {
-            logFn(
-                "bell click: HwNotificationUtils path failed " +
-                    "(${t.javaClass.name}: ${t.message}), fallback to notification settings"
-            )
-            try {
-                ctx.startActivity(
-                    Intent("android.settings.NOTIFICATION_SETTINGS")
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                )
-            } catch (t2: Throwable) {
-                logFn("bell click fallback failed: ${t2.javaClass.name}: ${t2.message}")
-            }
         }
     }
 
@@ -1591,9 +1465,6 @@ object HeaderOverlay {
                         // 通知栈顶兜底（主路径是写入口拦截，见
                         // installStackWriteInterceptor）
                         ensureStackAdjusted(st)
-                        if (!st.bellDrawableSet) {
-                            st.bell?.let { trySetBellDrawable(st.header, st, it) }
-                        }
                     }
                     logDiag(st)
                     WeatherSource.maybeRefresh(st.header.context)
@@ -1668,34 +1539,51 @@ object HeaderOverlay {
             "overlay height check #${st.diagTicks}: computed=$computed " +
                 "contentMaxBottom=${st.renderer.contentBottomPx} headerH=${header.height}"
         )
-        // 栈顶核对（v2.0.3 第 6 项 / v2.0.4 拦截口径）：头部下缘 vs
-        // 栈顶实际 Y（均为 window 坐标）；拦截生效后 gap 应回到系统
-        // 原有间距（系统原值 - 原头部下缘），而不是负数（通知钻进
-        // 覆盖层）。system/adjusted 为写入口拦截的跟踪值。
+        // 栈顶核对（v2.0.8 改真量测）：旧口径用「栈视图 window Y +
+        // topPadding + translation」拼 stackTop——那只是 topPadding
+        // 的回声（历版数据可证 stackTop 恒等于 topPadding），不是
+        // 独立量测，gap 数字一直在自证。改直接量第一张通知卡
+        // （NSSL 第一个可见且有高度的子视图，优先类名含
+        // ExpandableNotificationRow 的行）的实际 window Y，与
+        // headerBottom 比 realGap：≈0 才是真对齐，负数是通知真
+        // 钻进了覆盖层。system/adjusted 为来源追踪的记录值。
         val stack = st.stackScroller
-        val ambient = st.stackAmbient
-        if (stack != null && ambient != null) {
+        if (stack != null) {
             val hLoc = IntArray(2)
             header.getLocationOnScreen(hLoc)
-            val sLoc = IntArray(2)
-            stack.getLocationOnScreen(sLoc)
-            val tp = readTopPadding(st)
-            val translation = try {
-                XposedHelpers.getFloatField(ambient, "mStackTranslation")
-            } catch (t: Throwable) {
-                0f
-            }
             val headerBottom = hLoc[1] + header.height
-            val stackTop = if (tp != null) {
-                sLoc[1] + tp + translation.roundToInt()
-            } else {
-                -1
+            var firstCardY: Int? = null
+            var firstCardClass = ""
+            if (stack is ViewGroup) {
+                var fallbackY: Int? = null
+                var fallbackClass = ""
+                for (idx in 0 until stack.childCount) {
+                    val child = stack.getChildAt(idx)
+                    if (child.visibility != View.VISIBLE || child.height <= 0) continue
+                    val cLoc = IntArray(2)
+                    child.getLocationOnScreen(cLoc)
+                    if (child.javaClass.name.contains("ExpandableNotificationRow")) {
+                        firstCardY = cLoc[1]
+                        firstCardClass = child.javaClass.simpleName
+                        break
+                    }
+                    if (fallbackY == null) {
+                        fallbackY = cLoc[1]
+                        fallbackClass = child.javaClass.simpleName
+                    }
+                }
+                if (firstCardY == null && fallbackY != null) {
+                    firstCardY = fallbackY
+                    firstCardClass = fallbackClass
+                }
             }
+            val tp = readTopPadding(st)
             logFn(
                 "overlay stack check #${st.diagTicks}: headerBottom=$headerBottom " +
-                    "stackTop=$stackTop gap=${stackTop - headerBottom} " +
-                    "topPadding=$tp system=${st.hookSystemTopPadding} " +
-                    "adjusted=${st.hookAdjustedTopPadding} suspended=${st.suspended}"
+                    "firstCardY=${firstCardY ?: "none"}($firstCardClass) " +
+                    "realGap=${firstCardY?.let { it - headerBottom } ?: "n/a"} " +
+                    "topPadding=$tp system=${st.lastSystemOriginal} " +
+                    "adjusted=${st.lastAdjustedWritten} suspended=${st.suspended}"
             )
         } else {
             logFn("overlay stack check #${st.diagTicks}: stack not located yet")
@@ -1704,10 +1592,10 @@ object HeaderOverlay {
 
     /**
      * 页态挂起（v2.0.3 锁屏 / v2.0.4 控制中心 / v2.0.6 横幅）：把覆盖层整组
-     * （含铃铛）藏起来、原头部内容与高度恢复原样，但保留 State 与
+     * 藏起来、原头部内容与高度恢复原样，但保留 State 与
      * tick——回到通知中心页后 tick 会经 attach 自动恢复挂载。
      * 与 teardown 的区别：不摘状态、不停 tick。挂起/原因变化时各
-     * 记一行，带 wrapper 与铃铛的可见性数值（0=VISIBLE、8=GONE），
+     * 记一行，带 wrapper 的可见性数值（0=VISIBLE、8=GONE），
      * 便于核对整组是否真的撤下去了。
      */
     private fun suspendOverlay(header: ViewGroup, st: State, reason: String) {
@@ -1740,7 +1628,7 @@ object HeaderOverlay {
             logFn(
                 "overlay suspended: $reason (state=$statusBarState, " +
                     "cc=${isControlCenterActive(header)}, hun=${isHeadsUpActive()}) " +
-                    "wrapperVis=${st.wrapper?.visibility} bellVis=${st.bell?.visibility}"
+                    "wrapperVis=${st.wrapper?.visibility}"
             )
         }
     }

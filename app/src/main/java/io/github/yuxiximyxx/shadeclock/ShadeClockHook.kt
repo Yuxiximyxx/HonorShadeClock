@@ -21,10 +21,13 @@ import kotlin.math.roundToInt
  * 两块互相独立：
  * 1. 覆盖层（HeaderOverlay）：隐藏头部 Compose 内容、自绘覆盖层按
  *    选中的锁屏主题渲染（数据驱动，/sdcard/Download/HonorShadeClock/
- *    themes/<id>/），高度三档（跟随内容/1/3/1/2），铃铛复刻；
+ *    themes/<id>/），高度三档（跟随内容/1/3/1/2）；
  *    设置经 stamp.txt 跨进程传递，切换免强停；异常全回退原头部。
  *    v1.1.x 的居中 hook（Lambda9 与 DateAndTime MeasurePolicy 两套）
- *    已整体下线。
+ *    已整体下线；自制铃铛已于 v2.0.8 按小乐点名删除。
+ * 3. 隐藏运营商文字（CarrierHider，v2.0.8）：锁屏/控制中心/通知
+ *    中心三处共用的 HwOperatorNameParentView 按开关（默认开，
+ *    stamp 第 8 行）压 GONE，与覆盖层开关相互独立。
  * 2. 放大（资源替换）：覆盖层关闭（原系统头部模式）时仍生效——
  *    handleInitPackageResources 里把 SystemUI 的
  *    dimen/notif_center_header_clock_text_size（默认 40dp）、
@@ -147,9 +150,11 @@ class ShadeClockHook : IXposedHookLoadPackage, IXposedHookInitPackageResources {
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != TARGET_PACKAGE) return
-        diag("=== HonorShadeClock v2.0.4 loaded in $TARGET_PACKAGE ===")
+        diag("=== HonorShadeClock v2.0.8 loaded in $TARGET_PACKAGE ===")
         installDimenDiagnostic(lpparam)
         HeaderOverlay.install(lpparam) { message -> diag(message) }
+        // 隐藏运营商文字（v2.0.8）：与覆盖层相互独立，原头部模式下同样生效
+        CarrierHider.install(lpparam) { message -> diag(message) }
     }
 
     /**
