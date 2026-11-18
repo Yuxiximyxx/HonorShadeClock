@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.16-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.17-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.16-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.17-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,38 +68,43 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.16
-          name: HonorShadeClock 2.0.16 — 修重启后只有第一次下拉不空白
+          tag_name: v2.0.17
+          name: HonorShadeClock 2.0.17 — 修多次下拉仍不稳定（拆除显隐门）
           body: |
-            ## HonorShadeClock 2.0.16
+            ## HonorShadeClock 2.0.17
 
-            单项修复：重启系统界面后第一次下拉是
-            好的（时钟直接就在），之后每次下拉又
-            变回先空白、再闪出时钟。
+            单项修复：2.0.16 后多次下拉仍不稳——
+            第一拉在场、二拉中段样式缺席、三拉面
+            板已开头部仍全空。
 
-            - 根因（真机日志对位 + 反编译核实）：
-              样式的显隐还压着一道「容器可见」门。
-              这道门在进程启动时是开着的，所以第一
-              次下拉全程在场；但宿主只在关闭动画落
-              定时把它写关，之后要等下一次下拉进度
-              过约三成、头部动画集创建时才写开——
-              后续每次下拉的跟手阶段整簇就被这道门
-              压在空白里，门开才整幅闪出。
-            - 修法：另接一路更早的信号——桌面下拉
-              手势的进度从第一帧起逐帧跟踪，手指一
-              动门就开，样式随面板一起下来，与第一
-              次下拉完全一致；关闭落定时两道门一起
-              关，面板全关不残留的兜底不变。
+            - 根因（真机日志逐拉对位）：2.0.16 新
+              接的下拉进度信号在真实下拉路径上从未
+              触发（日志里一次都没出现），并联门从
+              未开过；而原有的「容器可见」门在一次
+              会话里反复翻转约 15 次，连面板已开时
+              都出现关闭段——第二、三拉的空白都与
+              它的关闭段对位。两道二值门都不可靠。
+            - 决定性反证：日志里有整段面板全关的
+              时段，覆盖层透明度明明是满值、持续数
+              十秒，桌面却始终干净——覆盖层在通知
+              栏窗口内部，面板收起时窗口整体隐藏，
+              满透明度也画不出来，「全关后残留桌
+              面」的担心在本机不成立。
+            - 修法：整道二值门拆除，样式透明度只
+              跟时钟本体通道（关闭动画期间宿主会
+              把通道写到 0，整簇仍随面板淡出）。
+              两道门的跟踪值保留在诊断日志里备查，
+              不再参与显示。
 
             其余功能（面板开合/页面切换跟随、通知
             避让、运营商隐藏、锁屏预挂起、重启系统
-            界面按钮、垂直偏移、各开关）与 2.0.15
+            界面按钮、垂直偏移、各开关）与 2.0.16
             完全一致，未做任何改动。
 
             生效方式：覆盖安装 → 用设置页「重启系
             统界面」按钮（或强停一次系统界面）→ 连
             续下拉几次通知中心，看是否每次第一帧
-            时钟都在。
+            时钟都在、且收起后桌面无残留。
             关闭办法：在 LSPosed 里停用模块再重启
             一次系统界面，即恢复原样。
           files: dist/*.apk

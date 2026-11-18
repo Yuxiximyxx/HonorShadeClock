@@ -153,7 +153,7 @@ class ShadeClockHook : IXposedHookLoadPackage, IXposedHookInitPackageResources {
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != TARGET_PACKAGE) return
-        diag("=== HonorShadeClock v2.0.14 loaded in $TARGET_PACKAGE ===")
+        diag("=== HonorShadeClock v${BuildConfig.VERSION_NAME} loaded in $TARGET_PACKAGE ===")
         installDimenDiagnostic(lpparam)
         HeaderOverlay.install(lpparam) { message -> diag(message) }
         // 隐藏运营商文字（v2.0.8）：与覆盖层相互独立，原头部模式下同样生效

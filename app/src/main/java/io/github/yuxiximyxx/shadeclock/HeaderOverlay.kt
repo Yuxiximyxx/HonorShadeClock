@@ -500,6 +500,12 @@ object HeaderOverlay {
      * CombineAlpha 与本跟踪值的初值都是 true、还没被关过。
      * 下拉一开始（progress 从 0 起）就开门，覆盖层从第一帧跟
      * time 路亮起、随面板位置下行，与第一次下拉表现一致。
+     *
+     * v2.0.17 注：真机日志证明该回调在状态栏下拉路径上从未
+     * 触发（见 [effectiveShadeAlpha] 注），本变量与
+     * [shadeContainerVisible] 自 v2.0.17 起只作诊断记录、不再
+     * 参与 alpha 合成；hook 保留装着（无害，其余手势路径若
+     * 喂到仍会打一行日志供核对）。
      */
     @Volatile
     private var shadePullTracking = false
@@ -515,10 +521,10 @@ object HeaderOverlay {
     private var animFollowHookActive = false
 
     /**
-     * 覆盖层应有的有效 alpha：容器不可见时恒 0（宿主收尾态就是
-     * 靠 visible=false 藏头部、alpha 反而复位 1——只抄 alpha 会
-     * 在面板全关后残留在桌面上）；可见时只跟 **time 路**（v2.0.15
-     * 改，v2.0.12–v2.0.14 是取两路较小者）。改的依据是两路的
+     * 覆盖层应有的有效 alpha：只跟 **time 路**（v2.0.15 起，
+     * v2.0.12–v2.0.14 是取两路较小者；v2.0.12–v2.0.16 另有
+     * 容器可见二值门压底，v2.0.17 已拆除，见本注末段）。改的
+     * 依据是两路的
      * 语义（反编译 NotifCenterHeaderKt 核实）：time 路驱动的
      * 正是时钟本体（DateAndTime 收集 timeAlpha），common 路
      * 驱动日期/流量等公共元素（收集 commonAlpha 时同场读的
@@ -530,8 +536,9 @@ object HeaderOverlay {
      * 的成因。覆盖层整簇的主体就是时钟样式，单 View 也拆不开
      * 两路，跟 time 路即与原时钟同帧。其余过渡不受影响：页面
      * 切换 setViewAlpha 对两路同帧同值、开合 fling 动画集对
-     * 两路同写，time 路一条即载全程；收尾仍有 visible=false
-     * 的 0 门兜底，面板全关不残留。
+     * 两路同写，time 路一条即载全程。（v2.0.17 前此处还有
+     * 「收尾 visible=false 的 0 门兜底」一说，已被真机日志
+     * 证伪拆除，见本注末段。）
      *
      * v2.0.15 真机又报「重启后第一次下拉是好的、之后又先空白
      * 再闪出」：迟到的不再是 alpha 通道而是这道 visible 门
@@ -541,15 +548,32 @@ object HeaderOverlay {
      * 场景落定 Idle；而写 false 在关闭动画落定。故第一次关闭
      * 之后 visible 就停在 false，后续每次下拉的前段（跟手
      * 期）整簇被门压死、等门开了才整幅闪出；第一次下拉没被
-     * 关过、初值 true 才全程在场。故 v2.0.16 起门改为二选一：
-     * visible 为 true，或下拉跟踪门 [shadePullTracking] 已开
-     * （桌面下拉 progress>0）。全关静止时两者皆关（visible
-     * 在关闭落定写 false 的同一处把跟踪门也清位），桌面不
-     * 残留的兜底不变。
+     * 关过、初值 true 才全程在场。v2.0.16 曾给门加并联的下拉
+     * 跟踪门（[shadePullTracking]），v2.0.17 真机日志（重启后
+     * 三次下拉）证明这条并联从未导通、且 visible 门本身就是
+     * 不稳定源，故整道二值门拆除、alpha 只跟 time 路：
+     * - 下拉跟踪门装上了（日志 `shade pull gate hooks
+     *   installed (2/2 ...)`）但整个会话 `shade pull tracking`
+     *   一次都没出现、10 条 diag 里 pullTrk 恒 false——状态栏
+     *   下拉的真实路径不经过那两个检测器的 onProgressUpdate，
+     *   并联门从未开过；
+     * - visible 标志在该会话翻转约 15 次，含面板已开/打开中
+     *   的 false 段——第二、三拉的空白与它逐段对位（二拉中段
+     *   缺席、三拉面板已开头部仍空）；
+     * - 决定性反证：面板全关时段的 diag（首拉前 State #1、
+     *   中途重挂载后 State #2 的 #1–#5）里 wrapper 都是
+     *   vis=VISIBLE、alpha=1.0、effA=1.0 且持续数十秒，而小乐
+     *   录屏同期的桌面画面干净——覆盖层是通知栏窗口内的同级
+     *   View，面板收起时窗口整体隐藏，alpha=1 也画不出来，
+     *   v2.0.12 担心的「全关后残留桌面」在本机构建上不成立；
+     *   关闭动画期间宿主动画器又把两路 alpha 同写到 0（见
+     *   v2.0.12 合成注），整簇随面板淡出。
+     * [shadeContainerVisible] 与 [shadePullTracking] 自此只作
+     * 诊断记录（diag 的 visFlag/pullTrk 字段与翻转日志保留），
+     * 不再参与合成。
      */
     private fun effectiveShadeAlpha(): Float =
-        if (!shadeContainerVisible && !shadePullTracking) 0f
-        else shadeTimeAlpha.coerceIn(0f, 1f)
+        shadeTimeAlpha.coerceIn(0f, 1f)
 
     /** 预热好的主题（install 阶段后台线程 load + 位图预解码完成），attach 时按 (themeId, stamp) 吻合采纳。 */
     private class PreheatedTheme(
@@ -825,9 +849,9 @@ object HeaderOverlay {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val v = (param.args.getOrNull(0) as? Boolean) ?: return
                         if (!v) {
-                            // 关闭落定：下拉跟踪门一并清位，保证全关
-                            // 静止时两门皆关（v2.0.16，见
-                            // effectiveShadeAlpha 注）。
+                            // 关闭落定：下拉跟踪记录一并清位（v2.0.16
+                            // 起如此；v2.0.17 起两者只作诊断记录、
+                            // 不再参与合成，见 effectiveShadeAlpha 注）。
                             shadePullTracking = false
                         }
                         if (v != shadeContainerVisible) {
@@ -872,8 +896,13 @@ object HeaderOverlay {
      * 就跟 time 路亮起；progress 回到 0（取消回弹到顶）即清
      * 位。关闭落定的清位在 updateContainerVisible(false) 的
      * 同一处（见 installHeaderAnimFollow）。任一 hook 装失败
-     * 只记一行、门退化为只认 visible（即 v2.0.15 行为），其
-     * 余功能不受影响。
+     * 只记一行，其余功能不受影响。
+     *
+     * v2.0.17 注：真机日志（重启后三次下拉）证明该回调在状态
+     * 栏下拉路径上从未触发——两个检测器虽在类与方法层面装上
+     * 了（2/2），宿主的实际下拉并不经它们。本 hook 自
+     * v2.0.17 起只作诊断保留，[shadePullTracking] 不再参与
+     * alpha 合成（见 [effectiveShadeAlpha] 注）。
      */
     private fun installShadePullGate(
         lpparam: XC_LoadPackage.LoadPackageParam,
@@ -949,11 +978,13 @@ object HeaderOverlay {
     private fun applyComposedTransform(st: State) {
         val wrapper = st.wrapper ?: return
         // alpha 斜率限制（v2.0.14，修进出通知中心闪烁）：合成目标
-        // 有两个硬跳变输入——容器可见标志是二值门（日志实证它在
+        // 曾有两个硬跳变输入——容器可见标志是二值门（日志实证它在
         // 过渡期会成串交替翻转，每翻一次旧口径就把 alpha 在 0 与
-        // 通道值之间砸一个来回）；卷帘跟踪时两路 alpha 又是分开
-        // 写的，min() 跟着先跳的那一路走（真机 diag 抓到开合中段
-        // effA 在相邻两秒间 0↔1 直跳、平移还在动）。故已应用值
+        // 通道值之间砸一个来回；该门已于 v2.0.17 拆除）；卷帘跟踪
+        // 时两路 alpha 又是分开写的，min() 跟着先跳的那一路走
+        // （真机 diag 抓到开合中段 effA 在相邻两秒间 0↔1 直跳、
+        // 平移还在动；min() 合成已于 v2.0.15 改为只跟 time 路）。
+        // 斜率限制保留作通道侧毛刺的兜底平滑。故已应用值
         // 不许直跳目标：按真实时间把每步移动量封顶为「全程
         // 90ms」——宿主自己的动画器都是 200ms 起、跟踪渐变是
         // 手指速度，都比封顶慢、原样通过；单帧毛刺（可见标志
