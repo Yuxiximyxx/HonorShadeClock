@@ -54,9 +54,15 @@ object StampStore {
     const val HEIGHT_THIRD = 1
     const val HEIGHT_HALF = 2
 
-    /** 覆盖层垂直偏移范围（dp）：负值上移、正值下移（v2.0.7）。 */
-    const val OFFSET_DP_MIN = -120
-    const val OFFSET_DP_MAX = 40
+    /**
+     * 覆盖层垂直偏移范围（dp）：负值上移、正值下移（v2.0.7 立
+     * -120～+40；v2.0.24 放宽到 -400～+160：有些主题的时钟簇
+     * 本身在画布中部偏下，-120 拉满仍偏下）。只是滑杆/落盘的
+     * 钳制界，存量已存值（如 -120）仍在界内、原样有效；戳记
+     * 行位与 dp 语义不变。
+     */
+    const val OFFSET_DP_MIN = -400
+    const val OFFSET_DP_MAX = 160
 
     /** 覆盖层水平偏移范围（dp）：负值左移、正值右移，对称（v2.0.23）。 */
     const val OFFSET_X_DP_MIN = -120

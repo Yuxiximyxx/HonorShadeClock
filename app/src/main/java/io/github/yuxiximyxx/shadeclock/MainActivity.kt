@@ -2,13 +2,20 @@ package io.github.yuxiximyxx.shadeclock
 
 import android.app.Activity
 import android.content.Context
+import android.content.SharedPreferences
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -28,6 +35,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
@@ -53,7 +61,8 @@ import top.yukonga.miuix.kmp.theme.ThemeController
 /**
  * 设置页（v2.0.3 起）：顶部样式（原系统头部 / 锁屏主题样式）、主题
  * 管理（导入/切换/删除）、区域高度三档、字号滑杆（原头部模式）；
- * v2.0.7 加「垂直偏移」滑杆（-120dp～+40dp，覆盖层整体上下移，
+ * v2.0.7 加「垂直偏移」滑杆（-400dp～+160dp，v2.0.24 由
+ * -120dp～+40dp 放宽，覆盖层整体上下移，
  * 经 stamp 第 7 行传 SystemUI 侧）；v2.0.8 加「隐藏运营商文字」
  * 开关（默认开，stamp 第 8 行，锁屏/控制中心/通知中心三处统管）；
  * v2.0.12 加「重启系统界面」按钮（写 restart.txt 请求标记，
@@ -63,6 +72,9 @@ import top.yukonga.miuix.kmp.theme.ThemeController
  * 侧，切换免强停；字号仍走 SharedPreferences「settings」，由 hook
  * 侧在 SystemUI 进程启动时经 XSharedPreferences 读取。
  * 样式照 MagicPods v2.11 的 MIUIX 写法。
+ * v2.0.24：设置项越加越多、全摊一页太长——各分组改可折叠
+ * （见 [SettingsSection]，展开状态按组落盘）；「系统界面」
+ * （重启按钮）是动作行、不折叠、常显。
  */
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -417,10 +429,12 @@ private fun SettingsScreen() {
                     }
                 }
 
-                SmallTitle(
-                    text = "顶部样式",
-                    insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
-                )
+                SettingsSection(
+                    prefs = prefs,
+                    id = "style",
+                    title = "顶部样式",
+                    defaultExpanded = false,
+                ) {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     cornerRadius = 20.dp,
@@ -452,10 +466,14 @@ private fun SettingsScreen() {
                     )
                 }
 
-                SmallTitle(
-                    text = "位置",
-                    insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
-                )
+                }
+
+                SettingsSection(
+                    prefs = prefs,
+                    id = "position",
+                    title = "位置",
+                    defaultExpanded = true,
+                ) {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     cornerRadius = 20.dp,
@@ -492,10 +510,14 @@ private fun SettingsScreen() {
                     }
                 }
 
-                SmallTitle(
-                    text = "主题管理",
-                    insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
-                )
+                }
+
+                SettingsSection(
+                    prefs = prefs,
+                    id = "themes",
+                    title = "主题管理",
+                    defaultExpanded = true,
+                ) {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     cornerRadius = 20.dp,
@@ -581,10 +603,14 @@ private fun SettingsScreen() {
                     }
                 }
 
-                SmallTitle(
-                    text = "区域高度",
-                    insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
-                )
+                }
+
+                SettingsSection(
+                    prefs = prefs,
+                    id = "height",
+                    title = "区域高度",
+                    defaultExpanded = false,
+                ) {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     cornerRadius = 20.dp,
@@ -603,10 +629,14 @@ private fun SettingsScreen() {
                     }
                 }
 
-                SmallTitle(
-                    text = "字号（原系统头部模式）",
-                    insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
-                )
+                }
+
+                SettingsSection(
+                    prefs = prefs,
+                    id = "fontsize",
+                    title = "字号（原系统头部模式）",
+                    defaultExpanded = false,
+                ) {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     cornerRadius = 20.dp,
@@ -629,6 +659,8 @@ private fun SettingsScreen() {
                             modifier = Modifier.padding(top = 12.dp),
                         )
                     }
+                }
+
                 }
 
                 SmallTitle(
@@ -677,10 +709,12 @@ private fun SettingsScreen() {
                     }
                 }
 
-                SmallTitle(
-                    text = "说明",
-                    insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
-                )
+                SettingsSection(
+                    prefs = prefs,
+                    id = "about",
+                    title = "说明",
+                    defaultExpanded = false,
+                ) {
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -714,8 +748,62 @@ private fun SettingsScreen() {
                         )
                     }
                 }
+                }
             }
         }
+    }
+}
+
+/**
+ * 可折叠分组（v2.0.24）：标题行沿用 [SmallTitle] 观感，右侧带
+ * 箭头（收起时朝右、展开时转朝下），整行可点切换展开/收起，
+ * 内容带展开/收起动画。展开状态按组落盘
+ * （ui_section_<id>，只存设置页自身的呈现偏好、不进戳记），
+ * 下次打开设置页保持上次的样子；从未存过时用
+ * [defaultExpanded]（按使用频率定：主题管理、位置默认展开，
+ * 其余默认收起）。「系统界面」是动作行、不走本组件、常显。
+ */
+@Composable
+private fun SettingsSection(
+    prefs: SharedPreferences,
+    id: String,
+    title: String,
+    defaultExpanded: Boolean,
+    content: @Composable () -> Unit,
+) {
+    var expanded by remember {
+        mutableStateOf(prefs.getBoolean("ui_section_$id", defaultExpanded))
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable {
+                expanded = !expanded
+                prefs.edit().putBoolean("ui_section_$id", expanded).apply()
+            },
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(modifier = Modifier.weight(1f)) {
+            SmallTitle(
+                text = title,
+                insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
+            )
+        }
+        Text(
+            "›",
+            fontSize = 20.sp,
+            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+            modifier = Modifier
+                .rotate(if (expanded) 90f else 0f)
+                .padding(end = 4.dp),
+        )
+    }
+    AnimatedVisibility(
+        visible = expanded,
+        enter = expandVertically() + fadeIn(),
+        exit = shrinkVertically() + fadeOut(),
+    ) {
+        content()
     }
 }
 
@@ -789,7 +877,15 @@ private fun SizeSliderRow(
                 onValueChange(it.roundToInt().coerceIn(min, max))
             },
             valueRange = min.toFloat()..max.toFloat(),
-            steps = (max - min - 1).coerceAtLeast(0),
+            // 小跨度逐 dp 设 steps（吸附感好）；大跨度（如垂直
+            // 偏移 v2.0.24 放宽到 560dp）逐 dp 设 steps 会让每
+            // 步不足一个像素、拖动发涩，改连续滑动，落值仍按
+            // 整数 dp 取整。
+            steps = if (max - min <= 100) {
+                (max - min - 1).coerceAtLeast(0)
+            } else {
+                0
+            },
             modifier = Modifier.fillMaxWidth(),
         )
     }

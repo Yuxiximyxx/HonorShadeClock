@@ -152,7 +152,9 @@ import kotlin.math.roundToInt
  * reconcile 的原值判定保持状态无关：原值可能是 280/501 等
  * 多个状态相关值，一律按与已跟踪 (原值, 调整值) 及当前 delta
  * 的关系判定，不写死任何原值。
- * ②垂直偏移（设置页滑杆 -120dp～+40dp、默认 0、stamp 第 7 行）：
+ * ②垂直偏移（设置页滑杆 -400dp～+160dp、默认 0、stamp 第 7 行；
+ * v2.0.24 由 -120dp～+40dp 放宽：全屏画布类主题的簇本身在画布
+ * 中部偏下，-120dp 拉满仍不够）：
  * 主题设计顶部留白（云镜簇顶 335 设计px）是给锁屏天空的，
  * 背景关掉后在通知中心显得空、整体偏低。渲染器整体平移
  * （draw 根 y 加 dy，元素与顶/底统计一起动），dy 由 dp 换算
@@ -700,6 +702,18 @@ object HeaderOverlay {
         var gateLogCount = 0
         /** 二值收尾门上次应用的判定（null=尚未应用），翻转才记日志/刷新。 */
         var gateClosed: Boolean? = null
+        /**
+         * 收尾早关 latch（v2.0.24）：关闭行程中已按「宿主先藏
+         * 头部」提前关门——置位后保持关，直到展开比例回升超
+         * 过触发点（手势反转）或容器可见标志回到 true 或面板
+         * 落定（比例 0，此时由落定判据接管）。见
+         * [updateCloseTailLatch]。
+         */
+        var gateTailLatched = false
+        /** 早关 latch 的触发比例（反转解除的基准）。 */
+        var gateTailFraction = 0f
+        /** 上一次采样的展开比例（判「正在下落」用），null=尚无采样。 */
+        var gateLastFraction: Float? = null
         /** 面板本体（头部祖先 NotificationPanelView）与展开比例字段句柄（v2.0.22 收尾门用，懒定位、定位失败保持 null 走旧口径）。 */
         var panelView: View? = null
         var panelFractionField: java.lang.reflect.Field? = null
@@ -765,13 +779,62 @@ object HeaderOverlay {
      * 时退回 v2.0.21 合取口径。页面切换期整门豁免（横滑跟
      * 随是 v2.0.11 确认好的行为，落定到控制中心由控制中
      * 心门控挂起、不靠这道门）。
+     *
+     * v2.0.24 补「收尾早关」：比例读得到时，除落定（比
+     * 例 0）外，关闭行程中宿主先行隐藏头部内容的那一刻
+     * 也关门——[updateCloseTailLatch] 维护的 latch；定案
+     * 与开侧不认该标志的理由见该函数注。
      */
     private fun shadeSettledClosed(st: State): Boolean {
         if (pageSwitching) return false
         val fraction = panelExpandedFraction(st)
-        if (fraction != null) return fraction <= 0f
+        if (fraction != null) return fraction <= 0f || st.gateTailLatched
         return !shadeContainerVisible &&
             st.header.visibility != View.VISIBLE
+    }
+
+    /**
+     * 收尾早关 latch 的维护（v2.0.24，只在
+     * [applyWrapperVisibility] 里调，预抽帧频）：真机
+     * （v2.0.23 录屏+日志）定案——关闭行程里原头部的退出
+     * 不是 alpha（diag 中段实数两路恒 1.0）、也不是面板落
+     * 定，而是宿主中途调 updateContainerVisible(false) 把
+     * 头部内容撤下（日志里该翻转落在展开比例 1.0 与 0.58
+     * 两次采样之间）；覆盖层只认比例 0 才关门，于是独自以
+     * 全不透明留在面板顶部、其余内容都退场后还压在桌面上
+     * 约 16 帧，末段随面板高度塌缩被上移裁成残条——即小
+     * 乐报的「返回闪烁」。修法：关闭行程中（比例在下落）
+     * 容器可见标志一旦翻 false，与原头部同刻关门并 latch
+     * 住，不等比例归零。开侧绝不认这个标志（它翻 true 迟
+     * 到进度 0.3 之后，v2.0.15/16 的教训）：置位条件带
+     * 「正在下落」，打开行程比例上行永不触发；面板全开静
+     * 置时标志的杂翻（页面切换落定等场景、比例不动）也不
+     * 触发。解除：比例回升超过触发点 0.02（手势反转上
+     * 行）、标志回到 true、或比例归零（落定判据接管，
+     * latch 顺手清掉）。页面切换期整门豁免、latch 不动。
+     */
+    private fun updateCloseTailLatch(st: State) {
+        if (pageSwitching) return
+        val fraction = panelExpandedFraction(st)
+        if (fraction == null) {
+            st.gateLastFraction = null
+            return
+        }
+        val last = st.gateLastFraction
+        st.gateLastFraction = fraction
+        when {
+            fraction <= 0f || shadeContainerVisible ->
+                st.gateTailLatched = false
+            st.gateTailLatched -> {
+                if (fraction > st.gateTailFraction + 0.02f) {
+                    st.gateTailLatched = false
+                }
+            }
+            last != null && fraction < last - 0.0005f -> {
+                st.gateTailLatched = true
+                st.gateTailFraction = fraction
+            }
+        }
     }
 
     /**
@@ -788,6 +851,7 @@ object HeaderOverlay {
             st.gateClosed = null
             return
         }
+        updateCloseTailLatch(st)
         val closed = shadeSettledClosed(st)
         if (st.gateClosed == closed && wrapper.visibility ==
             if (closed) View.GONE else View.VISIBLE
@@ -809,7 +873,7 @@ object HeaderOverlay {
                 logFn(
                     "overlay gate: ${if (closed) "settled-closed -> wrapper GONE" else "open -> wrapper VISIBLE"} " +
                         "(visFlag=$shadeContainerVisible, headerVis=${st.header.visibility}, " +
-                        "expF=${panelExpandedFraction(st)})"
+                        "expF=${panelExpandedFraction(st)}, tail=${st.gateTailLatched})"
                 )
             }
         }
@@ -3045,7 +3109,7 @@ object HeaderOverlay {
                 "alpha=${tv?.alpha} drawCalls=${tv?.drawCalls} " +
                 "renders=${tv?.renderCount} " +
                 "gate=${if (shadeSettledClosed(st)) "closed" else "open"} " +
-                "expF=${panelExpandedFraction(st)} " +
+                "expF=${panelExpandedFraction(st)} tail=${st.gateTailLatched} " +
                 "drawn=${tv?.lastDrawnElements} envNull=${tv?.lastEnvMissing} | " +
                 "bgShown=${st.appliedStamp?.showBackground} | " +
                 "mountBounds=${st.mountBounds?.joinToString(",")}"
