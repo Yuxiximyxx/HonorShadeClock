@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.4-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.5-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.4-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.5-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,28 +68,29 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.4
-          name: HonorShadeClock 2.0.4 — 铃铛随层挂起/控制中心页挂起/通知避让改拦截写入口
+          tag_name: v2.0.5
+          name: HonorShadeClock 2.0.5 — 治卡顿/秒数不跳、小模块默认关
           body: |
-            ## HonorShadeClock 2.0.4
+            ## HonorShadeClock 2.0.5
 
-            修 v2.0.3 真机三处泄漏/失效（本模块只管
-            解锁后下拉的通知中心页）：
+            修 v2.0.4 真机「很卡顿、几乎卡死、秒数
+            不跳」与小模块取舍：
 
-            - 锁屏铃铛残留：挂起时整组（含铃铛）一起
-              撤下。根因是布局回调里的可见性自愈在
-              挂起期把整层又顶了回来、只剩固定位置的
-              铃铛露出来；现在挂起是硬门控，任何回调
-              都顶不回来。
-            - 控制中心页泄漏：在控制中心页（WLAN/
-              蓝牙瓷砖那页）自动挂起、原头部保持原样，
-              切回通知页自动恢复。信号取宿主的页面
-              状态分发（HwPanelControl），不是猜的。
-            - 通知避让改拦截写入口：不再靠每秒事后
-              同步（真机未生效），改为拦系统写通知栈
-              顶位置的入口，在它每次写入时直接带上
-              头部变高的增量，通知从覆盖层下方开始
-              排；挂起/切回原样式时恢复系统原值。
+            - 卡顿根因：通知栈顶的调整不幂等且会自
+              激——我们写回位置时调用的系统更新会同
+              步再触发调整，一次写入级联多次全栈重
+              排；且系统重启过渡期会按已变高的头部
+              量出含增量的值，旧逻辑把它当原值又加
+              一遍（越加越高、主线程被塞满，秒数自
+              然不跳）。现改为写死判定（原值才加、
+              已含增量不加、自己写过的值跳过）+ 写
+              回重入保护 + 目标值已在位时不调更新
+              组；对齐去掉每秒硬摆位置，面板不可见
+              时不重绘。
+            - 小模块默认关：设置页新增「小模块（温
+              度/风向/电量）」开关，默认关——只显示
+              时间样式（时钟/日期/星期），温度、风
+              向、电量三列先不画，等后期优化好再开。
 
             生效方式：覆盖安装 → 强停一次系统界面 →
             下拉通知中心查看（主题与设置沿用已导入

@@ -138,6 +138,19 @@ class ThemeRenderer(private val log: (String) -> Unit) {
     private var backgroundHandled = false
     private var backgroundSkipLogged = false
 
+    /**
+     * 是否绘制数据小模块（设置页「小模块（温度/风向/电量）」开关，
+     * v2.0.5，默认关）。false 时跳过 [widgetSkipNodes] 里的节点：
+     * 表达式/选图依赖 Weather.today.* 或 #battery_level /
+     * #battery_state 的元素，以及它们所在的小模块组整组（组里的
+     * 静态图标一并跳过——云镜底部温度/风向/电量三列即此结构）。
+     * 时间、日期、星期、静态文字与图片照常；跟随内容高度按剩余
+     * 元素统计。由 HeaderOverlay 按 stamp 在每次挂载时赋值。
+     */
+    @Volatile
+    var showWidgets: Boolean = false
+    private var widgetSkipNodes: Set<XNode> = emptySet()
+
     fun load(dir: File): Boolean {
         themeDir = dir
         bitmaps.clear()
@@ -150,8 +163,68 @@ class ThemeRenderer(private val log: (String) -> Unit) {
         }
         typeface = loadTypeface(dir)
         backgroundSkipLogged = false
+        widgetSkipNodes = model?.let { computeWidgetSkipNodes(it) } ?: emptySet()
+        if (widgetSkipNodes.isNotEmpty()) {
+            log("theme widgets: ${widgetSkipNodes.size} node(s) marked as data widgets")
+        }
         if (model == null) log("theme load failed: no valid manifest.xml in $dir")
         return model != null
+    }
+
+    /** 属性串是否直接引用天气/电量数据（#Weather.…、@Weather.…、#battery_…）。 */
+    private fun exprDependsOnData(expr: String): Boolean =
+        expr.contains("Weather.") ||
+            expr.contains("battery_level") ||
+            expr.contains("battery_state")
+
+    /**
+     * 预计算「数据小模块」跳过集（load 时一次，绘制时只查集合）：
+     * 1) 数据依赖变量：定义表达式引用了 Weather./battery 数据的主题
+     *    Var（如云镜的 WeatherIcon），及索引带数据依赖的 VarArray
+     *    变量——元素经一层 #变量 间接引用数据的也算数据元素。
+     * 2) 小模块组：子树里含数据元素、且不含 Time/DateTime/静态
+     *    text 文字的 Group 整组入集（保护时钟组不被误伤）；组内
+     *    静态图标（温度/风向图标那种自身无数据依赖的）随组跳过。
+     * 3) 不在小模块组里的数据元素（混在大组里的）逐个入集。
+     */
+    private fun computeWidgetSkipNodes(m: ThemeModel): Set<XNode> {
+        val dataVars = HashSet<String>()
+        for ((name, def) in m.vars) {
+            if (def is VarDef.ExprDef && exprDependsOnData(def.expression)) {
+                dataVars.add(name)
+            }
+        }
+        for (arr in m.varArrays) {
+            if (exprDependsOnData(arr.indexExpr)) dataVars.add(arr.varName)
+        }
+        fun nodeDepends(node: XNode): Boolean =
+            node.attrs.values.any { v ->
+                exprDependsOnData(v) || dataVars.any { dv -> v.contains("#$dv") }
+            }
+        fun subtreeAny(node: XNode, pred: (XNode) -> Boolean): Boolean {
+            if (pred(node)) return true
+            return node.children.any { subtreeAny(it, pred) }
+        }
+        fun hasDataVisual(node: XNode): Boolean =
+            subtreeAny(node) { it.tag in VISUAL_TAGS && nodeDepends(it) }
+        fun hasPrimaryContent(node: XNode): Boolean =
+            subtreeAny(node) {
+                it.tag == "Time" || it.tag == "DateTime" ||
+                    (it.tag == "Text" && !it.attr("text").isNullOrBlank())
+            }
+        val skip = HashSet<XNode>()
+        fun walk(node: XNode) {
+            if (node.tag == "Group" && hasDataVisual(node) && !hasPrimaryContent(node)) {
+                skip.add(node)
+                return
+            }
+            if (node.tag in VISUAL_TAGS && node.tag != "Group" && nodeDepends(node)) {
+                skip.add(node)
+            }
+            for (c in node.children) walk(c)
+        }
+        for (root in m.roots) walk(root)
+        return skip
     }
 
     val isLoaded: Boolean get() = model != null
@@ -199,6 +272,8 @@ class ThemeRenderer(private val log: (String) -> Unit) {
         scaleAcc: Float,
         alphaAcc: Float,
     ) {
+        // 小模块开关关时整组/逐个跳过（v2.0.5）：连表达式都不求值
+        if (!showWidgets && widgetSkipNodes.contains(node)) return
         val visExpr = node.attr("visibility")
         if (visExpr != null) {
             val v = Expr.eval(visExpr, ctx)

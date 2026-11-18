@@ -89,6 +89,22 @@ import kotlin.math.roundToInt
  * 系统每次更新都自带偏移；tick 只做一次性兜底（识别系统原值/
  * 我们调整过的值，绝不叠加双加），挂起/卸载恢复系统原值。
  *
+ * v2.0.5 修 v2.0.4 真机「很卡顿、几乎卡死、秒数不跳」：根因是
+ * 栈顶调整不幂等且会自激——①我们写回 topPadding 时调用的系统
+ * 更新组会同步再触发写入口 hook，旧代码没有重入保护，一次系统
+ * 写入能级联出多次全栈重排；②SystemUI 重启过渡期系统会按已变
+ * 高的头部量出含增量的值（909），旧代码把它当原值又加一遍
+ * （日志实数 adjusted=2167），头部越高通知栈越乱、主线程越忙。
+ * 改：拦截与兜底统一走 reconcileStackTop 的写死判定（原值→加
+ * 增量；原值+增量→认作已正确不加；我们写过的值→回声跳过，但
+ * 增量变了要重算；未知值→按与头部高度的合理性窗口定性一次），
+ * writeTopPadding 加重入标志，目标值已在位时不调系统更新组；
+ * alignOverlay 删直接 layout() 调用、bounds 未变时只做廉价自愈；
+ * tick 每秒只做戳记比对与（面板可见时的）秒数重绘，对齐/栈检查
+ * 在稳态下都是零写入空转，并每 10 秒打一行心跳（drawCalls 应
+ * 稳定每秒 +1）。另加「小模块（温度/风向/电量）」开关（stamp
+ * 第 6 行，默认关）：关时渲染器跳过数据小模块，只显示时间样式。
+ *
  * 设置经 StampStore 的 stamp.txt 跨进程传递；覆盖层挂载时与每秒
  * tick 比对戳记，变了就重解析重载——切换主题免强停。
  * 全路径 try-catch：构建/渲染任何异常都卸下覆盖层、恢复原头部、
@@ -103,6 +119,13 @@ object HeaderOverlay {
         "com.android.systemui.statusbar.notification.HwNotificationUtils"
     private const val WRAPPER_MARKER = "shadeclock_overlay_wrapper"
     private const val MAX_FAILURES = 8
+
+    /**
+     * 栈顶值定性的合理性窗口（v2.0.5）：系统原值应约等于原头部
+     * 高度、含增量的值应约等于当前头部高度，允许 ±240 的系统
+     * 自有间距（沿用 v2.0.3 基线捕获的容差）。
+     */
+    private const val STACK_PLAUSIBLE_SLACK = 240
 
     // 锁屏门控（v2.0.3）：状态值与宿主 StatusBarState 的反编译源码
     // 逐一核对过（0=SHADE、1=KEYGUARD、2=SHADE_LOCKED、3=FS_USRSW）。
@@ -174,6 +197,14 @@ object HeaderOverlay {
         var hookAdjustedTopPadding: Int? = null
         /** 写入口调整日志计数（有界，避免刷屏）。 */
         var interceptLogCount = 0
+        /**
+         * 栈顶写回重入保护（v2.0.5）：置位期间拦截/兜底一律跳过——
+         * 我们调用的系统更新组会同步再触发写入口 hook，不挡住就
+         * 会级联自激（v2.0.4 真机卡死的主因之一）。
+         */
+        var stackAdjusting = false
+        /** tick 计数（心跳日志用，v2.0.5）。 */
+        var tickCount = 0
     }
 
     /** 自绘层：每帧按当前环境（时间/电量/天气）让渲染器画一遍。 */
@@ -421,6 +452,8 @@ object HeaderOverlay {
             }
             // 主题背景图开关（v2.0.3）：stamp 每次挂载/变更时同步给渲染器
             st.renderer.showBackgroundImage = stamp.showBackground
+            // 小模块开关（v2.0.5）：同上，stamp 第 6 行
+            st.renderer.showWidgets = stamp.showWidgets
             ensureWrapper(header, st)
             // 走到这里说明覆盖层已成功挂到父容器上：失败计数归零
             if (processFailureCount != 0) processFailureCount = 0
@@ -513,7 +546,10 @@ object HeaderOverlay {
                         if (st.wrapper != null) {
                             alignOverlay(st)
                             ensureStackAdjusted(st)
-                            st.themeView?.invalidate()
+                            // 面板不可见时不重绘（v2.0.5 瘦身）
+                            if (st.wrapper?.isShown == true) {
+                                st.themeView?.invalidate()
+                            }
                         }
                     }
                 }
@@ -615,7 +651,19 @@ object HeaderOverlay {
         if (header.width <= 0 || header.height <= 0) return
         val off = offsetIn(header, parent)
         val bounds = intArrayOf(off[0], off[1], header.width, header.height)
+        val prevBounds = st.mountBounds
         st.mountBounds = bounds
+        if (prevBounds != null && prevBounds.contentEquals(bounds)) {
+            // bounds 未变（稳态 tick 与重复布局回调的绝大多数情况）：
+            // 只做廉价的可见性/z 序自愈，不写 LayoutParams、不触发
+            // requestLayout（v2.0.5 瘦身，防布局自激）。
+            healWrapperVisibility(wrapper, parent)
+            return
+        }
+        // LayoutParams 只在数值真变化时才写；定位完全交给父容器
+        // （标准 FrameLayout，已实证不重写 onLayout）的布局 pass，
+        // 不再直接调 layout() 硬摆（v2.0.4 及以前每秒硬摆一次，
+        // 与父容器布局互相打架，是卡顿嫌疑之一，v2.0.5 删除）。
         val lp = wrapper.layoutParams
         if (lp is FrameLayout.LayoutParams) {
             if (lp.width != bounds[2] || lp.height != bounds[3] ||
@@ -640,17 +688,11 @@ object HeaderOverlay {
                 parent.requestLayout()
             }
         }
-        // 立即按目标 bounds 摆一次：父容器若有自定义 onLayout 不认
-        // margin，也能先到位；tick 每秒再校，父容器后续 layout 若按
-        // LayoutParams 摆放则与此一致。
-        if (wrapper.left != bounds[0] || wrapper.top != bounds[1] ||
-            wrapper.right != bounds[0] + bounds[2] ||
-            wrapper.bottom != bounds[1] + bounds[3]
-        ) {
-            wrapper.layout(bounds[0], bounds[1], bounds[0] + bounds[2], bounds[1] + bounds[3])
-        }
-        // 可见性/z 序自愈：wrapper 被改 INVISIBLE/透明或别的子视图
-        // 后加进来盖住它时，每轮对齐都恢复并顶回父容器最前。
+        healWrapperVisibility(wrapper, parent)
+    }
+
+    /** 可见性/z 序自愈：wrapper 被改 INVISIBLE/透明或别的子视图后加进来盖住它时恢复并顶回最前（只在状态真不对时才写）。 */
+    private fun healWrapperVisibility(wrapper: View, parent: ViewGroup) {
         if (wrapper.visibility != View.VISIBLE) wrapper.visibility = View.VISIBLE
         if (wrapper.alpha != 1f) wrapper.alpha = 1f
         if (parent.indexOfChild(wrapper) != parent.childCount - 1) {
@@ -712,10 +754,11 @@ object HeaderOverlay {
     // tick 总慢半拍且基线捕获条件苛刻。v2.0.4 改拦截写入口：
     // hook 该方法，after 里在同一次调用栈内读出系统刚写的值，
     // 加上（当前头部高 - 原头部高）的增量后按系统同组更新方法
-    // 放行——系统每次更新都自带偏移，不再赛跑。tick 只留一次性
-    // 兜底：识别「系统原值未调整」或「头部高度又变了」时补一次，
-    // 始终以跟踪到的系统原值为基数，绝不叠加双加。挂起/卸载时
-    // 只在当前值仍是我们调整过的值时才恢复系统原值。
+    // 放行——系统每次更新都自带偏移，不再赛跑。挂起/卸载时只在
+    // 当前值仍是我们调整过的值时才恢复系统原值。
+    // v2.0.5 教训：v2.0.4 的拦截不幂等且会自激（见类头 v2.0.5
+    // 段）——拦截与兜底统一走 reconcileStackTop 的写死判定，
+    // writeTopPadding 带重入保护，目标值已在位时不调更新组。
 
     /** 定位 NSSL 并取其 AmbientState（从面板子树按类名找，找到后缓存）。 */
     private fun findStack(st: State): Boolean {
@@ -771,6 +814,12 @@ object HeaderOverlay {
     private fun writeTopPadding(st: State, value: Int) {
         val ambient = st.stackAmbient ?: return
         val stack = st.stackScroller ?: return
+        // 重入保护（v2.0.5）：下面的系统更新组会同步再触发写入口
+        // hook（乃至系统再写一次），置位期间拦截/兜底/恢复一律
+        // 跳过——v2.0.4 没这层保护，一次写入级联多次全栈重排，
+        // 是真机卡死与重复加增量的共同源头。
+        if (st.stackAdjusting) return
+        st.stackAdjusting = true
         try {
             XposedHelpers.setIntField(ambient, "mTopPadding", value)
             // 与系统 requestScrollerTopPaddingUpdate 写完字段后相同的
@@ -795,6 +844,8 @@ object HeaderOverlay {
             }
         } catch (t: Throwable) {
             logFn("stack sync: write failed: ${t.javaClass.name}: ${t.message}")
+        } finally {
+            st.stackAdjusting = false
         }
     }
 
@@ -837,11 +888,13 @@ object HeaderOverlay {
         }
     }
 
-    /** 系统刚写完一次 mTopPadding：覆盖层激活时把增量加回去。 */
+    /** 系统刚写完一次 mTopPadding：覆盖层激活时按统一判定处理。 */
     private fun onSystemTopPaddingWrite(panel: View?) {
         val st = synchronized(states) {
             states.values.firstOrNull { it.wrapper != null }
         } ?: return
+        // 我们自己写回引发的重入：整段跳过（v2.0.5 防自激）
+        if (st.stackAdjusting) return
         // 挂起（锁屏/控制中心）时放行原值：锁屏分支写的是
         // mIntrinsicPadding，绝不能加增量。
         if (st.suspended) return
@@ -855,10 +908,98 @@ object HeaderOverlay {
         }
         if (!findStack(st)) return
         val cur = readTopPadding(st) ?: return
-        // 这是系统原值（方法刚算出并写入的），记下后加增量放行
-        st.hookSystemTopPadding = cur
-        st.hookAdjustedTopPadding = null
-        applyStackDelta(st, cur)
+        reconcileStackTop(st, cur)
+    }
+
+    /** 拦截/兜底共用的有界日志（避免动画期间逐帧刷屏）。 */
+    private fun logIntercept(st: State, message: String) {
+        if (st.interceptLogCount < 8) {
+            st.interceptLogCount++
+            logFn(message)
+        }
+    }
+
+    /**
+     * 栈顶统一判定（v2.0.5，拦截与 tick 兜底共用，判定规则写死）：
+     * 维护 (hookSystemTopPadding=系统原值, hookAdjustedTopPadding=
+     * 调整值) 一对跟踪值，对当前值 cur 按当前头部增量 delta 定性：
+     * - delta ≤ 0：cur 即原值，校准基准；若 cur 还是我们旧的调整
+     *   值且头部已复原，写回原值清残值。
+     * - cur == 调整值：回声（系统把调整过的值又写回来/我们写回的
+     *   同步回读），已正确跳过；仅当 delta 已变（头部又长高/缩回）
+     *   时按新 delta 重算一次。
+     * - cur == 原值：纯系统原值，加增量放行。
+     * - cur == 原值 + delta：系统已按变高后的头部量出（SystemUI
+     *   重启过渡期实证：先量出 909）、增量已含，认作已正确不加，
+     *   只把跟踪调整值更新为 cur（v2.0.4 在这里误当原值再加，
+     *   1538/2167 即此）。
+     * - 其余未知值：按合理性窗口定性一次——约等于当前头部高度
+     *   （±[STACK_PLAUSIBLE_SLACK]）视为已含增量并反推原值；约
+     *   等于原头部高度视为原值并加增量；都对不上则原样采用为
+     *   原值候选、本轮不加，等后续确切匹配再处理。
+     * 任何分支里目标值与现值相同都不调用系统更新组（见
+     * [applyStackDelta]）。
+     */
+    private fun reconcileStackTop(st: State, cur: Int) {
+        if (st.stackAdjusting) return
+        val origH = st.originalHeight
+        if (origH <= 0) return
+        val delta = st.header.height - origH
+        val sys = st.hookSystemTopPadding
+        val adj = st.hookAdjustedTopPadding
+        when {
+            delta <= 0 -> {
+                if (adj != null && cur == adj && sys != null) {
+                    writeTopPadding(st, sys)
+                    st.hookAdjustedTopPadding = null
+                    logFn("stack sync: topPadding restored to system value $sys (delta back to 0)")
+                } else if (cur != adj) {
+                    st.hookSystemTopPadding = cur
+                    st.hookAdjustedTopPadding = null
+                }
+            }
+            adj != null && cur == adj -> {
+                if (sys != null && adj != sys + delta) {
+                    applyStackDelta(st, sys)
+                }
+            }
+            sys != null && cur == sys -> {
+                applyStackDelta(st, cur)
+            }
+            sys != null && cur == sys + delta -> {
+                st.hookAdjustedTopPadding = cur
+                logIntercept(
+                    st,
+                    "stack write already includes delta: value=$cur " +
+                        "(system=$sys + delta=$delta), left as-is",
+                )
+            }
+            else -> {
+                when {
+                    abs(cur - st.header.height) <= STACK_PLAUSIBLE_SLACK -> {
+                        st.hookSystemTopPadding = cur - delta
+                        st.hookAdjustedTopPadding = cur
+                        logIntercept(
+                            st,
+                            "stack write adopted as already-adjusted: value=$cur, " +
+                                "derived system=${cur - delta} (delta=$delta)",
+                        )
+                    }
+                    abs(cur - origH) <= STACK_PLAUSIBLE_SLACK -> {
+                        st.hookSystemTopPadding = cur
+                        applyStackDelta(st, cur)
+                    }
+                    else -> {
+                        st.hookSystemTopPadding = cur
+                        st.hookAdjustedTopPadding = null
+                        logIntercept(
+                            st,
+                            "stack write adopted as-is (unclassified): value=$cur delta=$delta",
+                        )
+                    }
+                }
+            }
+        }
     }
 
     /** 把系统原值加上头部高度增量写回（增量 ≤0 时不写、保持原值）。 */
@@ -867,49 +1008,37 @@ object HeaderOverlay {
         val delta = st.header.height - st.originalHeight
         if (delta <= 0) return
         val target = systemValue + delta
+        // 目标值已在位：只更新跟踪，绝不调用那套更新方法（v2.0.5；
+        // 面板动画期间系统逐帧写栈顶，每帧整套重排是卡顿主因之一）
+        if (readTopPadding(st) == target) {
+            st.hookAdjustedTopPadding = target
+            return
+        }
         writeTopPadding(st, target)
         st.hookAdjustedTopPadding = target
-        if (st.interceptLogCount < 5) {
-            st.interceptLogCount++
-            logFn(
-                "stack write adjusted #${st.interceptLogCount}: " +
-                    "system=$systemValue + delta=$delta -> $target"
-            )
-        }
+        logIntercept(
+            st,
+            "stack write adjusted: system=$systemValue + delta=$delta -> $target",
+        )
     }
 
     /**
-     * tick/布局兜底（v2.0.4）：写入口拦截是主路径；这里只处理两种
-     * 漏网——系统原值已在位但没经拦截调整（如拦截安装前写入的）、
-     * 头部高度在两次系统写入之间又变了。基数永远是跟踪到的系统
-     * 原值、且认得出我们调整过的值，绝不叠加双加。
+     * tick/布局兜底（v2.0.5）：写入口拦截是主路径；这里只把当前值
+     * 交给同一套判定（[reconcileStackTop]）——稳态下当前值恒等于
+     * 调整值，走回声分支零写入；漏网的系统复位/高度变化会被它
+     * 识别并补一次，绝不叠加双加。
      */
     private fun ensureStackAdjusted(st: State) {
         if (st.suspended || st.originalHeight <= 0) return
+        if (st.stackAdjusting) return
         if (!findStack(st)) return
         val cur = readTopPadding(st) ?: return
-        val adjusted = st.hookAdjustedTopPadding
-        if (adjusted != null && cur == adjusted) {
-            // 仍是我们调整过的值：头部高度再变时按新 delta 重算；
-            // 头部回到原高（delta 归零）时恢复系统原值，别留增量残值
-            val sys = st.hookSystemTopPadding ?: return
-            val delta = st.header.height - st.originalHeight
-            if (delta <= 0) {
-                writeTopPadding(st, sys)
-                st.hookAdjustedTopPadding = null
-                logFn("stack sync: topPadding restored to system value $sys (delta back to 0)")
-            } else if (cur != sys + delta) {
-                applyStackDelta(st, sys)
-            }
-            return
-        }
-        // 系统原值（刚被系统复位/初次见到）：记下并调整
-        st.hookSystemTopPadding = cur
-        applyStackDelta(st, cur)
+        reconcileStackTop(st, cur)
     }
 
     /** 恢复栈顶：只在当前值仍是我们调整过的值时写回系统原值（挂起/卸载时调用）。 */
     private fun restoreStackTop(st: State) {
+        if (st.stackAdjusting) return
         val adjusted = st.hookAdjustedTopPadding ?: return
         st.hookAdjustedTopPadding = null
         val sys = st.hookSystemTopPadding ?: return
@@ -1147,7 +1276,23 @@ object HeaderOverlay {
                     }
                     logDiag(st)
                     WeatherSource.maybeRefresh(st.header.context)
-                    st.themeView?.invalidate()
+                    // 秒数重绘：面板不可见时跳过（没人看就不画，
+                    // 省主线程，v2.0.5）；对齐/栈检查在上面的稳态
+                    // 路径里都是零写入判定，不再是每秒重活。
+                    if (wrapper.isShown) {
+                        st.themeView?.invalidate()
+                    }
+                    // 心跳（v2.0.5）：每 10 秒一行，drawCalls 在
+                    // 面板可见时应稳定每秒 +1、不可见时不涨——用
+                    // 来真机验收「秒数逐秒跳、主线程不被塞满」。
+                    st.tickCount++
+                    if (st.tickCount % 10 == 0) {
+                        logFn(
+                            "overlay heartbeat #${st.tickCount / 10}: " +
+                                "drawCalls=${st.themeView?.drawCalls} " +
+                                "drawn=${st.themeView?.lastDrawnElements}"
+                        )
+                    }
                 } catch (t: Throwable) {
                     fail(st.header, t)
                     return

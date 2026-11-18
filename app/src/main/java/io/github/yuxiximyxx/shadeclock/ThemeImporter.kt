@@ -126,6 +126,7 @@ object ThemeStore {
     const val KEY_TOP_STYLE = "top_style"
     const val KEY_HEIGHT_MODE = "height_mode"
     const val KEY_SHOW_BACKGROUND = "show_background"
+    const val KEY_SHOW_WIDGETS = "show_widgets"
 
     fun loadThemes(prefs: SharedPreferences): List<ThemeEntry> {
         val raw = prefs.getString(KEY_THEMES_JSON, null) ?: return emptyList()
@@ -158,8 +159,10 @@ object ThemeStore {
             ?: StampStore.TOP_STYLE_THEME
         val heightMode = prefs.getInt(KEY_HEIGHT_MODE, StampStore.HEIGHT_FOLLOW)
         val showBackground = prefs.getBoolean(KEY_SHOW_BACKGROUND, false)
+        val showWidgets = prefs.getBoolean(KEY_SHOW_WIDGETS, false)
         val content = StampStore.formatStamp(
-            selected, System.currentTimeMillis(), heightMode, topStyle, showBackground,
+            selected, System.currentTimeMillis(), heightMode, topStyle,
+            showBackground, showWidgets,
         )
         PublicStore.writeFile(
             context, StampStore.STAMP_REL_DIR, StampStore.STAMP_NAME,

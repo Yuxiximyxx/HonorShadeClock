@@ -129,6 +129,9 @@ private fun SettingsScreen() {
     var showBackground by remember {
         mutableStateOf(prefs.getBoolean(ThemeStore.KEY_SHOW_BACKGROUND, false))
     }
+    var showWidgets by remember {
+        mutableStateOf(prefs.getBoolean(ThemeStore.KEY_SHOW_WIDGETS, false))
+    }
     var themes by remember { mutableStateOf(ThemeStore.loadThemes(prefs)) }
     var selectedThemeId by remember {
         mutableStateOf(prefs.getString(ThemeStore.KEY_SELECTED_THEME, "") ?: "")
@@ -171,6 +174,12 @@ private fun SettingsScreen() {
     fun saveShowBackground(value: Boolean) {
         showBackground = value
         prefs.edit().putBoolean(ThemeStore.KEY_SHOW_BACKGROUND, value).apply()
+        syncStamp()
+    }
+
+    fun saveShowWidgets(value: Boolean) {
+        showWidgets = value
+        prefs.edit().putBoolean(ThemeStore.KEY_SHOW_WIDGETS, value).apply()
         syncStamp()
     }
 
@@ -252,7 +261,7 @@ private fun SettingsScreen() {
                 .padding(innerPadding),
         ) {
             Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-                SmallTitle(text = "正式版 v2.0.4", insideMargin = PaddingValues(start = 4.dp))
+                SmallTitle(text = "正式版 v2.0.5", insideMargin = PaddingValues(start = 4.dp))
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     cornerRadius = 20.dp,
@@ -293,6 +302,12 @@ private fun SettingsScreen() {
                         summary = "开：连主题的整幅背景图一起画；关：只画时钟等元素，透出通知栏原背景",
                         checked = showBackground,
                         onCheckedChange = { saveShowBackground(it) },
+                    )
+                    SuperSwitch(
+                        title = "小模块（温度/风向/电量）",
+                        summary = "开：连温度、风向、电量小模块一起画；关：只显示时间样式（默认关）",
+                        checked = showWidgets,
+                        onCheckedChange = { saveShowWidgets(it) },
                     )
                 }
 
@@ -459,7 +474,7 @@ private fun SettingsScreen() {
                             modifier = Modifier.padding(top = 8.dp),
                         )
                         Text(
-                            "温度/风向小模块读系统天气服务，与锁屏同源；主题里的入场动画只按终态静态呈现，秒数逐秒切换。",
+                            "温度/风向小模块读系统天气服务，与锁屏同源（「小模块」开关默认关，打开后才画）；主题里的入场动画只按终态静态呈现，秒数逐秒切换。",
                             fontSize = 14.sp,
                             color = MiuixTheme.colorScheme.onSurface,
                             modifier = Modifier.padding(top = 8.dp),
