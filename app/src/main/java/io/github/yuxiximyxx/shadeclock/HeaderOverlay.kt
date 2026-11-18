@@ -21,6 +21,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 import io.github.yuxiximyxx.shadeclock.theme.RenderEnv
 import io.github.yuxiximyxx.shadeclock.theme.ThemeRenderer
 import io.github.yuxiximyxx.shadeclock.theme.WeatherSource
+import java.lang.ref.WeakReference
 import java.util.Calendar
 import java.util.WeakHashMap
 import kotlin.math.abs
@@ -105,6 +106,29 @@ import kotlin.math.roundToInt
  * 稳定每秒 +1）。另加「小模块（温度/风向/电量）」开关（stamp
  * 第 6 行，默认关）：关时渲染器跳过数据小模块，只显示时间样式。
  *
+ * v2.0.6 加第三道门控：横幅通知（heads-up peek）呈现时覆盖层也
+ * 会露出来压住横幅卡片（v2.0.5 真机，此时 state=0、cc=false，
+ * 两道旧门控都放行）。信号取宿主 HeadsUpManagerImpl
+ * .setEntryPinned(HeadsUpEntry, PinnedStatus, String)——反编译
+ * 核实它是 pinned 状态变更的唯一汇聚点：onEntryAdded /
+ * onEntryRemoved / updateNotificationInternal 全部经它，它重算
+ * 聚合状态 mHasPinnedNotification、仅在变化时更新字段并向全部
+ * OnHeadsUpChangedListener 分发 onHeadsUpPinnedModeChanged；
+ * 系统自己的 StatusBarHeadsUpChangeListener 正是把这个回调
+ * 翻译成窗口状态 mHeadsUpShowing（日志原文 "setHeadsUpShowing
+ * true"），即「横幅呈现中」的系统定义，与前两道门控同构
+ * （唯一入口＋去重＋分发）。after 里直读字段跟踪状态，变化时
+ * 除等 tick 外还即时重评各 State 的门控（横幅是瞬时呈现，
+ * 等 1 秒 tick 会压卡片一截）；轮询兜底直读 hook 捕获的实例
+ * 字段。一致性核查：本构建没有 HeadsUpAppearanceController；
+ * 横幅机制对 pinned 变化的反应只有窗口状态（mHeadsUpShowing /
+ * mForceCollapsed）、面板 requestLayout、音量弹窗关闭、NSSL
+ * 动画记账与 setHeadsUpAnimatingAway，HnHeadsUpManagerPhoneImpl
+ * 的同名监听只做横幅行自身的模糊/注视/触摸——都不碰头部本体、
+ * 其 Compose 子视图或父容器 HnColumeContainer 的可见性，与
+ * 本模块挂起时恢复的项目（wrapper 可见性、头部子视图可见性、
+ * 头部高度、栈顶）完全 disjoint，挂起保持标准恢复、不打架。
+ *
  * 设置经 StampStore 的 stamp.txt 跨进程传递；覆盖层挂载时与每秒
  * tick 比对戳记，变了就重解析重载——切换主题免强停。
  * 全路径 try-catch：构建/渲染任何异常都卸下覆盖层、恢复原头部、
@@ -149,6 +173,13 @@ object HeaderOverlay {
     private const val COLUME_CONTAINER_CLASS =
         "com.android.systemui.statusbar.phone.HnColumeContainer"
 
+    // 横幅门控（v2.0.6）：类名经反编译核实——HeadsUpManagerImpl
+    // 是新场景架构的横幅管理器，setEntryPinned 是 pinned 状态
+    // 变更的唯一汇聚点，聚合字段 mHasPinnedNotification 即
+    // 系统 mHeadsUpShowing 的同源状态。
+    private const val HEADS_UP_MANAGER_IMPL_CLASS =
+        "com.android.systemui.statusbar.notification.headsup.HeadsUpManagerImpl"
+
     private lateinit var logFn: (String) -> Unit
     private val states = WeakHashMap<View, State>()
     @Volatile
@@ -161,6 +192,14 @@ object HeaderOverlay {
     /** 控制中心页是否展开（HwPanelControlImpl 分发 hook 跟踪；字段读取兜底见 isControlCenterActive）。 */
     @Volatile
     private var controlCenterExpand = false
+
+    /** 横幅是否呈现中（HeadsUpManagerImpl 聚合 pinned 状态 hook 跟踪；字段直读兜底见 isHeadsUpActive）。 */
+    @Volatile
+    private var headsUpPinned = false
+
+    /** hook 回调捕获的 HeadsUpManagerImpl 实例（弱引用），供轮询直读其 mHasPinnedNotification 字段。 */
+    @Volatile
+    private var headsUpManagerRef: WeakReference<Any>? = null
     @Volatile
     private var bellClickLogCount = 0
 
@@ -186,7 +225,7 @@ object HeaderOverlay {
         var diagTicks = 0
         /** 挂起中（锁屏或控制中心页）：覆盖层整组不可见、原头部保持原样，tick 继续跑以便条件解除后自动恢复。 */
         var suspended = false
-        /** 挂起原因："keyguard" / "control-center"，日志与恢复判断用。 */
+        /** 挂起原因："keyguard" / "control-center" / "heads-up"，日志与恢复判断用。 */
         var suspendReason: String? = null
         /** 通知栈（NSSL）及其 AmbientState 的反射句柄（找到后缓存）。 */
         var stackScroller: View? = null
@@ -281,6 +320,7 @@ object HeaderOverlay {
         }
         installKeyguardGate(lpparam, log)
         installControlCenterGate(lpparam, log)
+        installHeadsUpGate(lpparam, log)
         installStackWriteInterceptor(lpparam, log)
     }
 
@@ -359,6 +399,110 @@ object HeaderOverlay {
     }
 
     /**
+     * 横幅门控的信号源（v2.0.6）：hook 宿主 HeadsUpManagerImpl
+     * .setEntryPinned(HeadsUpEntry, PinnedStatus, String)——反编译
+     * 核实它是 pinned 状态变更的唯一汇聚点（onEntryAdded /
+     * onEntryRemoved / updateNotificationInternal 全部经它），
+     * 方法内重算聚合状态、仅在变化时更新字段 mHasPinnedNotification
+     * 并向全部 OnHeadsUpChangedListener 分发
+     * onHeadsUpPinnedModeChanged；系统自己的
+     * StatusBarHeadsUpChangeListener 正是把该回调翻译成窗口状态
+     * mHeadsUpShowing，即「横幅呈现中」的系统定义，与锁屏门控的
+     * setState、控制中心门控的 notifyControlCenterPanelChange
+     * 同构（唯一入口＋去重＋分发）。after 里直读字段跟踪状态；
+     * 状态变化时除每秒 tick 外还即时重评各 State 的门控——横幅
+     * 是瞬时呈现，等 tick 会先压卡片一截。hook 失败时
+     * [isHeadsUpActive] 退化为跟踪值（初始 false），门控不成立
+     * 但其余功能不受影响，日志会写明。
+     */
+    private fun installHeadsUpGate(
+        lpparam: XC_LoadPackage.LoadPackageParam,
+        log: (String) -> Unit,
+    ) {
+        try {
+            val implClass = XposedHelpers.findClass(HEADS_UP_MANAGER_IMPL_CLASS, lpparam.classLoader)
+            val entryClass = XposedHelpers.findClass(
+                "$HEADS_UP_MANAGER_IMPL_CLASS\$HeadsUpEntry", lpparam.classLoader
+            )
+            val pinnedStatusClass = XposedHelpers.findClass(
+                "com.android.systemui.statusbar.notification.headsup.PinnedStatus",
+                lpparam.classLoader
+            )
+            XposedHelpers.findAndHookMethod(
+                implClass, "setEntryPinned",
+                entryClass, pinnedStatusClass, String::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val mgr = param.thisObject ?: return
+                        if (headsUpManagerRef?.get() !== mgr) {
+                            headsUpManagerRef = WeakReference(mgr)
+                        }
+                        val z = try {
+                            XposedHelpers.getBooleanField(mgr, "mHasPinnedNotification")
+                        } catch (t: Throwable) {
+                            return
+                        }
+                        if (z != headsUpPinned) {
+                            headsUpPinned = z
+                            log("heads-up pinned mode -> $z")
+                            reevaluateGatesNow()
+                        }
+                    }
+                }
+            )
+            log("heads-up gate hook installed (HeadsUpManagerImpl.setEntryPinned)")
+        } catch (t: Throwable) {
+            log(
+                "heads-up gate hook failed, gate inactive: " +
+                    "${t.javaClass.name}: ${t.message}"
+            )
+        }
+    }
+
+    /**
+     * 当前是否有横幅正在呈现：优先直读 hook 捕获的 HeadsUpManagerImpl
+     * 实例字段 mHasPinnedNotification（聚合 pinned 状态，与系统
+     * mHeadsUpShowing 同源、随呈现进入/退出即时变化）；实例还没
+     * 捕获到或直读失败时用 hook 跟踪值兜底。本模块只管通知中心
+     * 页，横幅呈现中即挂起；呈现状态的进入/退出以该信号自身
+     * 语义为准（用户下拉展开进完整通知页时 pinned 随场景转换
+     * 退出，门控随之恢复）。
+     */
+    private fun isHeadsUpActive(): Boolean {
+        val mgr = headsUpManagerRef?.get()
+        if (mgr != null) {
+            try {
+                return XposedHelpers.getBooleanField(mgr, "mHasPinnedNotification")
+            } catch (t: Throwable) {
+                // 直读失败退回跟踪值
+            }
+        }
+        return headsUpPinned
+    }
+
+    /**
+     * 即时重评各 State 的页态门控（v2.0.6，横幅 hook 状态变化时
+     * 调用）：横幅呈现是瞬时的，等每秒 tick 会先压卡片一截；
+     * 这里把 tick 的门控一轮（[applyGate]）post 到各 State 的
+     * handler 上立即执行——post 而非在 hook 调用栈内同步做，
+     * 避开宿主 setEntryPinned 尚在通知管线中途的重入。tick 仍
+     * 是兜底（hook 装不上或状态漏变时靠它收敛）。
+     */
+    private fun reevaluateGatesNow() {
+        val snapshot = synchronized(states) { states.values.toList() }
+        for (st in snapshot) {
+            st.handler.post {
+                try {
+                    val registered = synchronized(states) { states[st.header] === st }
+                    if (registered) applyGate(st)
+                } catch (t: Throwable) {
+                    logFn("overlay gate reevaluate failed: ${t.javaClass.name}: ${t.message}")
+                }
+            }
+        }
+    }
+
+    /**
      * 当前是否处于控制中心页：优先读头部父容器 HnColumeContainer 的
      * 镜像字段 isControlCenterExpand（宿主自己的 ControlCenter 监听
      * 维护、与分发状态严格同步，头部直父就是它）；读不到再用 hook
@@ -379,10 +523,11 @@ object HeaderOverlay {
         return controlCenterExpand
     }
 
-    /** 挂起原因：null=可挂载；锁屏优先于控制中心（两者可同时成立）。 */
+    /** 挂起原因：null=可挂载；优先级 锁屏 > 控制中心 > 横幅（可同时成立，取先者记日志）。 */
     private fun suspendReason(header: ViewGroup): String? = when {
         isKeyguardActive(header.context) -> "keyguard"
         isControlCenterActive(header) -> "control-center"
+        isHeadsUpActive() -> "heads-up"
         else -> null
     }
 
@@ -428,7 +573,7 @@ object HeaderOverlay {
             val st = synchronized(states) {
                 states.getOrPut(header) { State(header) }
             }
-            // 页态门控（v2.0.3 锁屏 / v2.0.4 加控制中心）：头部在锁屏
+            // 页态门控（v2.0.3 锁屏 / v2.0.4 控制中心 / v2.0.6 横幅）：头部在锁屏
             // 通知区与控制中心页里同样存在，覆盖层挂上去会盖住锁屏
             // 自己的大时钟、压住控制中心瓷砖。本模块只管解锁后下拉
             // 的通知中心页——其余页态不挂覆盖层、不隐藏原头部，只
@@ -446,7 +591,8 @@ object HeaderOverlay {
                 st.suspendReason = null
                 logFn(
                     "overlay resumed: $prevReason cleared " +
-                        "(state=$statusBarState, cc=${isControlCenterActive(header)}) " +
+                        "(state=$statusBarState, cc=${isControlCenterActive(header)}, " +
+                        "hun=${isHeadsUpActive()}) " +
                         "wrapperVis=${st.wrapper?.visibility} bellVis=${st.bell?.visibility}"
                 )
             }
@@ -1215,6 +1361,32 @@ object HeaderOverlay {
 
     // ---------- tick ----------
 
+    /**
+     * 页态门控一轮（tick 与横幅 hook 的即时重评共用）：返回 true
+     * 表示本轮已被门控处理——挂起中（保持整组 GONE，挂起期间
+     * 戳记变了仍走 attach 以便切回原头部等设置变更生效），或
+     * 刚从挂起恢复并已由 attach 重新挂载；调用方不要再走稳态
+     * 路径。返回 false 才是稳态（覆盖层正常挂载中）。
+     */
+    private fun applyGate(st: State): Boolean {
+        val reason = suspendReason(st.header)
+        if (reason != null) {
+            if (!st.suspended || st.suspendReason != reason) {
+                suspendOverlay(st.header, st, reason)
+            }
+            val mtimeKg = StampStore.stampMtime()
+            if (st.stampMtimeSeen >= 0 && mtimeKg != st.stampMtimeSeen) {
+                attach(st.header)
+            }
+            return true
+        }
+        if (st.suspended) {
+            attach(st.header)
+            return true
+        }
+        return false
+    }
+
     private fun startTicker(st: State) {
         if (st.ticker != null) return
         val runnable = object : Runnable {
@@ -1227,22 +1399,11 @@ object HeaderOverlay {
                         st.ticker = null
                         return
                     }
-                    // 页态门控（v2.0.3 锁屏 / v2.0.4 加控制中心）：
-                    // 挂起期保持整组 GONE，条件解除后经 attach 恢复。
-                    val reason = suspendReason(st.header)
-                    if (reason != null) {
-                        if (!st.suspended || st.suspendReason != reason) {
-                            suspendOverlay(st.header, st, reason)
-                        }
-                        val mtimeKg = StampStore.stampMtime()
-                        if (st.stampMtimeSeen >= 0 && mtimeKg != st.stampMtimeSeen) {
-                            attach(st.header)
-                        }
-                        st.handler.postDelayed(this, 1000L)
-                        return
-                    }
-                    if (st.suspended) {
-                        attach(st.header)
+                    // 页态门控（v2.0.3 锁屏 / v2.0.4 控制中心 /
+                    // v2.0.6 横幅）：与横幅 hook 的即时重评共用
+                    // applyGate；挂起期保持整组 GONE，条件解除后
+                    // 经 attach 恢复。
+                    if (applyGate(st)) {
                         st.handler.postDelayed(this, 1000L)
                         return
                     }
@@ -1382,7 +1543,7 @@ object HeaderOverlay {
     }
 
     /**
-     * 页态挂起（v2.0.3 锁屏 / v2.0.4 加控制中心）：把覆盖层整组
+     * 页态挂起（v2.0.3 锁屏 / v2.0.4 控制中心 / v2.0.6 横幅）：把覆盖层整组
      * （含铃铛）藏起来、原头部内容与高度恢复原样，但保留 State 与
      * tick——回到通知中心页后 tick 会经 attach 自动恢复挂载。
      * 与 teardown 的区别：不摘状态、不停 tick。挂起/原因变化时各
@@ -1418,7 +1579,7 @@ object HeaderOverlay {
         if (!wasSuspended || prevReason != reason) {
             logFn(
                 "overlay suspended: $reason (state=$statusBarState, " +
-                    "cc=${isControlCenterActive(header)}) " +
+                    "cc=${isControlCenterActive(header)}, hun=${isHeadsUpActive()}) " +
                     "wrapperVis=${st.wrapper?.visibility} bellVis=${st.bell?.visibility}"
             )
         }

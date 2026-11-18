@@ -261,7 +261,7 @@ private fun SettingsScreen() {
                 .padding(innerPadding),
         ) {
             Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-                SmallTitle(text = "正式版 v2.0.5", insideMargin = PaddingValues(start = 4.dp))
+                SmallTitle(text = "正式版 v2.0.6", insideMargin = PaddingValues(start = 4.dp))
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     cornerRadius = 20.dp,
