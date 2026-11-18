@@ -486,6 +486,24 @@ object HeaderOverlay {
     @Volatile
     private var shadeContainerVisible = true
 
+    /**
+     * 下拉跟踪门（v2.0.16）：桌面（Gone）出发的下拉手势正在进行
+     * 中——由 [installShadePullGate] hook 的两个手势意图检测器
+     * onProgressUpdate 逐帧喂进度，progress>0 即置位、回到 0 或
+     * 容器可见标志翻 false（关闭动画落定）时清位。为什么需要它：
+     * [shadeContainerVisible] 在首次关闭后就停在 false，而宿主在
+     * 后续下拉中要等进度过 0.3 触发展开、头部动画集创建时
+     * （setNtfPanelHeaderView）才把它写回 true——只认它当门，
+     * 每次下拉的前段覆盖层都被压在 alpha=0（真机 v2.0.15 会话
+     * 日志实证：首次下拉前无 false 翻转、后续每次关闭都落
+     * false）；进程重启后第一次下拉之所以正常，是因为宿主
+     * CombineAlpha 与本跟踪值的初值都是 true、还没被关过。
+     * 下拉一开始（progress 从 0 起）就开门，覆盖层从第一帧跟
+     * time 路亮起、随面板位置下行，与第一次下拉表现一致。
+     */
+    @Volatile
+    private var shadePullTracking = false
+
     @Volatile
     private var shadeContainerX = 0f
 
@@ -514,9 +532,23 @@ object HeaderOverlay {
      * 切换 setViewAlpha 对两路同帧同值、开合 fling 动画集对
      * 两路同写，time 路一条即载全程；收尾仍有 visible=false
      * 的 0 门兜底，面板全关不残留。
+     *
+     * v2.0.15 真机又报「重启后第一次下拉是好的、之后又先空白
+     * 再闪出」：迟到的不再是 alpha 通道而是这道 visible 门
+     * 本身——宿主写 visible=true 的时机（反编译逐点核实）全
+     * 在下拉后段：进度过 0.3 展开触发后建头部动画集时
+     * setNtfPanelHeaderView、fling 动画集 onAnimationEnd、
+     * 场景落定 Idle；而写 false 在关闭动画落定。故第一次关闭
+     * 之后 visible 就停在 false，后续每次下拉的前段（跟手
+     * 期）整簇被门压死、等门开了才整幅闪出；第一次下拉没被
+     * 关过、初值 true 才全程在场。故 v2.0.16 起门改为二选一：
+     * visible 为 true，或下拉跟踪门 [shadePullTracking] 已开
+     * （桌面下拉 progress>0）。全关静止时两者皆关（visible
+     * 在关闭落定写 false 的同一处把跟踪门也清位），桌面不
+     * 残留的兜底不变。
      */
     private fun effectiveShadeAlpha(): Float =
-        if (!shadeContainerVisible) 0f
+        if (!shadeContainerVisible && !shadePullTracking) 0f
         else shadeTimeAlpha.coerceIn(0f, 1f)
 
     /** 预热好的主题（install 阶段后台线程 load + 位图预解码完成），attach 时按 (themeId, stamp) 吻合采纳。 */
@@ -676,6 +708,7 @@ object HeaderOverlay {
         installHeadsUpGate(lpparam, log)
         installStackWriteInterceptor(lpparam, log)
         installHeaderAnimFollow(lpparam, log)
+        installShadePullGate(lpparam, log)
         // 首显预热（v2.0.11）：进程启动就在后台把 stamp 读取与
         // 主题加载（解析/字体/位图预解码）做完，attach 零 IO。
         startPreheat()
@@ -791,6 +824,12 @@ object HeaderOverlay {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val v = (param.args.getOrNull(0) as? Boolean) ?: return
+                        if (!v) {
+                            // 关闭落定：下拉跟踪门一并清位，保证全关
+                            // 静止时两门皆关（v2.0.16，见
+                            // effectiveShadeAlpha 注）。
+                            shadePullTracking = false
+                        }
                         if (v != shadeContainerVisible) {
                             shadeContainerVisible = v
                             // 翻转逐次记一行供真机核对跟随链。注意
@@ -817,6 +856,62 @@ object HeaderOverlay {
             log("header anim follow hooks installed ($installed/5 on NotifCenterHeaderInteractorImpl)")
         } else {
             log("header anim follow hooks all failed, pre-draw translationX sampling fallback")
+        }
+    }
+
+    /**
+     * 下拉跟踪门（v2.0.16）：hook 场景下拉/收起的两个手势意图
+     * 检测器 onProgressUpdate(float)——反编译 StatusBarPullAnim
+     * BinderImpl 的场景状态收集器核实：与 Gone 相关的场景过渡
+     * 在跟踪与 fling 期间逐帧把 progress 喂给检测器（从桌面出
+     * 发的下拉喂 PullDownGestureIntentDetector、其余 Gone 相关
+     * 收合喂 CollapseGestureIntentDetector），progress 从 0 起
+     * 第一帧就到，比 interactor 的 visible=true（进度 0.3 展
+     * 开触发后才写）早一整段跟手期。progress>0 即开门
+     * [shadePullTracking] 并立即重跑合成，覆盖层在下拉第一帧
+     * 就跟 time 路亮起；progress 回到 0（取消回弹到顶）即清
+     * 位。关闭落定的清位在 updateContainerVisible(false) 的
+     * 同一处（见 installHeaderAnimFollow）。任一 hook 装失败
+     * 只记一行、门退化为只认 visible（即 v2.0.15 行为），其
+     * 余功能不受影响。
+     */
+    private fun installShadePullGate(
+        lpparam: XC_LoadPackage.LoadPackageParam,
+        log: (String) -> Unit,
+    ) {
+        var installed = 0
+        for (className in listOf(
+            "com.android.systemui.statusbar.phone.PullDownGestureIntentDetector",
+            "com.android.systemui.statusbar.phone.CollapseGestureIntentDetector",
+        )) {
+            try {
+                val detectorClass = XposedHelpers.findClass(className, lpparam.classLoader)
+                XposedHelpers.findAndHookMethod(
+                    detectorClass, "onProgressUpdate", Float::class.javaPrimitiveType,
+                    object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            val f = (param.args.getOrNull(0) as? Float) ?: return
+                            val active = f > 0f
+                            if (active != shadePullTracking) {
+                                shadePullTracking = active
+                                logFn("shade pull tracking -> $active (progress=$f)")
+                                applyComposedToAllStates()
+                            }
+                        }
+                    }
+                )
+                installed++
+            } catch (t: Throwable) {
+                log(
+                    "shade pull gate hook failed for $className: " +
+                        "${t.javaClass.name}: ${t.message}"
+                )
+            }
+        }
+        if (installed > 0) {
+            log("shade pull gate hooks installed ($installed/2 gesture intent detectors)")
+        } else {
+            log("shade pull gate hooks all failed, visible-flag gate only (v2.0.15 behavior)")
         }
     }
 
@@ -2483,6 +2578,7 @@ object HeaderOverlay {
                 "wrapper=[${wrapper?.left},${wrapper?.top},${wrapper?.right},${wrapper?.bottom}] " +
                 "vis=${wrapper?.visibility} alpha=${wrapper?.alpha} " +
                 "effA=${effectiveShadeAlpha()} visFlag=$shadeContainerVisible " +
+                "pullTrk=$shadePullTracking " +
                 "chA=$shadeCommonAlpha/$shadeTimeAlpha " +
                 "cXY=${shadeContainerX}/${shadeContainerY} " +
                 "hTXY=${header.translationX}/${header.translationY} " +
