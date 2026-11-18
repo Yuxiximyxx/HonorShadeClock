@@ -612,8 +612,8 @@ object HeaderCentering {
         }
         api.placeRelativeMethod.invoke(null, scope, datePlaceable, centeredX, dateY)
         // timePositionInParent 回写：与原版逐字一致（x = density * f$10，y = dateY 的 float 位模式）
-        val offsetPacked = (Float.floatToRawIntBits(density * fMargin).toLong() shl 32) or
-            (Float.floatToRawIntBits(dateY.toFloat()).toLong() and 0xFFFF_FFFFL)
+        val offsetPacked = ((density * fMargin).toRawBits().toLong() shl 32) or
+            (dateY.toFloat().toRawBits().toLong() and 0xFFFF_FFFFL)
         val offsetBoxed = api.offsetBoxMethod.invoke(null, offsetPacked)
         api.updateStateMethod.invoke(timePosFlow, null, offsetBoxed)
 
