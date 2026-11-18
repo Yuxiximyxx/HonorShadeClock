@@ -32,7 +32,7 @@
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="探针版：定位 MagicOS 11 通知中心顶部时钟控件的视图结构，为居中大时钟做准备。不改任何样式。" />
+            android:value="通知中心大时钟：把 MagicOS 11 通知中心顶部时钟居中并放大（时钟 54dp、日期 16dp）。" />
         <meta-data
             android:name="xposedminversion"
             android:value="82" />

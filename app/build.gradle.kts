@@ -24,8 +24,8 @@ android {
         applicationId = "io.github.yuxiximyxx.shadeclock"
         minSdk = 34   // Android 14 (MagicOS 8 起，与 MagicPods 一致)
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.3.0"
+        versionCode = 5
+        versionName = "1.0.0"
     }
 
     signingConfigs {
@@ -108,7 +108,7 @@ android {
 }
 
 /**
- * 打包后校验传统 Xposed 模块声明：assets/xposed_init 必须存在且指向探针入口类。
+ * 打包后校验传统 Xposed 模块声明：assets/xposed_init 必须存在且指向模块入口类。
  * 该文件一旦被打包规则吞掉，LSPosed 就识别不到模块，而构建仍会「成功」——强制校验。
  */
 val verifyXposedModule = tasks.register("verifyXposedModule") {

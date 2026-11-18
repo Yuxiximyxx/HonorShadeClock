@@ -5,3 +5,4 @@
 
 # Xposed API 由 LSPosed 在运行时提供，APK 内不存在这些类
 -dontwarn de.robv.android.xposed.**
+-dontwarn android.content.res.XResources**

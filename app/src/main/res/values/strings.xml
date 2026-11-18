@@ -1,6 +1,6 @@
 <resources>
     <string name="app_name">通知中心大时钟</string>
-    <string name="app_subtitle">定位 MagicOS 通知中心时钟控件，为居中大时钟做准备</string>
+    <string name="app_subtitle">把 MagicOS 11 通知中心顶部时钟居中并放大</string>
 
     <!-- 作用域：只需要 SystemUI（通知中心时钟所在进程） -->
     <string-array name="xposedscope">

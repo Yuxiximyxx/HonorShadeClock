@@ -31,7 +31,7 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.ThemeController
 
 /**
- * 探针版主界面：只说明用途与取日志步骤，没有任何可调功能。
+ * 正式版主界面：说明功能效果、生效方式与关闭办法，没有可调开关。
  * 样式照 MagicPods v2.11 的 MIUIX 写法（MiuixTheme + Scaffold + SmallTopAppBar + Card）。
  */
 class MainActivity : ComponentActivity() {
@@ -54,13 +54,13 @@ class MainActivity : ComponentActivity() {
             val controller = remember(dark) {
                 ThemeController(if (dark) ColorSchemeMode.Dark else ColorSchemeMode.Light)
             }
-            MiuixTheme(controller = controller) { ProbeHome() }
+            MiuixTheme(controller = controller) { HomeScreen() }
         }
     }
 }
 
 @Composable
-private fun ProbeHome() {
+private fun HomeScreen() {
     Scaffold(
         containerColor = MiuixTheme.colorScheme.background,
         topBar = {
@@ -77,7 +77,7 @@ private fun ProbeHome() {
                 .padding(innerPadding),
         ) {
             Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-                SmallTitle(text = "探针版 v0.3.0", insideMargin = PaddingValues(start = 4.dp))
+                SmallTitle(text = "正式版 v1.0.0", insideMargin = PaddingValues(start = 4.dp))
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     cornerRadius = 20.dp,
@@ -85,12 +85,12 @@ private fun ProbeHome() {
                 ) {
                     Column {
                         Text(
-                            "这个版本不改任何样式，只做一件事：定位荣耀 MagicOS 11 通知中心顶部时钟控件的运行时结构，为正式版把时钟改成居中大时钟提供落点。v0.2.0 改用整棵视图树遍历：每 5 秒把 SystemUI 全部窗口的视图树扫一遍，直接读取控件当前的类名、id、文本、尺寸与位置，不再只依赖 setText。v0.3.0 已确认头部是一个 Compose 容器，本版专门给它做一次图纸测绘（类结构与 Compose 语义树），为正式版选改法。",
+                            "把荣耀 MagicOS 11 通知中心顶部的时钟改成居中显示的大时钟：时钟和日期整组水平居中，时钟字号由 40dp 放大到 54dp，日期字号由 14dp 放大到 16dp。流量行、右上角铃铛按钮和原动画保持原样。",
                             fontSize = 14.sp,
                             color = MiuixTheme.colorScheme.onSurface,
                         )
                         Text(
-                            "探针只读取视图信息，绝不修改任何视图属性。",
+                            "模块带结构自检：系统版本变化导致头部结构对不上时，居中会自动跳过、只保留放大，不会硬改；居中逻辑万一运行时出错也会立即回退系统原逻辑。",
                             fontSize = 14.sp,
                             color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                             modifier = Modifier.padding(top = 8.dp),
@@ -99,7 +99,7 @@ private fun ProbeHome() {
                 }
 
                 SmallTitle(
-                    text = "使用步骤",
+                    text = "生效方式",
                     insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
                 )
                 Card(
@@ -108,16 +108,14 @@ private fun ProbeHome() {
                     insideMargin = PaddingValues(16.dp),
                 ) {
                     Column {
-                        Text("1. 覆盖安装本新版 v0.3.0（直接装，不用先卸载旧版）", fontSize = 14.sp)
-                        Text("2. 在 LSPosed 里确认模块已启用，作用域仍勾着「系统界面（SystemUI）」", fontSize = 14.sp, modifier = Modifier.padding(top = 8.dp))
-                        Text("3. 强停一次系统界面，让探针注入新进程", fontSize = 14.sp, modifier = Modifier.padding(top = 8.dp))
-                        Text("4. 下拉通知中心并保持打开约 10 秒，再关掉", fontSize = 14.sp, modifier = Modifier.padding(top = 8.dp))
-                        Text("5. 把日志文件发回即可（见下方路径）", fontSize = 14.sp, modifier = Modifier.padding(top = 8.dp))
+                        Text("1. 在 LSPosed 里启用本模块，作用域勾「系统界面（SystemUI）」", fontSize = 14.sp)
+                        Text("2. 强停一次系统界面（或重启手机），让模块注入新进程", fontSize = 14.sp, modifier = Modifier.padding(top = 8.dp))
+                        Text("3. 下拉通知中心即可看到居中大时钟", fontSize = 14.sp, modifier = Modifier.padding(top = 8.dp))
                     }
                 }
 
                 SmallTitle(
-                    text = "日志输出",
+                    text = "关闭办法",
                     insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
                 )
                 Card(
@@ -129,12 +127,12 @@ private fun ProbeHome() {
                 ) {
                     Column {
                         Text(
-                            "/sdcard/Download/shadeclock_probe.log",
+                            "在 LSPosed 里停用本模块，再强停一次系统界面（或重启手机），通知中心即恢复原样。",
                             fontSize = 14.sp,
                             color = MiuixTheme.colorScheme.onSurface,
                         )
                         Text(
-                            "LSPosed 日志里只记每轮的标题行，控件明细都在这个文件里（搜 probe v2 pass）。",
+                            "模块的安装结果与字号验读会写一行到 /sdcard/Download/shadeclock_probe.log，排查问题时可看这个文件。",
                             fontSize = 14.sp,
                             color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                             modifier = Modifier.padding(top = 8.dp),
