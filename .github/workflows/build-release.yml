@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.29-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.30-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.29-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.30-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,39 +68,37 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.29
-          name: HonorShadeClock 2.0.29 — 只修去控制中心一闪：目的页闩抢在呈现之前归零
+          tag_name: v2.0.30
+          name: HonorShadeClock 2.0.30 — 去掉一下拉就全显：出现改随下拉行程渐入
           body: |
-            ## HonorShadeClock 2.0.29
+            ## HonorShadeClock 2.0.30
 
-            只修最后一处闪烁：下拉打开控制中心时，
-            时钟簇会在控制中心页上闪一下。2.0.28 已
-            过关的收起末段与控制中心回滑本版未动。
+            只改一件事：去掉「一下拉就全显」的起手
+            闪。小乐真机定位（2.0.29）：从状态栏下
+            拉打开通知中心或控制中心，起手都会先闪
+            一下——通知中心里闪完本就该显示时钟、
+            不突兀；控制中心里随即被摘掉，格外刺眼。
 
-            定案（.28 真机日志逐行对位 + 反编译互
-            证）：日常的「下拉打开控制中心」不走横
-            滑切换路径，而是面板打开行程中（展开比
-            例约 0.3）落定通知就直接切页——这个通
-            知是动画开始侧的信号，不是呈现完成信
-            号。2.0.28 对它的响应是约 110ms 淡出：
-            簇在控制中心已经呈现的页面上从全不透明
-            慢慢淡掉——这段淡出本身就是看到的那一
-            闪（它压根不该在控制中心露面）。更糟的
-            是宿主在动画末尾还会把原头部的透明度通
-            道写回全开，通道跟随在那一刻也救不回来。
+            定案（2.0.29 真机日志两会话逐轮对位）：
+            每一轮下拉，收尾门都在展开比例
+            0.34–0.47 处才打开（落定隔离+开门确认
+            走完），而面板因子的旧饱和点是 0.18——
+            开门那一刻因子早已是 1.0、通道 alpha
+            也是 1.0，合成 alpha 一帧内从 0 直跳
+            1.0；此时面板只展开约三分之一、背景还
+            没铺开，整簇全强度浮在桌面上，就是那
+            一闪。目的页闩在开门之后才置位，治的
+            是落定后露面，治不了起手这一帧。
 
-            修法：新增「目的页闩」——直接 hook 宿
-            主面板控制器的目的页入口（去控制中心的
-            展开/滑动方法与页面类型汇聚点），这些信
-            号在动画开始、落定通知到达之前就已发
-            出。闩一置位，覆盖层透明度与通道值无关
-            地归零并在同一调用栈内立即生效，赶在控
-            制中心第一帧呈现之前；宿主之后写回什么
-            都顶不起来。回程的清闩点都在通知页呈现
-            侧入口，返回时的淡入照旧在通知页上发
-            生；横滑切换期闩被豁免、逐帧跟随不变；
-            闩与落定真相每轮对账，漏接信号也不会
-            把通知页显示吞掉。
+            修法（小乐拍板的新口径，取代 v2.0.15
+            以来的「下拉第一帧就在场」）：出现改
+            随下拉行程渐入——展开比例 0.40 以下
+            因子为 0，0.40–0.90 之间 smoothstep
+            平滑上升，近全开才全显。开门时刻因子
+            ≈0，fling 后段约 200ms 走完渐入。收
+            起行程（已真机过关）一字未动，仍是旧
+            曲线只降不升；目的页闩、横滑跟随、三
+            道门控、通知避让均未动。
 
             生效方式：覆盖安装 → 打开一次设置页 →
             用「重启系统界面」按钮重载 → 下拉确认。
