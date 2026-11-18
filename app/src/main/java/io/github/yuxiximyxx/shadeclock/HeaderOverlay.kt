@@ -320,6 +320,17 @@ import kotlin.math.roundToInt
  * 不抄：覆盖层是整簇单 View、原头部那是分元素形变，量级与
  * 场景都对不上。
  *
+ * v2.0.13 修锁屏瞬间闪现：按电源键锁屏时，锁屏界面已展示、
+ * setState 门控（落定信号）还没到，时钟簇会闪 1–2 帧。加
+ * ACTION_SCREEN_OFF 预挂起：灭屏广播在 SystemUI 进程内即时
+ * 到达、早于 keyguard 展示完成，收到即置预挂起标志并立即对
+ * 全部 State 重评门控、按既有 keyguard 路径藏整组；setState
+ * 门控保留作兜底对账。ACTION_SCREEN_ON 清标志并重评——灭屏
+ * 不等于锁屏（无锁/智能解锁下亮屏直接回通知页），恢复走
+ * applyGate 既有口径，不会把样式卡在挂起态。接收器在首次
+ * attach 时以宿主 applicationContext 注册（进程级、只注册
+ * 一次，回调默认在主线程，与 tick 的门控重评同路径）。
+ *
  * 设置经 StampStore 的 stamp.txt 跨进程传递；覆盖层挂载时与每秒
  * tick 比对戳记，变了就重解析重载——切换主题免强停。
  * 全路径 try-catch：构建/渲染任何异常都卸下覆盖层、恢复原头部、
@@ -382,6 +393,20 @@ object HeaderOverlay {
     /** 宿主状态栏状态（StatusBarStateControllerImpl.setState 跟踪）；-1=尚未知。 */
     @Volatile
     private var statusBarState = -1
+
+    /**
+     * 灭屏预挂起（v2.0.13）：ACTION_SCREEN_OFF 置位、
+     * ACTION_SCREEN_ON 清位。setState 是落定信号、晚于锁屏
+     * 界面实际展示，灭屏广播先到，先按 keyguard 口径把整组
+     * 藏掉止闪；亮屏后由 setState 门控对账（真锁屏继续挂起、
+     * 无锁直回通知页经 applyGate 恢复）。
+     */
+    @Volatile
+    private var screenOffPreSuspend = false
+
+    /** 灭屏/亮屏接收器是否已注册（进程级只注册一次）。 */
+    @Volatile
+    private var screenGateReceiverRegistered = false
 
     /** 控制中心页是否展开（HwPanelControlImpl 分发 hook 跟踪；字段读取兜底见 isControlCenterActive）。 */
     @Volatile
@@ -865,6 +890,71 @@ object HeaderOverlay {
     }
 
     /**
+     * 灭屏预挂起（v2.0.13）：注册 ACTION_SCREEN_OFF /
+     * ACTION_SCREEN_ON 接收器（宿主 applicationContext、进程级
+     * 只注册一次；两参 registerReceiver 的回调默认走进程主
+     * 线程，与 tick 的门控重评同线程同路径）。灭屏广播在
+     * keyguard 展示完成之前就到达——收到即置 [screenOffPreSuspend]
+     * 并立即对全部 State 重评门控，按既有 keyguard 路径藏整组，
+     * 抢在 setState 落定信号之前止住锁屏瞬间闪现。亮屏清位并
+     * 重评：真锁屏由 setState 门控继续挂起，无锁直回通知页由
+     * applyGate 的既有恢复路径接上，不会卡在挂起态。注册失败
+     * 只记一行，门控退回 setState 单路（行为同 v2.0.12）。
+     */
+    private fun ensureScreenGateReceiver(header: ViewGroup) {
+        if (screenGateReceiverRegistered) return
+        try {
+            val appContext = header.context.applicationContext ?: header.context
+            val receiver = object : BroadcastReceiver() {
+                override fun onReceive(c: Context?, intent: Intent?) {
+                    when (intent?.action) {
+                        Intent.ACTION_SCREEN_OFF -> {
+                            if (screenOffPreSuspend) return
+                            screenOffPreSuspend = true
+                            logFn("screen off: overlay pre-suspended ahead of keyguard gate")
+                            reevaluateAllStates()
+                        }
+                        Intent.ACTION_SCREEN_ON -> {
+                            if (!screenOffPreSuspend) return
+                            screenOffPreSuspend = false
+                            logFn("screen on: screen-off pre-suspend cleared, gates re-evaluated")
+                            reevaluateAllStates()
+                        }
+                    }
+                }
+            }
+            val filter = IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_SCREEN_ON)
+            }
+            appContext.registerReceiver(receiver, filter)
+            screenGateReceiverRegistered = true
+            logFn("screen off/on pre-suspend receiver registered")
+        } catch (t: Throwable) {
+            logFn(
+                "screen gate receiver register failed, keyguard gate only: " +
+                    "${t.javaClass.name}: ${t.message}"
+            )
+        }
+    }
+
+    /**
+     * 对全部已登记 State 立即重评一次门控（与 tick 内 applyGate
+     * 同一路径）：该挂起的按现原因挂起、该恢复的经 attach 恢复。
+     * 供灭屏/亮屏广播即时调用，不等下一轮 1 秒 tick。
+     */
+    private fun reevaluateAllStates() {
+        val snapshot = synchronized(states) { states.values.toList() }
+        for (st in snapshot) {
+            try {
+                applyGate(st)
+            } catch (t: Throwable) {
+                logFn("gate re-evaluate failed: ${t.javaClass.name}: ${t.message}")
+            }
+        }
+    }
+
+    /**
      * 控制中心门控的信号源（v2.0.4）：hook 宿主 HwPanelControlImpl
      * .notifyControlCenterPanelChange(boolean)——反编译核实它是
      * 控制中心页状态的分发唯一入口（与旧值相同直接返回、更新
@@ -1172,6 +1262,9 @@ object HeaderOverlay {
      * 锁屏与横幅是终态门控，过渡期照样硬挂起、不参与跟随。
      */
     private fun suspendReason(header: ViewGroup): String? = when {
+        // 灭屏预挂起（v2.0.13）：灭屏瞬间即成立、早于 setState
+        // 落定，原因记 keyguard 与锁屏挂起同路（恢复日志口径一致）。
+        screenOffPreSuspend -> "keyguard"
         isKeyguardActive(header.context) -> "keyguard"
         isControlCenterActive(header) && !pageSwitching -> "control-center"
         isHeadsUpActive() -> "heads-up"
@@ -1232,6 +1325,9 @@ object HeaderOverlay {
     // ---------- 挂载 ----------
 
     private fun attach(header: ViewGroup) {
+        // 灭屏预挂起接收器（v2.0.13）：与覆盖层是否挂载无关，
+        // 首次 attach 时顺手注册（进程级一次）。
+        ensureScreenGateReceiver(header)
         if (processFailureCount >= MAX_FAILURES) return
         try {
             val stamp = StampStore.readStamp()
