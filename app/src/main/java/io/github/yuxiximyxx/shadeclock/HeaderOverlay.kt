@@ -405,9 +405,28 @@ object HeaderOverlay {
      * 开门时间确认窗（v2.0.25）：收尾门从「已关」转「想开」
      * 的判定须持续成立至少这段时间（约半帧）才放行——滤掉
      * 关落定后宿主状态复位把展开比例一次性打回高值的单次
-     * 采样尖峰（定案见 [updateCloseTailLatch] 注）。
+     * 采样尖峰（v2.0.25 定案；v2.0.28 起主防线见
+     * [shadeSettledClosed] 注、本确认只作第二层）。
      */
     private const val OPEN_CONFIRM_MS = 8L
+
+    /**
+     * 面板连续因子饱和点（v2.0.28）：展开比例达到该值即全
+     * 不透明，见 [computePanelFactor]。
+     */
+    private const val PANEL_FACTOR_SATURATION = 0.18f
+
+    /**
+     * 控制中心挂起/恢复的 alpha 斜坡全程（v2.0.28）：二值
+     * 切断改连续淡入淡出，见 [startCcFadeLoop]。
+     */
+    private const val CC_FADE_FULL_MS = 110f
+
+    /**
+     * 连续因子（标志抑制/CC 淡变）的斜率全程（v2.0.28）：
+     * 与通道 alpha 的 90ms 斜率限制同量级。
+     */
+    private const val FACTOR_FULL_MS = 90f
 
     /** 页面切换取证的行数上限（v2.0.27，见 [logSwitchTrace]）。 */
     private const val SWITCH_TRACE_MAX = 60
@@ -717,16 +736,11 @@ object HeaderOverlay {
         var gateLogCount = 0
         /** 二值收尾门上次应用的判定（null=尚未应用），翻转才记日志/刷新。 */
         var gateClosed: Boolean? = null
-        /**
-         * 收尾早关 latch（v2.0.24）：关闭行程中已按「宿主先藏
-         * 头部」提前关门——置位后保持关，直到展开比例回升超
-         * 过触发点（手势反转）或容器可见标志回到 true 或面板
-         * 落定（比例 0，此时由落定判据接管）。见
-         * [updateCloseTailLatch]。
-         */
-        var gateTailLatched = false
-        /** 早关 latch 的触发比例（反转解除的基准）。 */
-        var gateTailFraction = 0f
+        // 收尾早关 latch（v2.0.24 立、v2.0.27 真机证伪）已于
+        // v2.0.28 退役：其触发证据（关闭行程中容器标志翻
+        // false）改由 visSuppress 以 alpha 斜坡连续化承接，
+        // 落定判据改由 shadeSettledClosed 的关闭行程守卫 +
+        // 落定隔离承接（见各处注）。
         /**
          * 开门时间确认的起点（v2.0.25）：收尾门已关时出现
          * 第一发「想开」评估的时刻，-1=无待确认；持续成立
@@ -734,12 +748,8 @@ object HeaderOverlay {
          * [applyWrapperVisibility]。
          */
         var gateOpenConfirmAtMs = -1L
-        /**
-         * 早关 latch 解除（手势反转）的时间确认起点
-         * （v2.0.25）：比例越过解除阈值的第一发评估时刻，
-         * -1=无待确认，见 [updateCloseTailLatch]。
-         */
-        var gateLatchReleaseAtMs = -1L
+        // latch 解除确认（v2.0.25）随 latch 一并退役
+        // （v2.0.28）：开门只剩 gateOpenConfirmAtMs 一道确认。
         /**
          * 开门/latch 解除的时间确认复评是否已在主线程队列里
          * （v2.0.26）：确认起点一落就排一发延迟复评，确认的
@@ -761,11 +771,66 @@ object HeaderOverlay {
          * 位、回落到落定开门，不会永久等下去。
          */
         var resumeAwaitFollow = false
+        /**
+         * 落定后隔离（v2.0.28）：展开比例到过 0（真落定关）
+         * 后武装——收尾门重新开门前必须先观测到一次「行程
+         * 进展」（比例穿过中间值且不在关闭行程中，或跟踪/
+         * 瞬时展开信号在场，见 [updatePanelJourney]）。关落
+         * 定后宿主把面板高度一次性打回满值（比例 0→1.0 单
+         * 步跳变、无任何行程信号）不算进展、门保持关。真开
+         * 门（跟手或动画）必然穿过中间值，不受影响。
+         */
+        var gateQuarantine = false
+        /** 本轮开行程里是否已观测到进展（见 [gateQuarantine]）。 */
+        var gateProgressionSeen = false
+        /**
+         * 面板连续因子（v2.0.28）：由展开比例连续驱动的透
+         * 明度乘子（饱和点 [PANEL_FACTOR_SATURATION]），关
+         * 闭行程中只降不升（单调），见 [computePanelFactor]。
+         * 与二值收尾门分工：门管终态清理、因子管行程中的
+         * 每一帧。
+         */
+        var panelFactor = 1f
+        /** 因子上次采样的展开比例（判下落用）。 */
+        var factorLastFraction: Float? = null
+        /**
+         * 容器标志抑制（v2.0.28）：关闭行程中容器可见标志
+         * 翻 false 后置位——原头部在那一刻退出，覆盖层的
+         * [visFactor] 随之用 90ms 斜坡淡出（早关 latch 的连
+         * 续化替代：触发证据与 .24 相同，但落到 alpha 上、
+         * 不再是二值 GONE）。标志回 true / 比例归零 / 页面
+         * 切换 / 比例回升越过置位点 0.05 时清位。
+         */
+        var visSuppress = false
+        /** 抑制置位时的展开比例（回升解除的基准）。 */
+        var visSuppressFraction = 0f
+        /** 标志抑制的已应用因子与时刻（斜坡用，见 [applyComposedTransform]）。 */
+        var visFactor = 1f
+        var visFactorAtMs = 0L
+        /**
+         * 控制中心淡变因子（v2.0.28）：控制中心页的挂起/恢
+         * 复不再二值切断/弹入——挂起先把 [ccFade] 斜坡到 0
+         * 再落定整组 GONE、恢复从 0 斜坡回 1（全程
+         * [CC_FADE_FULL_MS]），见 [startCcFadeLoop]。锁屏/
+         * 横幅仍走即时硬挂起（终态门控、不许淡变）。
+         */
+        var ccFade = 1f
+        /** 淡变目标（0=淡出待落定挂起，1=淡入/稳态）。 */
+        var ccFadeTarget = 1f
+        var ccFadeAtMs = 0L
+        /** 控制中心软挂起进行中（已开始淡出、尚未落定整组挂起）。 */
+        var ccFadingOut = false
+        /** 淡变驱动复评是否已在主线程队列里（防重复排队）。 */
+        var ccFadeRecheckPosted = false
         /** 上一次采样的展开比例（判「正在下落」用），null=尚无采样。 */
         var gateLastFraction: Float? = null
         /** 面板本体（头部祖先 NotificationPanelView）与展开比例字段句柄（v2.0.22 收尾门用，懒定位、定位失败保持 null 走旧口径）。 */
         var panelView: View? = null
         var panelFractionField: java.lang.reflect.Field? = null
+        /** 行程布尔量句柄（v2.0.28，与比例同在 PanelView 上一并解析）：关闭行程 / 跟手跟踪 / 瞬时展开。 */
+        var panelClosingField: java.lang.reflect.Field? = null
+        var panelTrackingField: java.lang.reflect.Field? = null
+        var panelInstantField: java.lang.reflect.Field? = null
         var panelFractionLookupDone = false
     }
 
@@ -801,6 +866,24 @@ object HeaderOverlay {
                 } catch (t: Throwable) {
                     null
                 }
+                // 行程布尔量（v2.0.28）：与比例同在 PanelView
+                // 上、一并解析（读不到保持 null、判据退化，
+                // 见 panelBool）。
+                st.panelClosingField = try {
+                    XposedHelpers.findField(panel.javaClass, "mClosing")
+                } catch (t: Throwable) {
+                    null
+                }
+                st.panelTrackingField = try {
+                    XposedHelpers.findField(panel.javaClass, "mTracking")
+                } catch (t: Throwable) {
+                    null
+                }
+                st.panelInstantField = try {
+                    XposedHelpers.findField(panel.javaClass, "mInstantExpanding")
+                } catch (t: Throwable) {
+                    null
+                }
             }
             val field = st.panelFractionField ?: return null
             (field.get(panel) as? Number)?.toFloat()
@@ -808,6 +891,39 @@ object HeaderOverlay {
             null
         }
     }
+
+    /**
+     * 面板行程布尔量（v2.0.28）：mClosing / mTracking /
+     * mInstantExpanding（反编译核实均为 PanelView 公开字
+     * 段）。读不到（句柄未解析/反射失败）返回 null，调用
+     * 方按「未知」退化处理，不许把 null 当 false 用在关门
+     * 方向以外的结论上。
+     */
+    private fun panelBool(
+        st: State,
+        field: java.lang.reflect.Field?,
+    ): Boolean? {
+        if (st.panelView == null) panelExpandedFraction(st)
+        val panel = st.panelView ?: return null
+        val f = field ?: return null
+        return try {
+            f.getBoolean(panel)
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    /** 面板是否在关闭行程中（宿主 mClosing）。 */
+    private fun panelClosing(st: State): Boolean? =
+        panelBool(st, st.panelClosingField)
+
+    /** 面板是否在跟手跟踪中（宿主 mTracking）。 */
+    private fun panelTracking(st: State): Boolean? =
+        panelBool(st, st.panelTrackingField)
+
+    /** 面板是否在瞬时展开中（宿主 mInstantExpanding）。 */
+    private fun panelInstantExpanding(st: State): Boolean? =
+        panelBool(st, st.panelInstantField)
 
     /**
      * 二值收尾门（v2.0.21 立、v2.0.22 换判据）：面板是否已
@@ -829,122 +945,146 @@ object HeaderOverlay {
      * 随是 v2.0.11 确认好的行为，落定到控制中心由控制中
      * 心门控挂起、不靠这道门）。
      *
-     * v2.0.24 补「收尾早关」：比例读得到时，除落定（比
-     * 例 0）外，关闭行程中宿主先行隐藏头部内容的那一刻
-     * 也关门——[updateCloseTailLatch] 维护的 latch；定案
-     * 与开侧不认该标志的理由见该函数注。
+     * v2.0.24 曾补「收尾早关」latch、v2.0.25 给开门与
+     * latch 解除加时间确认——两者均已于 v2.0.28 退役
+     * （latch 的触发证据改由 visSuppress 连续化承接、开
+     * 门确认保留，见下）。
      *
-     * v2.0.25：本函数的判定不变，但从「已关」转「开」
-     * 的应用要过 [applyWrapperVisibility] 的时间确认
-     * （复位尖峰单次采样不许开门），latch 解除同理（见
-     * [updateCloseTailLatch] 注的定案）。
+     * v2.0.27 曾补第三项判据「头部本体 GONE 也算关」，
+     * v2.0.28 复盘后撤销（定案见下）。
      *
-     * v2.0.27 补第三项判据「头部本体已被宿主撤下」：展开
-     * 比例之外，头部 View 本身 visibility == GONE 也算关。
-     * 定案（v2.0.26 真机录屏+日志）：收起落定后整簇在桌
-     * 面原位全不透明重现约 225ms（约 10 帧）才随窗口隐藏
-     * 消失——比 v2.0.25 的单帧尖峰长得多：复位把比例写回
-     * 1.0 后能持续多发评估、8ms 时间确认被「持续成立」
-     * 放行（.25 回报预留的残余风险正是这条）。而两轮证据
-     * 里尖峰/复位时刻头部本体都是 GONE（.25 日志
-     * headerVis=8），历轮日志里真实下拉与全开驻留时头部
-     * 可见性只有 INVISIBLE/VISIBLE、从不为 GONE——头部是
-     * 被覆盖的槽位本体，它被宿主撤下（关闭行程撤头部、
-     * 落定复位期）时槽位不存在，覆盖层没有在场的理由。
-     * 此项同时让关侧与宿主撤头部的时刻同刻，不再单靠比
-     * 例归零或 latch。
+     * v2.0.28 判据重做（v2.0.27 真机复盘，日志
+     * shadeclock_probe_0_icp6.log 的 v2.0.27 会话）：.27
+     * 的两处修法都被证伪——A：失败的那轮关闭里，早关
+     * latch 在比例 0.739 处触发关门时头部本体读数就是
+     * VISIBLE(0)、其后的重开评估亦然（门日志两行
+     * headerVis 均为 0）：那轮关闭宿主是经容器标志藏的
+     * 头部内容、头部 View 本体全程没进过 GONE，第三项判
+     * 据在整轮关闭里一次都没成立过；而同会话另一段里它
+     * 又在全开驻留（比例 1.0、标志 true）时误触发、随即
+     * 被头部恢复 VISIBLE 顶开——头部可见性与面板开合是
+     * 两条独立的宿主写路径，作判据双向都不可靠，撤销。
+     * 真正的失效链是：宿主在关闭动画结束与窗口隐藏之间
+     * 会把面板高度一次性打回满值（展开比例随之单步跳
+     * 变、持续多发评估），latch 解除确认（8ms）与开门确
+     * 认（8ms）串联约 20ms、远短于它的持续时长（.26 实
+     * 测约 225ms），两道确认被「持续成立」正当放行。本
+     * 版改两条结构性判据（不再靠比例数值本身分真假）：
+     * ①关闭行程守卫——宿主 mClosing 为真期间一律算关
+     * （高度打回满值发生在关闭行程内、mClosing 尚未清
+     * 的那段）；②落定隔离——比例到过 0 后武装，重开必
+     * 须先观测到行程进展（见 State.gateQuarantine），单
+     * 步跳变不算进展。行程中的每一帧另由连续因子承接
+     * （见 [computePanelFactor] 与 State.visSuppress），
+     * 门只管终态。
      */
     private fun shadeSettledClosed(st: State): Boolean {
         if (pageSwitching) return false
         val fraction = panelExpandedFraction(st)
         if (fraction != null) {
-            // 头部本体已被宿主撤下（GONE）也算关（v2.0.27，
-            // 定案见函数注）：复位期比例假读 1.0 也开不了门。
-            return fraction <= 0f || st.gateTailLatched ||
-                st.header.visibility == View.GONE
+            // 关闭行程守卫（v2.0.28）：mClosing 期间比例读
+            // 数含宿主把高度打回满值的假 1.0，一律算关。
+            if (panelClosing(st) == true) return true
+            if (fraction <= 0f) return true
+            // 落定隔离（v2.0.28）：到过 0 后重开须先有行
+            // 程进展（updatePanelJourney 维护），单步跳变
+            // 不开门。
+            if (st.gateQuarantine && !st.gateProgressionSeen) {
+                return true
+            }
+            return false
         }
         return !shadeContainerVisible &&
             st.header.visibility != View.VISIBLE
     }
 
     /**
-     * 收尾早关 latch 的维护（v2.0.24，只在
-     * [applyWrapperVisibility] 里调，预抽帧频）：真机
-     * （v2.0.23 录屏+日志）定案——关闭行程里原头部的退出
-     * 不是 alpha（diag 中段实数两路恒 1.0）、也不是面板落
-     * 定，而是宿主中途调 updateContainerVisible(false) 把
-     * 头部内容撤下（日志里该翻转落在展开比例 1.0 与 0.58
-     * 两次采样之间）；覆盖层只认比例 0 才关门，于是独自以
-     * 全不透明留在面板顶部、其余内容都退场后还压在桌面上
-     * 约 16 帧，末段随面板高度塌缩被上移裁成残条——即小
-     * 乐报的「返回闪烁」。修法：关闭行程中（比例在下落）
-     * 容器可见标志一旦翻 false，与原头部同刻关门并 latch
-     * 住，不等比例归零。开侧绝不认这个标志（它翻 true 迟
-     * 到进度 0.3 之后，v2.0.15/16 的教训）：置位条件带
-     * 「正在下落」，打开行程比例上行永不触发；面板全开静
-     * 置时标志的杂翻（页面切换落定等场景、比例不动）也不
-     * 触发。解除：比例回升超过触发点 0.02（手势反转上
-     * 行）、标志回到 true、或比例归零（落定判据接管，
-     * latch 顺手清掉）。页面切换期整门豁免、latch 不动。
+     * 面板行程簿记（v2.0.28，替代 v2.0.24-.27 的收尾早关
+     * latch）：在 [applyWrapperVisibility] 里每发评估维护
+     * 落定隔离与进展（见 State.gateQuarantine）——
+     * - 比例到 0：武装隔离、清进展；
+     * - 不在关闭行程中、比例穿过中间值（0.02..0.98），或
+     *   跟踪/瞬时展开信号在场：记进展（真开门必然其一）；
+     * - 关闭行程中穿过中间值是关闭本身、不记进展。
+     * 页面切换期整门豁免、簿记只同步采样基准。
      *
-     * v2.0.25 定案（v2.0.24 真机录屏+日志）：latch 本身触
-     * 发成功（日志实证在比例 0.82 处与原头部同刻关门），
-     * 但紧接着一发评估里比例读数跳回 1.0——当时容器标志
-     * 仍 false、头部本体已 GONE，面板只可能更关、不可能
-     * 在一发评估内真重开：这是关落定后宿主状态复位（比
-     * 例与 alpha/标志同批被写回下次打开初值，v2.0.22 已
-     * 实证同批复位）打出的单次采样尖峰。旧解除条件是单
-     * 次采样越过触发点+0.02 即解除，尖峰正好冒充「手势
-     * 反转」把 latch 解掉、门随即按 open 把整簇以全不透
-     * 明贴回已关的桌面（录屏落定后整簇重现约一帧，与该
-     * 行日志逐项对位）。另一轮关闭里标志翻转时比例已
-     * ≈0、门在同一调用栈内靠落定判据关掉（tail=false 属
-     * 正常、无 latch 窗口）。修法：解除与开门都加时间确
-     * 认——判定须持续成立 ≥ [OPEN_CONFIRM_MS]（约半帧）
-     * 才算数；手势反转/真实下拉是持续过程、评估帧频密
-     * 集，确认只迟约一帧；尖峰等不到第二发评估就回落、
-     * 确认随之撤销。本函数管 latch 解除的确认，开门侧的
-     * 确认在 [applyWrapperVisibility]。
+     * 同处维护容器标志抑制的置位/清位（见
+     * State.visSuppress）：关闭行程（含跟手下落）中标志翻
+     * false 即置位。开侧永不认该标志置位（v2.0.15/16 教
+     * 训）——置位条件锁死在「关闭行程」上，标志本身在下
+     * 拉期间翻 false 不触发任何事。
      */
-    private fun updateCloseTailLatch(st: State) {
-        if (pageSwitching) return
+    private fun updatePanelJourney(st: State) {
+        val prevFraction = st.gateLastFraction
         val fraction = panelExpandedFraction(st)
-        if (fraction == null) {
-            st.gateLastFraction = null
-            return
-        }
-        val last = st.gateLastFraction
         st.gateLastFraction = fraction
+        if (pageSwitching || fraction == null) return
+        val closing = panelClosing(st) == true
         when {
-            fraction <= 0f || shadeContainerVisible -> {
-                st.gateTailLatched = false
-                st.gateLatchReleaseAtMs = -1L
+            fraction <= 0f -> {
+                st.gateQuarantine = true
+                st.gateProgressionSeen = false
             }
-            st.gateTailLatched -> {
-                if (fraction > st.gateTailFraction + 0.02f) {
-                    // 解除要时间确认（v2.0.25）：单次采样越过
-                    // 阈值只记起点，持续 ≥ OPEN_CONFIRM_MS 的
-                    // 第二发评估才真解除（定案见函数注）。
-                    val now = SystemClock.uptimeMillis()
-                    val since = st.gateLatchReleaseAtMs
-                    if (since < 0L) {
-                        st.gateLatchReleaseAtMs = now
-                        // 解除确认同样排一发时间驱动复评
-                        // （v2.0.26）：不依赖下一发自然评估。
-                        scheduleGateConfirmRecheck(st)
-                    } else if (now - since >= OPEN_CONFIRM_MS) {
-                        st.gateTailLatched = false
-                        st.gateLatchReleaseAtMs = -1L
-                    }
-                } else {
-                    st.gateLatchReleaseAtMs = -1L
-                }
+            closing -> {
+                // 关闭行程：穿过中间值不算开门进展
             }
-            last != null && fraction < last - 0.0005f -> {
-                st.gateTailLatched = true
-                st.gateTailFraction = fraction
+            fraction in 0.02f..0.98f ||
+                panelTracking(st) == true ||
+                panelInstantExpanding(st) == true -> {
+                st.gateProgressionSeen = true
             }
         }
+        val falling = prevFraction != null &&
+            fraction < prevFraction - 0.0005f
+        if (!st.visSuppress && !shadeContainerVisible &&
+            fraction > 0f && (closing || falling)
+        ) {
+            st.visSuppress = true
+            st.visSuppressFraction = fraction
+        }
+        if (st.visSuppress && (shadeContainerVisible ||
+                fraction <= 0f ||
+                fraction > st.visSuppressFraction + 0.05f)
+        ) {
+            st.visSuppress = false
+        }
+    }
+
+    /**
+     * 控制中心淡变的驱动复评（v2.0.28）：淡变靠
+     * [applyComposedTransform] 内的斜坡推进，评估来源
+     * （预抽/漏斗）在过渡动画期帧频到来、静止后稀疏——
+     * 起点一落就排 10ms 复评自持，直到因子到达目标；淡
+     * 出到达 0 且控制中心仍落定在场，才落定整组挂起
+     * （终态清理走 [suspendOverlay] 原路）。与
+     * [scheduleGateConfirmRecheck] 同款式：防重复排队、
+     * 状态摘除即作罢、异常不外抛。
+     */
+    private fun startCcFadeLoop(st: State) {
+        if (st.ccFadeRecheckPosted) return
+        st.ccFadeRecheckPosted = true
+        st.handler.postDelayed({
+            st.ccFadeRecheckPosted = false
+            val registered = synchronized(states) {
+                states[st.header] === st
+            }
+            if (!registered) return@postDelayed
+            try {
+                if (!st.suspended) applyComposedTransform(st)
+                if (st.ccFade != st.ccFadeTarget) {
+                    startCcFadeLoop(st)
+                } else if (st.ccFadeTarget == 0f && st.ccFadingOut) {
+                    st.ccFadingOut = false
+                    if (!pageSwitching &&
+                        suspendReason(st.header) == "control-center"
+                    ) {
+                        suspendOverlay(st.header, st, "control-center")
+                    }
+                }
+            } catch (t: Throwable) {
+                // 淡变失败不许影响宿主
+            }
+        }, 10L)
     }
 
     /**
@@ -972,9 +1112,7 @@ object HeaderOverlay {
                 // 判据回落把起点清零——链条自持、不依赖外部
                 // 评估，但也绝不空转：起点活着必然意味着判
                 // 据正持续「想开/想解除」，下一发必能落定。
-                if (st.gateOpenConfirmAtMs >= 0L ||
-                    st.gateLatchReleaseAtMs >= 0L
-                ) {
+                if (st.gateOpenConfirmAtMs >= 0L) {
                     scheduleGateConfirmRecheck(st)
                 }
             } catch (t: Throwable) {
@@ -1009,13 +1147,15 @@ object HeaderOverlay {
                 return
             }
         }
-        updateCloseTailLatch(st)
+        updatePanelJourney(st)
         var closed = shadeSettledClosed(st)
         // 开门时间确认（v2.0.25 立、v2.0.26 修死锁）：门已关
         // 落定时重新打开，须「想开」判定持续成立
         // ≥ OPEN_CONFIRM_MS（约半帧）才放行——关落定后宿
-        // 主复位打出的比例尖峰只持续一发评估（定案见
-        // updateCloseTailLatch 注），等不到确认就回落；真实
+        // 主复位打出的比例尖峰只持续一发评估（v2.0.25 当
+        // 时的定案；v2.0.28 起主防线是 shadeSettledClosed
+        // 的行程判据、本确认只作第二层），等不到确认就回
+        // 落；真实
         // 下拉/手势反转是持续过程，确认只迟约一帧，且位图
         // 早已离屏渲好、第一帧仍是成品。挂起恢复与 attach
         // 首应用不走确认（gateClosed 非 true：挂起分支已
@@ -1073,7 +1213,8 @@ object HeaderOverlay {
                 logFn(
                     "overlay gate: ${if (closed) "settled-closed -> wrapper GONE" else "open -> wrapper VISIBLE"} " +
                         "(visFlag=$shadeContainerVisible, headerVis=${st.header.visibility}, " +
-                        "expF=${panelExpandedFraction(st)}, tail=${st.gateTailLatched})"
+                        "expF=${panelExpandedFraction(st)}, cls=${panelClosing(st)}, " +
+                        "q=${st.gateQuarantine}, pg=${st.gateProgressionSeen})"
                 )
             }
         }
@@ -1606,11 +1747,91 @@ object HeaderOverlay {
         }
         st.followAlpha = a
         st.followAlphaAtMs = now
-        if (wrapper.alpha != a) wrapper.alpha = a
+        // 连续因子（v2.0.28）：通道 alpha 之上再乘三路连续
+        // 乘子——面板行程因子、容器标志抑制因子、控制中心
+        // 淡变因子（各义见 [computePanelFactor] 与 State 字
+        // 段注）。二值门/挂起管终态，这三路管行程中的每一
+        // 帧：任何单点状态尖峰最多让乘积在一帧内偏一点，
+        // 不再整簇全显/全灭。
+        val pf = computePanelFactor(st)
+        val vf = slewFactor(
+            st.visFactor, if (st.visSuppress) 0f else 1f,
+            st.visFactorAtMs, now,
+        )
+        st.visFactor = vf
+        st.visFactorAtMs = now
+        val cc = if (pageSwitching) {
+            1f
+        } else {
+            slewFactor(
+                st.ccFade, st.ccFadeTarget, st.ccFadeAtMs, now,
+                CC_FADE_FULL_MS,
+            )
+        }
+        st.ccFade = cc
+        st.ccFadeAtMs = now
+        val composed = a * pf * vf * cc
+        if (wrapper.alpha != composed) wrapper.alpha = composed
         val tx = st.header.translationX + shadeContainerX
         if (wrapper.translationX != tx) wrapper.translationX = tx
         val ty = st.header.translationY + shadeContainerY
         if (wrapper.translationY != ty) wrapper.translationY = ty
+    }
+
+    /**
+     * 连续因子的斜坡推进（v2.0.28）：按真实时间把
+     * current 向 target 推进、全程 fullMs 走完（与通道
+     * alpha 的 90ms 斜率限制同款式）。无历史时刻
+     * （lastMs<=0，首次应用）时原地不动、只由调用方记时
+     * 刻，下一次起推进。
+     */
+    private fun slewFactor(
+        current: Float,
+        target: Float,
+        lastMs: Long,
+        now: Long,
+        fullMs: Float = FACTOR_FULL_MS,
+    ): Float {
+        if (current == target || lastMs <= 0L) return current
+        val dtMs = (now - lastMs).coerceIn(0L, 250L)
+        val maxDelta = dtMs / fullMs
+        return if (target > current) {
+            min(target, current + maxDelta)
+        } else {
+            max(target, current - maxDelta)
+        }
+    }
+
+    /**
+     * 面板连续因子（v2.0.28）：展开比例 → 透明度乘子，
+     * 饱和点 [PANEL_FACTOR_SATURATION]（比例达 18% 即全
+     * 显——面板自身窗口的揭示慢于此，覆盖层不迟到，承
+     * v2.0.15 的开侧口径）。关闭行程（mClosing 或采样下
+     * 落）中只降不升：宿主在关闭尾段把高度打回满值时比
+     * 例假升、因子不跟升，闪无从发生。页面切换期比例恒
+     * 满、因子恒 1，不干涉横滑跟随；比例读不到时保持上
+     * 次值（fail-open 不劣化）。
+     */
+    private fun computePanelFactor(st: State): Float {
+        if (pageSwitching) {
+            st.panelFactor = 1f
+            st.factorLastFraction = null
+            return 1f
+        }
+        val fraction = panelExpandedFraction(st)
+            ?: return st.panelFactor
+        val curve = (fraction / PANEL_FACTOR_SATURATION)
+            .coerceIn(0f, 1f)
+        val last = st.factorLastFraction
+        val falling = last != null && fraction < last - 0.0005f
+        st.factorLastFraction = fraction
+        val next = if (panelClosing(st) == true || falling) {
+            min(st.panelFactor, curve)
+        } else {
+            curve
+        }
+        st.panelFactor = next
+        return next
     }
 
     /**
@@ -2174,6 +2395,21 @@ object HeaderOverlay {
                 // State.resumeAwaitFollow 注）；不在切换中恢
                 // 复（锁屏/横幅结束）不置位、照旧立即对齐。
                 st.resumeAwaitFollow = pageSwitching
+                // 控制中心淡入（v2.0.28）：落定往返的恢复从
+                // 0 淡入（与挂起侧的淡出对称、二值弹入取
+                // 消）；切换中恢复由通道跟随接管、因子瞬时
+                // 归 1；锁屏/横幅恢复照旧瞬时（attach 后半
+                // 段的对齐直接落目标值）。
+                if (prevReason == "control-center" &&
+                    !pageSwitching
+                ) {
+                    st.ccFade = 0f
+                    st.ccFadeTarget = 1f
+                    startCcFadeLoop(st)
+                } else {
+                    st.ccFade = 1f
+                    st.ccFadeTarget = 1f
+                }
                 logFn(
                     "overlay resumed: $prevReason cleared " +
                         "(state=$statusBarState, cc=${isControlCenterActive(header)}, " +
@@ -3237,6 +3473,25 @@ object HeaderOverlay {
     private fun applyGate(st: State): Boolean {
         val reason = suspendReason(st.header)
         if (reason != null) {
+            // 控制中心软挂起（v2.0.28）：落定到控制中心页先
+            // 只启动 alpha 淡出（ccFadingOut），因子到 0 后
+            // 由淡变复评落定整组挂起——二值切断改连续淡出
+            // （.27 的 switch trace 定案：切断帧里跳变的只
+            // 有 wrapper 可见性本身，连续量全是稳态值）。锁
+            // 屏/横幅是终态硬门控、仍走即时整组挂起；已挂
+            // 起/已在淡出中不重入。
+            if (reason == "control-center" && !st.suspended &&
+                !st.ccFadingOut && st.wrapper != null
+            ) {
+                st.ccFadingOut = true
+                st.ccFadeTarget = 0f
+                startCcFadeLoop(st)
+                return true
+            }
+            if (st.ccFadingOut && reason == "control-center") {
+                // 淡出进行中：等因子到 0 落定，不抢跑硬挂起
+                return true
+            }
             if (!st.suspended || st.suspendReason != reason) {
                 suspendOverlay(st.header, st, reason)
             }
@@ -3249,6 +3504,13 @@ object HeaderOverlay {
         if (st.suspended) {
             attach(st.header)
             return true
+        }
+        // 控制中心一瞥即回（淡出未落定就已解除）：取消淡
+        // 出、斜坡淡回（v2.0.28）。
+        if (st.ccFadingOut) {
+            st.ccFadingOut = false
+            st.ccFadeTarget = 1f
+            startCcFadeLoop(st)
         }
         return false
     }
@@ -3382,8 +3644,10 @@ object HeaderOverlay {
                 "alpha=${tv?.alpha} drawCalls=${tv?.drawCalls} " +
                 "renders=${tv?.renderCount} " +
                 "gate=${if (shadeSettledClosed(st)) "closed" else "open"} " +
-                "expF=${panelExpandedFraction(st)} tail=${st.gateTailLatched} " +
-                    "cfm=${st.gateOpenConfirmAtMs >= 0L} rel=${st.gateLatchReleaseAtMs >= 0L} " +
+                "expF=${panelExpandedFraction(st)} cls=${panelClosing(st)} " +
+                    "cfm=${st.gateOpenConfirmAtMs >= 0L} q=${st.gateQuarantine} " +
+                    "pg=${st.gateProgressionSeen} pf=${st.panelFactor} " +
+                    "vf=${st.visFactor} cc=${st.ccFade} " +
                 "drawn=${tv?.lastDrawnElements} envNull=${tv?.lastEnvMissing} | " +
                 "bgShown=${st.appliedStamp?.showBackground} | " +
                 "mountBounds=${st.mountBounds?.joinToString(",")}"
@@ -3461,6 +3725,12 @@ object HeaderOverlay {
         st.suspendReason = reason
         // 斜率状态复位（v2.0.14）：恢复后的第一次应用直接对齐
         st.followAlpha = -1f
+        // 淡变状态收束（v2.0.28）：硬挂起落定时因子归 0；
+        // 恢复侧按原因决定瞬时回 1（锁屏/横幅/切换）还是
+        // 从 0 淡入（控制中心落定往返，见 attach 恢复分支）。
+        st.ccFade = 0f
+        st.ccFadeTarget = 0f
+        st.ccFadingOut = false
         // 栈顶停手并恢复系统原值，别误伤锁屏/控制中心自己的布局
         restoreStackTop(st)
         try {
