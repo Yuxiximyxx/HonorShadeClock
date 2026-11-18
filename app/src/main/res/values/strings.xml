@@ -1,6 +1,6 @@
 <resources>
-    <string name="app_name">通知中心大时钟</string>
-    <string name="app_subtitle">在通知栏顶部渲染荣耀锁屏主题样式，或放大原头部时钟</string>
+    <string name="app_name">通知中心主题</string>
+    <string name="app_subtitle">把荣耀锁屏主题样式渲染进通知中心顶部，可导入/切换主题，也可隐藏运营商文字</string>
 
     <!-- 作用域：只需要 SystemUI（通知中心时钟所在进程） -->
     <string-array name="xposedscope">

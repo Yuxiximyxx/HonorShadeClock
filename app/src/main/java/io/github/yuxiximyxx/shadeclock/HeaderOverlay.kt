@@ -4,7 +4,9 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.PorterDuff
 import android.os.BatteryManager
 import android.os.Handler
 import android.os.Looper
@@ -349,6 +351,41 @@ import kotlin.math.roundToInt
  * 补 invalidate 已落帧（diag #3 drawn=19 先于 alpha 到
  * 位），故 tick 口径不动、防 v2.0.5 卡顿回潮。
  *
+ * v2.0.21 定案（v2.0.20 真机录屏+日志 probe_1_7uzm）：闪烁
+ * 还在，但形态已变——录屏逐帧是「通知已进场、时钟区全透
+ * 明，落定后整幅跳出」（二值有/无、无淡入中间帧），收起尾
+ * 段有一帧面板背景已透、簇仍全不透明压在桌面上。日志侧：
+ * 全部 35 条 diag 采样 wrapper alpha=1.0、effA=1.0、time
+ * 路恒 1.0——**alpha 通道不是本版闪烁源**，v2.0.12–17 的
+ * alpha 合成补丁已到头。本版闪烁是两件别的事：
+ * ①开侧是「画没画好」的时序问题：attach 时 wrapper 按头部
+ * 原高挂载（mount 日志 bounds=…,280），多个会话 diag #1
+ * 时 drawCalls=0、首绘落在第 1–2 个 tick 之间——首绘只靠
+ * 布局 post 与 1 秒 tick 的 invalidate 链驱动，亚秒级的下
+ * 拉跟踪期里没有任何机制保证簇已按最终 bounds 绘好，落定
+ * 后布局 post 的那发 invalidate 才把整幅画出来，正是录屏
+ * 的「迟一拍整幅出现」。
+ * ②关侧是可见性没联动：宿主关落定时把头部本体置
+ * INVISIBLE 并移回关闭位（关闭态 diag 实证 header vis=4、
+ * top 回 141），而 wrapper 是同级 View、不随头部本体可见
+ * 性联动；关闭的平移路径又不把 time 路 alpha 写到 0（关
+ * 闭中段采样 effA 仍 1.0、通知卡已越过头部下缘），于是
+ * 通知栏窗口收尾的最后几帧里簇独自留在原位压桌面。
+ * 改法（不动已确认好的横滑跟随与三道门控）：
+ * - ThemeView 改位图呈现：内容在主题/尺寸/偏移变化与每秒
+ *   先离屏渲进 Bitmap（离屏渲染不依赖窗口可见性与遍历时
+ *   机），onDraw 只贴图；预抽里发现位图过期（>900ms 或尺
+ *   寸不符）先同步重渲再画——任何一帧只要 wrapper 被合
+ *   成，内容必然是完整成品，即小乐要的「直接加载好的」。
+ * - 关侧加二值收尾门（[shadeSettledClosed]）：容器可见标
+ *   志为 false 且头部本体非 VISIBLE、且不在页面切换中，
+ *   判为「面板已关落定」，wrapper 帧频（预抽）联动 GONE；
+ *   任一条件解除即恢复 VISIBLE 并先刷新位图。取舍：开侧
+ *   若宿主在跟踪前段两个条件同时成立，簇最迟在宿主写
+ *   visible=true（展开进度 0.3 处）那帧出现——仍远早于
+ *   v2.0.20 的落定后跳出；页面切换期整门豁免，v2.0.11
+ *   确认好的横滑 alpha/平移跟随不受影响。
+ *
  * 设置经 StampStore 的 stamp.txt 跨进程传递；覆盖层挂载时与每秒
  * tick 比对戳记，变了就重解析重载——切换主题免强停。
  * 全路径 try-catch：构建/渲染任何异常都卸下覆盖层、恢复原头部、
@@ -652,9 +689,75 @@ object HeaderOverlay {
          */
         var followAlpha = -1f
         var followAlphaAtMs = 0L
+        /** 二值收尾门（v2.0.21）的翻转日志计数（有界，防刷屏）。 */
+        var gateLogCount = 0
+        /** 二值收尾门上次应用的判定（null=尚未应用），翻转才记日志/刷新。 */
+        var gateClosed: Boolean? = null
     }
 
-    /** 自绘层：每帧按当前环境（时间/电量/天气）让渲染器画一遍。 */
+    /**
+     * 二值收尾门（v2.0.21）：面板是否已「关落定」。判据取宿主
+     * 自己的两个落定事实——容器可见标志已被写 false（关闭动
+     * 画落定的收尾信号，v2.0.16 反编译核实其 false 写入点只
+     * 在关闭落定），且头部本体已非 VISIBLE（关闭态 diag 实
+     * 证 vis=4）。单用任一条都不可靠：可见标志在过渡期会翻
+     * 转（v2.0.14/17 实证），但那些翻转段里头部本体是
+     * VISIBLE 的（面板开着），合取后不会误关；页面切换期整
+     * 门豁免（横滑跟随是 v2.0.11 确认好的行为，落定到控制
+     * 中心由控制中心门控挂起、不靠这道门）。
+     */
+    private fun shadeSettledClosed(st: State): Boolean =
+        !pageSwitching && !shadeContainerVisible &&
+            st.header.visibility != View.VISIBLE
+
+    /**
+     * 按二值收尾门应用 wrapper 可见性（预抽帧频、漏斗 hook、
+     * tick 三处共用）：关落定 → GONE（与头部本体同帧撤下，
+     * 不再留簇压桌面）；解除 → VISIBLE 并先把位图刷新鲜、
+     * 再由调用方接合成变换。挂起态不走这里（suspendOverlay
+     * 已整组 GONE）。
+     */
+    private fun applyWrapperVisibility(st: State) {
+        val wrapper = st.wrapper ?: return
+        if (st.suspended) {
+            if (wrapper.visibility != View.GONE) wrapper.visibility = View.GONE
+            st.gateClosed = null
+            return
+        }
+        val closed = shadeSettledClosed(st)
+        if (st.gateClosed == closed && wrapper.visibility ==
+            if (closed) View.GONE else View.VISIBLE
+        ) {
+            return
+        }
+        st.gateClosed = closed
+        val want = if (closed) View.GONE else View.VISIBLE
+        if (wrapper.visibility != want) {
+            wrapper.visibility = want
+            if (st.gateLogCount < 20) {
+                st.gateLogCount++
+                logFn(
+                    "overlay gate: ${if (closed) "settled-closed -> wrapper GONE" else "open -> wrapper VISIBLE"} " +
+                        "(visFlag=$shadeContainerVisible, headerVis=${st.header.visibility})"
+                )
+            }
+        }
+        if (!closed) {
+            // 重新出现的第一帧就要是成品：先离屏渲好（过期才真渲）
+            st.themeView?.refreshContent()
+        }
+    }
+
+    /**
+     * 自绘层（v2.0.21 改位图呈现）：内容先离屏渲进一张与视图
+     * 同尺寸的 Bitmap，onDraw 只把位图贴出来。为什么：直绘版
+     * 的首绘只能靠布局 post / tick 的 invalidate 链在窗口遍
+     * 历里落帧，下拉跟踪期（亚秒、无 tick）没人保证它画好，
+     * 真机表现为落定后整幅跳出（见类头 v2.0.21 注）。离屏渲
+     * 染不依赖窗口可见性与遍历时机——主题装载、尺寸落定、
+     * 每秒刷新都先把成品渲好，wrapper 只要被合成出来，贴的
+     * 必然是完整一帧，即「直接加载好的」。
+     */
     private class ThemeView(
         context: Context,
         private val envProvider: () -> RenderEnv?,
@@ -665,8 +768,19 @@ object HeaderOverlay {
 
         private var lastContentBottom = -1f
 
-        /** 诊断计数：onDraw 被调用次数（v2.0.2 overlay diag 用）。 */
+        /** 离屏成品位图（与视图当前尺寸一致）；null=还没渲出过成品。 */
+        private var bitmap: Bitmap? = null
+
+        /** 最近一次离屏渲染的时刻（uptimeMillis），过期判定用。 */
+        var lastRenderAtMs = 0L
+            private set
+
+        /** 诊断计数：onDraw（贴图）被调用次数（v2.0.2 overlay diag 用）。 */
         var drawCalls = 0
+            private set
+
+        /** 诊断计数：离屏渲染次数（v2.0.21），与 drawCalls 对照看内容是否先于呈现就绪。 */
+        var renderCount = 0
             private set
 
         /** 最近一帧实际绘制的元素数；env 缺失时为 0。 */
@@ -677,27 +791,91 @@ object HeaderOverlay {
         var lastEnvMissing = false
             private set
 
-        override fun onDraw(canvas: Canvas) {
-            super.onDraw(canvas)
-            drawCalls++
-            try {
-                val env = envProvider()
-                if (env == null) {
-                    lastEnvMissing = true
-                    lastDrawnElements = 0
-                    return
+        /** 位图是否已过期：没渲过、尺寸与视图不符、或渲好已超过 900ms（秒数要逐秒走）。 */
+        fun contentStale(): Boolean {
+            val bmp = bitmap ?: return true
+            if (bmp.isRecycled || bmp.width != width || bmp.height != height) return true
+            return SystemClock.uptimeMillis() - lastRenderAtMs >= 900L
+        }
+
+        /**
+         * 离屏渲染一帧成品（主线程调用）。force=false 时未过
+         * 期直接跳过（预抽帧频调用靠它去抖）。返回是否真渲了。
+         * 尺寸未定（宽高 0）或 env 未就绪时不渲、保留旧成品
+         * （宁可贴上一帧，也不贴空白）。
+         */
+        fun refreshContent(force: Boolean = false): Boolean {
+            if (!force && !contentStale()) return false
+            val w = width
+            val h = height
+            if (w <= 0 || h <= 0) {
+                lastEnvMissing = true
+                return false
+            }
+            val env = try {
+                envProvider()
+            } catch (t: Throwable) {
+                onDrawError(t)
+                return false
+            }
+            if (env == null) {
+                lastEnvMissing = true
+                return false
+            }
+            return try {
+                var bmp = bitmap
+                if (bmp == null || bmp.isRecycled || bmp.width != w || bmp.height != h) {
+                    bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                    bitmap = bmp
                 }
-                lastEnvMissing = false
+                val canvas = Canvas(bmp)
+                canvas.drawColor(0, PorterDuff.Mode.CLEAR)
                 renderer.draw(canvas, env)
+                lastEnvMissing = false
                 lastDrawnElements = renderer.lastDrawnElements
+                renderCount++
+                lastRenderAtMs = SystemClock.uptimeMillis()
                 val cb = renderer.contentBottomPx
                 if (abs(cb - lastContentBottom) > 2f) {
                     lastContentBottom = cb
                     post { onContentHeightChanged() }
                 }
+                true
             } catch (t: Throwable) {
                 onDrawError(t)
+                false
             }
+        }
+
+        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+            super.onSizeChanged(w, h, oldw, oldh)
+            // 尺寸一变立刻按新尺寸重渲（同一布局 pass 内完成），
+            // 不等 tick——wrapper 从原高长到主题高时内容同步跟上。
+            if (w > 0 && h > 0 && (w != oldw || h != oldh)) {
+                refreshContent(force = true)
+            }
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            drawCalls++
+            // 贴图前最后一道保险：还没有成品（或尺寸对不上）
+            // 就当场离屏渲一帧再贴，绝不贴空白。
+            if (bitmap == null || bitmap?.isRecycled == true ||
+                bitmap?.width != width || bitmap?.height != height
+            ) {
+                refreshContent(force = true)
+            }
+            val bmp = bitmap
+            if (bmp != null && !bmp.isRecycled) {
+                canvas.drawBitmap(bmp, 0f, 0f, null)
+            }
+        }
+
+        /** 卸载时回收位图，别在 SystemUI 里留着大块内存。 */
+        fun releaseBitmap() {
+            bitmap?.let { if (!it.isRecycled) it.recycle() }
+            bitmap = null
         }
     }
 
@@ -960,6 +1138,9 @@ object HeaderOverlay {
         for (st in snapshot) {
             if (st.suspended) continue
             try {
+                // 二值收尾门先于变换（v2.0.21）：容器可见标志的
+                // 翻转就在这条 hook 链上进来，关落定当场联动。
+                applyWrapperVisibility(st)
                 applyComposedTransform(st)
             } catch (t: Throwable) {
                 // 跟随失败不许影响宿主动画
@@ -1631,9 +1812,14 @@ object HeaderOverlay {
             // 目标值（恢复不许从挂起前的旧 alpha 慢慢爬回来）。
             st.followAlpha = -1f
             applyComposedTransform(st)
-            // 首显即时（v2.0.11）：挂载完成不等 tick——本帧就把
-            // 首绘排上（面板当前可见才有意义，不可见时预抽断言
-            // 与首轮 tick 会在可见首帧补上）。
+            // 首显即时（v2.0.11；v2.0.21 改离屏成品）：挂载完成
+            // 不等 tick——当场把第一帧离屏渲好（尺寸还没落定时
+            // 渲不出，onSizeChanged/布局 post 会在尺寸一到就补
+            // 渲），面板可见时再排一发贴图。二值收尾门也在这里
+            // 先应用一次：进程启动时面板是关着的，wrapper 从
+            // 第一帧就该是 GONE，别等 tick。
+            st.themeView?.refreshContent(force = true)
+            applyWrapperVisibility(st)
             if (st.wrapper?.isShown == true) {
                 st.themeView?.invalidate()
             }
@@ -1717,7 +1903,10 @@ object HeaderOverlay {
                             }
                             alignOverlay(st)
                             ensureStackAdjusted(st)
-                            // 面板不可见时不重绘（v2.0.5 瘦身）
+                            // 尺寸/位置落定后把成品渲到最新一帧
+                            // （过期或尺寸不符才真渲，v2.0.21）；
+                            // 面板不可见时不贴图（v2.0.5 瘦身）
+                            st.themeView?.refreshContent()
                             if (st.wrapper?.isShown == true) {
                                 st.themeView?.invalidate()
                             }
@@ -1735,9 +1924,9 @@ object HeaderOverlay {
         // 旧对策只有 attach 与 1 秒 tick 两次隐藏、闪烁最长达
         // 一拍 tick；预抽在绘制前纠正，被改回的子视图根本不会
         // 被画出来，不是轮询硬压（无帧就不跑、只在真不对时写）；
-        // ②ThemeView 还没有效首绘（没画过、或首绘时 env 未
-        // 就绪只录了空帧）且头部已有宽度时补一发 invalidate，
-        // 首显不等 tick；③动画跟随的帧级采样（v2.0.12）：合成
+        // ②二值收尾门联动 + 位图新鲜度（v2.0.21）：关落定同
+        // 帧藏 wrapper；位图过期先离屏重渲再贴，首显不等
+        // tick；③动画跟随的帧级采样（v2.0.12）：合成
         // 变换里头部 View 自身的 translationX/Y 没有漏斗 hook
         // 可抄（引擎直接写 View 属性），靠预抽逐帧采样补齐——
         // 漏斗 hook 负责 alpha/容器偏移的即时同步，预抽负责
@@ -1752,10 +1941,15 @@ object HeaderOverlay {
                     val registered = synchronized(states) { states[header] === st }
                     if (registered && !st.suspended && st.wrapper != null) {
                         hideComposeChildren(header, st, fromPreDraw = true)
+                        // 二值收尾门帧频联动（v2.0.21）：宿主把头
+                        // 部本体撤下场景的那一帧，wrapper 同帧
+                        // GONE，不留收尾残影帧。
+                        applyWrapperVisibility(st)
+                        // 位图新鲜度（v2.0.21）：过期（>900ms 或
+                        // 尺寸不符）就在绘制前同步离屏重渲，本帧
+                        // 贴出的必然是完整成品；未过期零开销。
                         val tv = st.themeView
-                        if (tv != null && header.width > 0 &&
-                            (tv.drawCalls == 0 || tv.lastEnvMissing)
-                        ) {
+                        if (tv != null && header.width > 0 && tv.refreshContent()) {
                             tv.invalidate()
                         }
                         if (animFollowHookActive) {
@@ -1915,7 +2109,10 @@ object HeaderOverlay {
      * 其余复位）。
      */
     private fun healWrapperVisibility(st: State, wrapper: View, parent: ViewGroup) {
-        if (wrapper.visibility != View.VISIBLE) wrapper.visibility = View.VISIBLE
+        // 可见性以二值收尾门为准（v2.0.21）：关落定时保持
+        // GONE，不许自愈把它顶回来（同 v2.0.4 挂起期硬门控
+        // 的教训）；其余时候恢复 VISIBLE。
+        applyWrapperVisibility(st)
         if (animFollowHookActive) {
             applyComposedTransform(st)
         } else if (pageSwitching) {
@@ -2569,11 +2766,18 @@ object HeaderOverlay {
                     }
                     logDiag(st)
                     WeatherSource.maybeRefresh(st.header.context)
-                    // 秒数重绘：面板不可见时跳过（没人看就不画，
-                    // 省主线程，v2.0.5）；对齐/栈检查在上面的稳态
-                    // 路径里都是零写入判定，不再是每秒重活。
+                    // 秒数刷新（v2.0.21 改离屏渲染）：面板可见时
+                    // 每秒把下一帧成品渲好再贴图；不可见时只在
+                    // 还没有成品时渲一帧备着（下拉第一帧就是成
+                    // 品），已有成品就不空转（v2.0.5 瘦身口径）。
+                    val tvTick = st.themeView
                     if (wrapper.isShown) {
-                        st.themeView?.invalidate()
+                        tvTick?.refreshContent()
+                        tvTick?.invalidate()
+                    } else if (tvTick != null && tvTick.contentStale() &&
+                        tvTick.lastRenderAtMs == 0L
+                    ) {
+                        tvTick.refreshContent()
                     }
                     // 心跳（v2.0.5）：每 10 秒一行，drawCalls 在
                     // 面板可见时应稳定每秒 +1、不可见时不涨——用
@@ -2583,6 +2787,7 @@ object HeaderOverlay {
                         logFn(
                             "overlay heartbeat #${st.tickCount / 10}: " +
                                 "drawCalls=${st.themeView?.drawCalls} " +
+                                "renders=${st.themeView?.renderCount} " +
                                 "drawn=${st.themeView?.lastDrawnElements}"
                         )
                     }
@@ -2637,6 +2842,8 @@ object HeaderOverlay {
                 "child=$childIdx/${parent?.childCount} clip=${parent?.clipChildren} | " +
                 "themeView=[${tv?.width}x${tv?.height}] vis=${tv?.visibility} " +
                 "alpha=${tv?.alpha} drawCalls=${tv?.drawCalls} " +
+                "renders=${tv?.renderCount} " +
+                "gate=${if (shadeSettledClosed(st)) "closed" else "open"} " +
                 "drawn=${tv?.lastDrawnElements} envNull=${tv?.lastEnvMissing} | " +
                 "bgShown=${st.appliedStamp?.showBackground} | " +
                 "mountBounds=${st.mountBounds?.joinToString(",")}"
@@ -2765,6 +2972,7 @@ object HeaderOverlay {
                 st.preDrawListener = null
             }
             unregisterBatteryReceiver(st)
+            st.themeView?.releaseBitmap()
             st.wrapper?.let { wrapper ->
                 (wrapper.parent as? ViewGroup)?.removeView(wrapper)
             }

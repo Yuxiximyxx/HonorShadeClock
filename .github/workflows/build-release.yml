@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.20-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.21-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.20-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.21-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,38 +68,36 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.20
-          name: HonorShadeClock 2.0.20 — 选了 AAA 仍显示云镜修复（戳记收敛到单一权威）+ 充电动画不进通知中心
+          tag_name: v2.0.21
+          name: HonorShadeClock 2.0.21 — 改名「通知中心主题」+ 偏移按主题记 + 进出闪烁修（位图呈现与收尾门）
           body: |
-            ## HonorShadeClock 2.0.20
+            ## HonorShadeClock 2.0.21
 
-            两件事，其余功能与 2.0.19 一致：
+            改名：模块显示名改为「通知中心主题」（包名不变，
+            原有设置与主题都不受影响）。另修两件事：
 
-            - 选了 AAA 却还是显示云镜：2.0.19 的日志实证，
-              系统界面侧从头到尾只采纳到云镜的那份戳记，
-              选 AAA 的写入没有在目录里留下一份能被采纳
-              的最新戳记——设置侧经 MediaStore 写入（查
-              不到就新建、被系统改名成副本、结果还被丢
-              弃）在重装过的机器上不可靠。本版把戳记通道
-              收敛到单一权威：设置侧每次写戳记前先删尽
-              本安装拥有的全部戳记副本、只写一份，写完
-              回读校验内容一致才算成功（失败会在设置页
-              给出提示，不再静默）；系统界面侧采纳胜者
-              后回写正本并删掉其余旧副本，目录最终只剩
-              正本一份。重启系统界面的标记文件同口径。
-              升级后打开一次设置页、把主题来回切换一次
-              即可自愈存量副本。
-            - 充电动画不再进通知中心：锁屏主题自带的充
-              电组（充电帧图、充电背景、充电百分比）是
-              锁屏场景的东西，覆盖层求值时一律按未充电
-              处理，充电触发的整组永不出现在通知中心；
-              电量数值保持真值，电量小模块/图标不受影
-              响。对所有主题通用，不只针对某一份。
+            - 垂直偏移按主题记：以前偏移是全局一个值，各主
+              题的时钟簇位置不同套不住。现改为每个主题单独
+              记自己的偏移，设置页滑杆显示/修改的是当前选
+              中主题的那一份，切换主题时下发的就是那个主
+              题的值；旧的全局偏移已自动搬给当前主题作初
+              始值，不会丢。
+            - 进出通知中心闪烁：2.0.20 的日志定案——全部
+              采样里覆盖层 alpha 恒为 1.0，录屏也是整幅
+              有/无的跳变，闪烁不是 alpha 的问题。开侧是
+              内容没画好：首绘靠布局/每秒刷新链驱动，下拉
+              太快时跟不上，落定后才整幅跳出；关侧是宿主
+              关完把原头部藏了、覆盖层没跟着藏，最后几帧
+              独自压在桌面上。本版：内容改为先离屏渲成成
+              品图、显示时只贴图，下拉第一帧就是加载好的
+              完整样式；关闭落定时覆盖层与原头部同帧撤
+              下，不再残留。横滑切换通知/控制中心的跟随
+              与三道门控（锁屏/控制中心/横幅）未动。
 
             生效方式：覆盖安装 → 打开一次设置页 → 用
-            设置页「重启系统界面」按钮重载 → 在两个主
-            题间来回切换确认都跟随；充电时下拉确认不
-            再出现充电动画。
+            「重启系统界面」按钮重载 → 连续下拉多次确认
+            时钟第一帧就在、收起后桌面干净；两个主题各
+            调一次偏移、来回切换确认各自记住。
             关闭办法：在 LSPosed 里停用模块再重启一次
             系统界面，即恢复原样。
           files: dist/*.apk

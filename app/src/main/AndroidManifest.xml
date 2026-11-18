@@ -32,7 +32,7 @@
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="通知中心大时钟：在 MagicOS 11 通知栏顶部以覆盖层渲染荣耀锁屏主题样式（可导入/切换主题），或放大原头部时钟字号。" />
+            android:value="通知中心主题：在 MagicOS 11 通知中心顶部以覆盖层渲染荣耀锁屏主题样式（可导入/切换主题、每个主题单独记垂直偏移），可隐藏运营商文字；也可放大原头部时钟字号。" />
         <meta-data
             android:name="xposedminversion"
             android:value="82" />

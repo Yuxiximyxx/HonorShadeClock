@@ -232,7 +232,64 @@ object ThemeStore {
     const val KEY_SHOW_BACKGROUND = "show_background"
     const val KEY_SHOW_WIDGETS = "show_widgets"
     const val KEY_OFFSET_DP = "offset_dp"
+    const val KEY_OFFSETS_JSON = "offsets_by_theme_json"
     const val KEY_HIDE_CARRIER = "hide_carrier"
+
+    // ---- 垂直偏移按主题记（v2.0.21）----
+    // v2.0.20 及以前偏移是全局一个值（KEY_OFFSET_DP），但各
+    // 主题的时钟簇位置/留白不同，一个值套不住所有主题。改
+    // 为按 themeId 存一张映射（KEY_OFFSETS_JSON）；戳记格式
+    // 不变——写戳记时取「当前选中主题」的那一份下发，hook
+    // 侧无感。存量迁移：旧的全局值作为「当前选中主题」的初
+    // 始值搬进映射（只搬一次，搬完删旧键），不丢用户已调好
+    // 的值；其余主题从 0 开始各自调。
+
+    fun loadOffsetMap(prefs: SharedPreferences): MutableMap<String, Int> {
+        val out = mutableMapOf<String, Int>()
+        val raw = prefs.getString(KEY_OFFSETS_JSON, null) ?: return out
+        return try {
+            val obj = JSONObject(raw)
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                out[k] = obj.optInt(k, 0)
+                    .coerceIn(StampStore.OFFSET_DP_MIN, StampStore.OFFSET_DP_MAX)
+            }
+            out
+        } catch (t: Throwable) {
+            out
+        }
+    }
+
+    fun saveOffsetMap(prefs: SharedPreferences, map: Map<String, Int>) {
+        val obj = JSONObject()
+        for ((k, v) in map) obj.put(k, v)
+        prefs.edit().putString(KEY_OFFSETS_JSON, obj.toString()).apply()
+    }
+
+    /** 存量迁移（幂等）：旧全局偏移 → 当前选中主题的初始偏移，搬完删旧键。 */
+    fun migrateLegacyOffset(prefs: SharedPreferences) {
+        if (!prefs.contains(KEY_OFFSET_DP)) return
+        val legacy = prefs.getInt(KEY_OFFSET_DP, 0)
+            .coerceIn(StampStore.OFFSET_DP_MIN, StampStore.OFFSET_DP_MAX)
+        val selected = prefs.getString(KEY_SELECTED_THEME, "") ?: ""
+        val map = loadOffsetMap(prefs)
+        if (!map.containsKey(selected)) {
+            map[selected] = legacy
+            saveOffsetMap(prefs, map)
+        }
+        prefs.edit().remove(KEY_OFFSET_DP).apply()
+    }
+
+    /** 某主题的偏移（dp）；没调过返回 0。调用前应已跑过 migrateLegacyOffset。 */
+    fun offsetForTheme(prefs: SharedPreferences, themeId: String): Int =
+        loadOffsetMap(prefs)[themeId] ?: 0
+
+    fun setOffsetForTheme(prefs: SharedPreferences, themeId: String, value: Int) {
+        val map = loadOffsetMap(prefs)
+        map[themeId] = value.coerceIn(StampStore.OFFSET_DP_MIN, StampStore.OFFSET_DP_MAX)
+        saveOffsetMap(prefs, map)
+    }
 
     fun loadThemes(prefs: SharedPreferences): List<ThemeEntry> {
         val raw = prefs.getString(KEY_THEMES_JSON, null) ?: return emptyList()
@@ -302,7 +359,11 @@ object ThemeStore {
         val heightMode = prefs.getInt(KEY_HEIGHT_MODE, StampStore.HEIGHT_FOLLOW)
         val showBackground = prefs.getBoolean(KEY_SHOW_BACKGROUND, false)
         val showWidgets = prefs.getBoolean(KEY_SHOW_WIDGETS, false)
-        val offsetDp = prefs.getInt(KEY_OFFSET_DP, 0)
+        // 偏移按主题下发（v2.0.21）：戳记第 7 行仍是单个值，
+        // 取当前选中主题的那一份；先跑存量迁移保证旧全局值
+        // 已搬进映射。
+        migrateLegacyOffset(prefs)
+        val offsetDp = offsetForTheme(prefs, selected)
         val hideCarrier = prefs.getBoolean(KEY_HIDE_CARRIER, true)
         val content = StampStore.formatStamp(
             selected, System.currentTimeMillis(), heightMode, topStyle,
@@ -342,6 +403,9 @@ object ThemeStore {
         PublicStore.deleteTree(context, "${StampStore.THEMES_REL_DIR}/$id")
         val themes = loadThemes(prefs).filter { it.id != id }
         saveThemes(prefs, themes)
+        // 该主题的偏移记录一并清掉（v2.0.21），免得映射里留孤儿
+        val offsets = loadOffsetMap(prefs)
+        if (offsets.remove(id) != null) saveOffsetMap(prefs, offsets)
         if (prefs.getString(KEY_SELECTED_THEME, "") == id) {
             prefs.edit().putString(KEY_SELECTED_THEME, "").apply()
         }

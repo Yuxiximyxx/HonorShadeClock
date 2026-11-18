@@ -141,16 +141,22 @@ private fun SettingsScreen() {
     var hideCarrier by remember {
         mutableStateOf(prefs.getBoolean(ThemeStore.KEY_HIDE_CARRIER, true))
     }
-    var offsetDp by remember {
-        mutableIntStateOf(
-            prefs.getInt(ThemeStore.KEY_OFFSET_DP, 0)
-                .coerceIn(StampStore.OFFSET_DP_MIN, StampStore.OFFSET_DP_MAX)
-        )
-    }
     var restartStatus by remember { mutableStateOf("") }
     var themes by remember { mutableStateOf(ThemeStore.loadThemes(prefs)) }
     var selectedThemeId by remember {
         mutableStateOf(prefs.getString(ThemeStore.KEY_SELECTED_THEME, "") ?: "")
+    }
+    // 垂直偏移按主题记（v2.0.21）：滑杆永远显示/修改「当前
+    // 选中主题」的那一份；先跑存量迁移（旧全局值搬给当前
+    // 主题），再读当前主题的值作初值。
+    var offsetDp by remember {
+        ThemeStore.migrateLegacyOffset(prefs)
+        mutableIntStateOf(
+            ThemeStore.offsetForTheme(
+                prefs,
+                prefs.getString(ThemeStore.KEY_SELECTED_THEME, "") ?: "",
+            )
+        )
     }
     var importStatus by remember { mutableStateOf("") }
     var importing by remember { mutableStateOf(false) }
@@ -238,13 +244,16 @@ private fun SettingsScreen() {
     fun saveOffsetDp(value: Int) {
         if (value == offsetDp) return
         offsetDp = value
-        prefs.edit().putInt(ThemeStore.KEY_OFFSET_DP, value).apply()
+        // 只写当前选中主题的那一份（v2.0.21），别的主题不受影响
+        ThemeStore.setOffsetForTheme(prefs, selectedThemeId, value)
         syncStamp()
     }
 
     fun selectTheme(id: String) {
         selectedThemeId = id
         prefs.edit().putString(ThemeStore.KEY_SELECTED_THEME, id).apply()
+        // 滑杆跟随主题：切过去就显示那个主题自己记着的偏移
+        offsetDp = ThemeStore.offsetForTheme(prefs, id)
         syncStamp()
     }
 
@@ -253,7 +262,10 @@ private fun SettingsScreen() {
             ThemeStore.deleteTheme(context, prefs, id)
             withContext(Dispatchers.Main) {
                 themes = ThemeStore.loadThemes(prefs)
-                if (selectedThemeId == id) selectedThemeId = ""
+                if (selectedThemeId == id) {
+                    selectedThemeId = ""
+                    offsetDp = ThemeStore.offsetForTheme(prefs, "")
+                }
                 importStatus = "已删除主题"
             }
         }
@@ -278,6 +290,8 @@ private fun SettingsScreen() {
                         prefs.edit()
                             .putString(ThemeStore.KEY_SELECTED_THEME, result.entry.id)
                             .apply()
+                        // 新主题的偏移从它自己那份起算（没调过是 0）
+                        offsetDp = ThemeStore.offsetForTheme(prefs, result.entry.id)
                         importStatus = "已导入并选中「${result.entry.name}」"
                         syncStamp()
                     }
@@ -326,7 +340,7 @@ private fun SettingsScreen() {
         containerColor = MiuixTheme.colorScheme.background,
         topBar = {
             SmallTopAppBar(
-                title = "通知中心大时钟",
+                title = "通知中心主题",
                 color = Color.Transparent,
             )
         },
@@ -415,7 +429,7 @@ private fun SettingsScreen() {
                             onValueChange = { saveOffsetDp(it) },
                         )
                         Text(
-                            "负数上移、正数下移。主题顶部的留白是给锁屏天空的，在通知中心里显空时往上调；最多上移到时钟簇贴顶。",
+                            "负数上移、正数下移。每个主题单独记自己的偏移：滑杆调的是当前选中的主题，切到别的主题显示的是那个主题的值。主题顶部的留白是给锁屏天空的，在通知中心里显空时往上调；最多上移到时钟簇贴顶。",
                             fontSize = 13.sp,
                             color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                             modifier = Modifier.padding(top = 8.dp),
