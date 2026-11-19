@@ -5,7 +5,9 @@ import android.appwidget.AppWidgetManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Process
+import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
+import org.xmlpull.v1.XmlPullParser
 
 /**
  * 真卡片探针（v2.0.31）：只加日志、零行为改变。
@@ -71,6 +73,7 @@ object CardProbe {
             log("[cardprobe] ===== card probe start (trigger=$source, pid=${Process.myPid()}, uid=${Process.myUid()}) =====")
             probePermission(ctx, log)
             probeProviders(ctx, log)
+            probeXmlDumpAsync(ctx, log)
             probeHostAllocate(ctx, log)
             log("[cardprobe] form-host: no known entry point (static analysis: no Honor form host service/class found in SystemUI dex or framework-magic.jar); skipped, no guessing")
             log("[cardprobe] ===== card probe end =====")
@@ -137,6 +140,117 @@ object CardProbe {
             log("[cardprobe] providers: label-matched=$matched of ${providers.size}")
         } catch (t: Throwable) {
             log("[cardprobe] providers enumeration failed: ${t.javaClass.name}: ${t.message}")
+        }
+    }
+
+    /**
+     * 服务卡片 XML 声明 dump（v2.0.34）：小乐纠正——系统目录里
+     * 「服务卡片」与「经典小工具」是两个分区，区分标记与规范
+     * 尺寸档位不在运行时 API 里，最大嫌疑在每个 receiver 的
+     * appwidget-provider XML 原始声明（荣耀命名空间自定义属性）。
+     * 本探针在 SystemUI 侧（全量 554 可见、不受普通应用可见性
+     * 过滤）逐个 loadXmlMetaData 读原始 XML，把全部属性
+     * （命名空间+名+值，资源引用另记原始整数形态）写到
+     * /sdcard/Download/shadeclock_cardxml.txt，供下一轮逐属性
+     * 比对定案。解析 554 份 XML 较重，放后台线程跑；只写文件、
+     * 零行为改变，异常全吞。
+     */
+    private fun probeXmlDumpAsync(ctx: Context, log: (String) -> Unit) {
+        try {
+            val appCtx = ctx.applicationContext ?: ctx
+            val t = Thread { dumpProviderXml(appCtx, log) }
+            t.name = "shadeclock-cardxml"
+            t.isDaemon = true
+            t.start()
+            log("[cardprobe] xml-dump: scheduled on background thread -> /sdcard/Download/shadeclock_cardxml.txt")
+        } catch (t: Throwable) {
+            log("[cardprobe] xml-dump: schedule failed: ${t.javaClass.name}: ${t.message}")
+        }
+    }
+
+    private fun dumpProviderXml(ctx: Context, log: (String) -> Unit) {
+        val outFile = File("/sdcard/Download/shadeclock_cardxml.txt")
+        var ok = 0
+        var failed = 0
+        try {
+            val pm = ctx.packageManager
+            val awm = AppWidgetManager.getInstance(ctx)
+            if (awm == null) {
+                log("[cardprobe] xml-dump: AppWidgetManager is null")
+                return
+            }
+            val providers = awm.installedProviders
+            outFile.bufferedWriter().use { w ->
+                w.write("# HonorShadeClock cardxml dump v2.0.34 providers=${providers.size}\n")
+                for (info in providers) {
+                    val comp = info.provider
+                    val label = try {
+                        info.loadLabel(pm) ?: ""
+                    } catch (t: Throwable) {
+                        ""
+                    }
+                    w.write("=== ${comp.flattenToString()} label=$label\n")
+                    try {
+                        val ri = pm.getReceiverInfo(comp, PackageManager.GET_META_DATA)
+                        val parser = ri.loadXmlMetaData(pm, "android.appwidget.provider")
+                        if (parser == null) {
+                            w.write("  <no xml metadata>\n")
+                            failed++
+                            continue
+                        }
+                        try {
+                            var event = parser.eventType
+                            while (event != XmlPullParser.END_DOCUMENT) {
+                                if (event == XmlPullParser.START_TAG) {
+                                    val sb = StringBuilder()
+                                    sb.append("  <").append(parser.name)
+                                    for (i in 0 until parser.attributeCount) {
+                                        val ns = parser.getAttributeNamespace(i)
+                                        val name = parser.getAttributeName(i)
+                                        val value = try {
+                                            parser.getAttributeValue(i)
+                                        } catch (t: Throwable) {
+                                            null
+                                        }
+                                        sb.append('\n').append("    ")
+                                        if (!ns.isNullOrEmpty()) {
+                                            sb.append('{').append(ns).append('}')
+                                        }
+                                        sb.append(name).append("=\"").append(value).append('"')
+                                        val rawInt = try {
+                                            parser.getAttributeIntValue(i, Int.MIN_VALUE)
+                                        } catch (t: Throwable) {
+                                            Int.MIN_VALUE
+                                        }
+                                        if (rawInt != Int.MIN_VALUE) {
+                                            sb.append(" rawInt=").append(rawInt)
+                                                .append("/0x")
+                                                .append(Integer.toHexString(rawInt))
+                                        }
+                                    }
+                                    w.write(sb.toString())
+                                    w.write("\n")
+                                }
+                                event = parser.next()
+                            }
+                        } finally {
+                            try {
+                                parser.close()
+                            } catch (t: Throwable) {
+                                // 关不掉就算了
+                            }
+                        }
+                        ok++
+                    } catch (t: Throwable) {
+                        failed++
+                        w.write("  <error ${t.javaClass.name}: ${t.message}>\n")
+                    }
+                }
+                w.write("# end ok=$ok failed=$failed\n")
+            }
+            log("[cardprobe] xml-dump: done ok=$ok failed=$failed -> ${outFile.absolutePath}")
+        } catch (t: Throwable) {
+            log("[cardprobe] xml-dump: aborted: ${t.javaClass.name}: ${t.message}")
         }
     }
 

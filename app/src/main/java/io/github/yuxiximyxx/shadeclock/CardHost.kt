@@ -113,7 +113,7 @@ object CardHost {
             "[cardhost] provider: $key label=$label " +
                 "minW=${info.minWidth} minH=${info.minHeight} " +
                 "cellW=${info.targetCellWidth} cellH=${info.targetCellHeight} " +
-                "configure=${info.configure}"
+                "configure=${info.configure} updatePeriod=${info.updatePeriodMillis}"
         )
         if (info.configure != null) {
             log(
@@ -121,7 +121,7 @@ object CardHost {
                     "(${info.configure}), this build binds without configuring"
             )
         }
-        val h = host ?: AppWidgetHost(ctx, HOST_ID).also { host = it }
+        val h = host ?: LoggingHost(ctx, HOST_ID, log).also { host = it }
         if (!hostListening) {
             h.startListening()
             hostListening = true
@@ -272,5 +272,62 @@ object CardHost {
     private fun forgetId(component: ComponentName) {
         val map = loadIdMap()
         if (map.remove(component.flattenToString()) != null) saveIdMap(map)
+    }
+}
+
+/**
+ * 内容下发取证宿主（v2.0.34）：与 KgAppWidgetHost 同路，
+ * onCreateView 换成会记日志的视图子类。只记日志、不改任何
+ * 托管行为——用来把「视图建了但内容没下发」与「下发了但在
+ * SystemUI 侧 inflate 失败落错误视图（『无法添加小部件』）」
+ * 两类成因分开：前者 updateAppWidget 永远不来，后者来了且
+ * 随后能检出 error view。
+ */
+private class LoggingHost(
+    context: Context,
+    hostId: Int,
+    private val logFn: (String) -> Unit,
+) : AppWidgetHost(context, hostId) {
+
+    override fun onCreateView(
+        context: Context,
+        appWidgetId: Int,
+        appWidget: AppWidgetProviderInfo?,
+    ): AppWidgetHostView {
+        logFn("[cardhost] hostView created id=$appWidgetId provider=${appWidget?.provider}")
+        return LoggingHostView(context, logFn)
+    }
+}
+
+private class LoggingHostView(
+    context: Context,
+    private val logFn: (String) -> Unit,
+) : AppWidgetHostView(context) {
+
+    override fun updateAppWidget(views: android.widget.RemoteViews?) {
+        try {
+            logFn(
+                "[cardhost] updateAppWidget id=$appWidgetId " +
+                    "pkg=${views?.package} layout=${views?.layoutId}"
+            )
+        } catch (t: Throwable) {
+            // 只记日志，异常不许影响下发本体
+        }
+        super.updateAppWidget(views)
+        // 下发应用是同步 inflate、失败当场落 error view；延后
+        // 500ms 反射检一次 getErrorView（方法不存在就记 n/a）。
+        try {
+            postDelayed({
+                try {
+                    val m = AppWidgetHostView::class.java.getMethod("getErrorView")
+                    val ev = m.invoke(this)
+                    logFn("[cardhost] errorView check id=$appWidgetId -> ${ev != null}")
+                } catch (t: Throwable) {
+                    logFn("[cardhost] errorView check id=$appWidgetId -> n/a (${t.javaClass.simpleName})")
+                }
+            }, 500L)
+        } catch (t: Throwable) {
+            // 同上
+        }
     }
 }
