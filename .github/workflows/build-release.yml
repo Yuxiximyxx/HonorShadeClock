@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.34-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.35-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.34-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.35-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,46 +68,46 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.34
-          name: HonorShadeClock 2.0.34 — 服务卡片纠偏取证（XML 声明 dump + 内容下发日志）
+          tag_name: v2.0.35
+          name: HonorShadeClock 2.0.35 — 取证第二弹（桌面宿主绑定地面真值）
           body: |
-            ## HonorShadeClock 2.0.34
+            ## HonorShadeClock 2.0.35
 
-            卡片线纠偏取证版：托管行为与 2.0.33
-            完全一致，只新增两路取证，不改目录、
-            不改绑定参数。
+            取证第二弹：托管行为与 2.0.34 完全
+            一致，只在探针里再加一路「宿主绑定
+            地面真值」dump。2.0.34 的两路取证
+            （XML 声明 dump、内容下发日志）原样
+            保留、继续有效。
 
-            背景：.32/.33 把系统目录里的「服务
-            卡片」与「经典小工具」混在一起按通用
-            小部件枚举了，且真机上多张卡显示
-            「无法添加小部件」。荣耀服务卡片的
-            身份标记与规范尺寸，最大嫌疑在每个
-            provider 的 appwidget-provider XML
-            原始声明里，运行时 API 读不到。
+            做法：你在桌面亲手添加想要的服务
+            卡片后，启动器宿主名下就有一批已
+            成立的绑定。本版探针经小部件服务
+            枚举各宿主名下的全部绑定，逐个把
+            provider 组件与完整的 options
+            （hostName、尺寸档位、私有键全量）
+            写到 /sdcard/Download/
+            shadeclock_hostbind.txt，与我们
+            自己宿主的绑定逐项对照——桌面宿主
+            的下发条件若与我们的不同，这里会
+            现形。服务侧若按调用方身份拦下，
+            被拦的方法与异常会如实记下、退回
+            XML 路线，不硬闯。
 
-            本版新增：
-            1. SystemUI 侧全量 XML dump：探针在
-               系统进程内（554 个 provider 全量
-               可见）逐个读原始声明 XML，把全部
-               属性（命名空间+名+值）写到
-               /sdcard/Download/shadeclock_cardxml.txt；
-            2. 内容下发取证：宿主视图加日志——
-               provider 的内容下发（updateAppWidget）
-               到没到、到的布局是什么、下发后是否
-               落到错误视图，都会记进
-               shadeclock_probe.log 的 [cardhost] 段，
-               用来区分「拒发」与「inflate 失败」。
+            取证动作（顺序别反）：
+            1. 先在桌面添加你想要的那几张
+               服务卡片；
+            2. 覆盖安装本版 → 打开一次设置页
+               → 点「重启系统界面」；
+            3. 下拉开几次通知中心、点开一两张
+               头部卡片；
+            4. 回传三个文件：
+               /sdcard/Download/shadeclock_cardxml.txt
+               /sdcard/Download/shadeclock_hostbind.txt
+               /sdcard/Download/shadeclock_probe.log
 
-            需要回传两个文件：
-            /sdcard/Download/shadeclock_cardxml.txt
-            /sdcard/Download/shadeclock_probe.log
-            （覆盖安装 → 打开一次设置页 → 点
-            「重启系统界面」→ 下拉开几次通知
-            中心、点开一两张卡片后回传。）
-
-            下一版据 XML 定案：目录只列真服务
-            卡片、尺寸用规范档位、托管参数按
-            provider 对宿主的期望声明补齐。
+            下一版据三份证据定案：目录只列真
+            服务卡片、尺寸用规范档位、托管参数
+            按真宿主的下发条件补齐。
             关闭办法：在 LSPosed 里停用模块再重启一次
             系统界面，即恢复原样。
           files: dist/*.apk
