@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.32-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.33-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.32-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.33-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,49 +68,62 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.32
-          name: HonorShadeClock 2.0.32 — 头部卡片施工验证版（自选卡片）
+          tag_name: v2.0.33
+          name: HonorShadeClock 2.0.33 — 选卡页修复（目录对齐/顶部重叠/图标/搜索）
           body: |
-            ## HonorShadeClock 2.0.32
+            ## HonorShadeClock 2.0.33
 
-            施工验证版：把应用服务卡片真绑进通知
-            中心头部（与主题时钟簇互斥），呈现体系
-            （落定才出现/目的页闩/开门序列/避让）
-            与 2.0.30/2.0.31 完全一致、自动适用。
+            只修设置页「头部卡片」的选卡页；卡片
+            绑定链（CardHost）、呈现体系、戳记
+            语义、默认选中天气小卡全部与 2.0.32
+            一致、未动。
 
-            本版内容：
-            1. SystemUI 侧自建标准 AppWidgetHost
-               （新类 CardHost），按选中 provider
-               走 allocate → bindAppWidgetIdIfAllowed
-               → createView 全链；appWidgetId 按
-               provider 分别持久化，来回切换复用
-               各自实例与配置；
-            2. 默认开启卡片模式、默认选中天气
-               小卡（SmallCardWeatherProvider，
-               532×560）；设置页新增二级页「头部
-               卡片」：模式开关 + 按应用分组的
-               选卡列表（全机 provider 自选）；
-            3. 卡片按原生尺寸水平居中，比头部宽
-               的只等比缩小到贴合、不放大，高度
-               随缩放后尺寸走既有避让机制；
-            4. 点击透传：覆盖层零触摸拦截，点卡
-               片应直进对应应用；面板拖拽语义
-               未动；
-            5. 带 configure 的卡本版只绑不配
-               （出默认内容）；绑定失败自动回退
-               主题时钟簇并记 [cardhost] 日志。
+            .32 真机反馈的三个问题与本版处理：
+            1. 顶部重叠：设置页内容区的 padding
+               顺序写反，顶栏 inset 一滚动就被卷
+               走，列表行滑到状态栏/顶栏底下与
+               标题、时间重叠——已改成先 padding
+               再滚动，内容永远不进顶栏区域
+               （全设置页受益）；
+            2. 目录对不上：.32 列表是全机小部件
+               大杂烩，且天气/日历/时钟/智慧空间
+               四组整组缺失。静态比对定案：设置
+               侧与 .31 探针调的是同一个枚举
+               API，差别只在调用方身份（设置是
+               普通应用、探针在系统进程）——缺失
+               是调用方侧过滤。本版给清单加了
+               <queries> 声明（十个服务卡片来源
+               应用逐个列名 + 小部件意图兜底），
+               并把十个来源应用按探针包名钉在
+               列表最前（新增笔记）；
+            3. 没有图标、没法找：分组行补上应用
+               图标（图标+应用名+卡数，向系统
+               卡片目录形态靠），并加了搜索框
+               （按应用名/卡片名过滤、命中自动
+               展开）。
+            4. 尺寸标注改口径：不再直接标 provider
+               原始声明值（0×0、3584×805 这类没
+               法看）；有格子数显示「W×H 格」，
+               没有的显示按 CardHost 布局规则算出
+               的「实际占用约 WxH dp」。
 
-            注意：高度特别大的卡（如 1000px+）
-            会把通知挤下去很多，选卡时留意尺寸。
+            还差一步定案：系统「服务卡片」目录
+            的精选标记还没找到实锤，本版没有凭
+            猜过滤。打开一次「头部卡片」页会自
+            动生成 /sdcard/Download/
+            shadeclock_carddump.txt（设置进程视
+            角的全量 provider 字段 + receiver
+            metaData 键名），请回传这个文件，
+            下一版据它定过滤口径。
 
-            验证动作：覆盖安装 → 打开一次设置页
-            → 用「重启系统界面」按钮重载 → 下拉
-            通知中心看天气卡是否出真数据、点卡
-            片是否进天气应用、从卡片上起手上下
-            拉是否正常、控制中心/锁屏无卡；再到
-            「头部卡片」页关开关应恢复主题时钟、
-            换选其他卡应能切换。出问题回传
-            /sdcard/Download/shadeclock_probe.log。
+            验证动作：覆盖安装 → 打开设置页 →
+            进「头部卡片」页：滚动列表时顶部不
+            再重叠；天气/时钟/日历应出现在列表
+            最前；搜索「天气」能过滤出来；分组
+            行有应用图标。再下拉通知中心确认
+            天气卡照常。出问题回传
+            /sdcard/Download/shadeclock_probe.log
+            与 shadeclock_carddump.txt。
             关闭办法：在 LSPosed 里停用模块再重启一次
             系统界面，即恢复原样。
           files: dist/*.apk
