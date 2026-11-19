@@ -304,6 +304,40 @@ private class LoggingHostView(
     private val logFn: (String) -> Unit,
 ) : AppWidgetHostView(context) {
 
+    /**
+     * 错误视图自检（v2.0.36 修好）：沿 AppWidgetHostView 类层级
+     * 找 declared 的 getErrorView 并放开访问，检出返回
+     * "errorView=true/false (via getErrorView)"；方法在该 ROM
+     * 上真不存在时退而拼子视图摘要
+     * "children=[类名('文本'), ...]"（错误视图是系统文案的
+     * TextView，摘要里认得出）。两种结果都比 .35 的恒 n/a 强。
+     */
+    private fun errorViewState(): String {
+        var cls: Class<*>? = AppWidgetHostView::class.java
+        while (cls != null) {
+            try {
+                val m = cls.getDeclaredMethod("getErrorView")
+                m.isAccessible = true
+                val ev = m.invoke(this)
+                return "errorView=${ev != null} (via getErrorView on ${cls.simpleName})"
+            } catch (nf: NoSuchMethodException) {
+                cls = cls.superclass
+            }
+        }
+        val sb = StringBuilder("children=[")
+        for (i in 0 until childCount) {
+            val c = getChildAt(i)
+            if (i > 0) sb.append(", ")
+            sb.append(c.javaClass.simpleName)
+            if (c is android.widget.TextView) {
+                val t = c.text?.toString()?.replace('\n', ' ') ?: ""
+                sb.append("('").append(t.take(24)).append("')")
+            }
+        }
+        sb.append("]")
+        return sb.toString()
+    }
+
     override fun updateAppWidget(views: android.widget.RemoteViews?) {
         try {
             logFn(
@@ -315,13 +349,16 @@ private class LoggingHostView(
         }
         super.updateAppWidget(views)
         // 下发应用是同步 inflate、失败当场落 error view；延后
-        // 500ms 反射检一次 getErrorView（方法不存在就记 n/a）。
+        // 500ms 反射检一次。v2.0.36 修：.34/.35 这检恒回 n/a——
+        // getErrorView 在 AOSP 里是 protected，getMethod 只找
+        // public 方法、必然 NoSuchMethodException，自检从没真跑
+        // 过。改沿类层级找 declared 方法并放开访问；仍找不到时
+        // 退而记子视图摘要（类名+TextView 文本），错误视图的
+        // 文案在摘要里同样认得出。
         try {
             postDelayed({
                 try {
-                    val m = AppWidgetHostView::class.java.getMethod("getErrorView")
-                    val ev = m.invoke(this)
-                    logFn("[cardhost] errorView check id=$appWidgetId -> ${ev != null}")
+                    logFn("[cardhost] errorView check id=$appWidgetId -> ${errorViewState()}")
                 } catch (t: Throwable) {
                     logFn("[cardhost] errorView check id=$appWidgetId -> n/a (${t.javaClass.simpleName})")
                 }

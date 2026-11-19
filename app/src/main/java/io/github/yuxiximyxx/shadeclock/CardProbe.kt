@@ -35,6 +35,11 @@ object CardProbe {
 
     private val ran = AtomicBoolean(false)
 
+    /** 宿主（SystemUI）类加载器，由 ShadeClockHook 在 handleLoadPackage 时注入，
+     * 供 hostbind 反射加载 framework 隐藏类时多一条路（v2.0.36）。 */
+    @Volatile
+    var hostClassLoader: ClassLoader? = null
+
     /** 目标来源应用的 label 关键词（按 label 匹配并标注，包名以枚举结果为准）。 */
     private val LABEL_KEYWORDS = listOf(
         "日历", "天气", "时钟", "联系人", "图库", "钱包", "健康",
@@ -42,14 +47,43 @@ object CardProbe {
         "Calendar", "Weather", "Clock", "Contacts", "Gallery", "Wallet", "Health"
     )
 
-    /** hook 初始化触发点。context 拿不到时静默跳过，等首次开门再跑。 */
+    /**
+     * hook 初始化触发点。handleLoadPackage 时 Application 往往还没建、
+     * context 拿不到——v2.0.35 时这条路实际从未触发、探针全靠首次开门。
+     * v2.0.36 改为后台轮询重试（每 2 秒、最长 60 秒），context 一出现
+     * 就跑，不再只挂首次开门；runOnce 的进程内一次闸不变。
+     */
     fun runAtInit(log: (String) -> Unit) {
         val ctx = currentApplicationContext()
-        if (ctx == null) {
-            log("[cardprobe] init trigger: no application context yet, defer to first gate open")
+        if (ctx != null) {
+            runOnce(ctx, "init", log)
             return
         }
-        runOnce(ctx, "init", log)
+        log("[cardprobe] init trigger: no application context yet, scheduling retry")
+        try {
+            val t = Thread {
+                var waitedMs = 0
+                while (waitedMs < 60_000) {
+                    try {
+                        Thread.sleep(2_000)
+                    } catch (ie: InterruptedException) {
+                        return@Thread
+                    }
+                    waitedMs += 2_000
+                    val c = currentApplicationContext()
+                    if (c != null) {
+                        runOnce(c, "init-retry", log)
+                        return@Thread
+                    }
+                }
+                log("[cardprobe] init trigger: context still unavailable after 60s, defer to first gate open")
+            }
+            t.name = "shadeclock-probe-init"
+            t.isDaemon = true
+            t.start()
+        } catch (t: Throwable) {
+            log("[cardprobe] init trigger: retry schedule failed: ${t.javaClass.name}: ${t.message}")
+        }
     }
 
     /** 首次开门触发点（HeaderOverlay 在 wrapper 转 VISIBLE 时调用）。 */
@@ -184,8 +218,9 @@ object CardProbe {
                 return
             }
             val providers = awm.installedProviders
+            val seenPkgs = HashSet<String>()
             outFile.bufferedWriter().use { w ->
-                w.write("# HonorShadeClock cardxml dump v2.0.34 providers=${providers.size}\n")
+                w.write("# HonorShadeClock cardxml dump v2.0.36 providers=${providers.size}\n")
                 for (info in providers) {
                     val comp = info.provider
                     val label = try {
@@ -193,7 +228,30 @@ object CardProbe {
                     } catch (t: Throwable) {
                         ""
                     }
+                    // 应用级 meta-data 键（每包只记一次）：服务卡片身份标记
+                    // 若不在 provider XML 里，候选位置之二（v2.0.36 新增）。
+                    if (seenPkgs.add(comp.packageName)) {
+                        try {
+                            val ai = pm.getApplicationInfo(
+                                comp.packageName,
+                                PackageManager.GET_META_DATA,
+                            )
+                            val keys = ai.metaData?.keySet()?.sorted()?.joinToString(", ")
+                            w.write("### app-meta pkg=${comp.packageName} keys=[$keys]\n")
+                        } catch (t: Throwable) {
+                            w.write("### app-meta pkg=${comp.packageName} FAILED: ${t.javaClass.name}: ${t.message}\n")
+                        }
+                    }
                     w.write("=== ${comp.flattenToString()} label=$label\n")
+                    // receiver 级 meta-data 全部键名（候选位置之三）：身份标记
+                    // 可能以独立 meta-data 键挂在 receiver 上，不在 XML 内容里。
+                    try {
+                        val ri0 = pm.getReceiverInfo(comp, PackageManager.GET_META_DATA)
+                        val keys = ri0.metaData?.keySet()?.sorted()?.joinToString(", ")
+                        w.write("  meta-keys: [$keys]\n")
+                    } catch (t: Throwable) {
+                        w.write("  meta-keys: FAILED ${t.javaClass.name}: ${t.message}\n")
+                    }
                     try {
                         val ri = pm.getReceiverInfo(comp, PackageManager.GET_META_DATA)
                         val parser = ri.loadXmlMetaData(pm, "android.appwidget.provider")
@@ -271,29 +329,29 @@ object CardProbe {
      * 不硬闯。SystemUI 自家名下（锁屏宿主 KgAppWidgetHost 与
      * 本模块 CardHost 都在此）应可达：锁屏宿主是荣耀自家宿主、
      * 它的 options 就是现成的对照样本。
+     * v2.0.36 修订：.35 真机两会话都死在取 Stub 类一步、文件没
+     * 生成（根因见 obtainAppWidgetService 注释）；本版文件先行 +
+     * 三条服务获取策略，成败全写进文件本身。
      */
     private fun dumpHostBindings(ctx: Context, log: (String) -> Unit) {
         val outFile = File("/sdcard/Download/shadeclock_hostbind.txt")
+        // v2.0.36 第一修：文件先行。.35 的死法是反射取 Stub 类在
+        // 打开文件之前就抛 ClassNotFoundException、整个函数 abort，
+        // 文件根本没机会创建——小乐那边看到的就是「没有 hostbind」。
+        // 本版先把文件建出来写好文件头，后面每一步（拿 binder、
+        // 拿服务代理、逐包枚举）的成败都写进文件本身并逐段 flush，
+        // 全灭也有一份带失败轨迹的文件落地。
         try {
-            val smClass = Class.forName("android.os.ServiceManager")
-            val binder = smClass.getMethod("getService", String::class.java)
-                .invoke(null, "appwidget")
-            if (binder == null) {
-                log("[cardprobe] hostbind: appwidget service binder is null")
-                return
-            }
-            val stubClass = Class.forName("android.appwidget.IAppWidgetService\$Stub")
-            val svc = stubClass.getMethod(
-                "asInterface",
-                Class.forName("android.os.IBinder"),
-            ).invoke(null, binder)
-            if (svc == null) {
-                log("[cardprobe] hostbind: IAppWidgetService.asInterface returned null")
-                return
-            }
-            log("[cardprobe] hostbind: IAppWidgetService proxy ok: ${svc.javaClass.name}")
             outFile.bufferedWriter().use { w ->
-                w.write("# HonorShadeClock hostbind dump v2.0.35\n")
+                w.write("# HonorShadeClock hostbind dump v2.0.36\n")
+                w.flush()
+                val svc = obtainAppWidgetService(ctx, w, log)
+                if (svc == null) {
+                    w.write("## service acquisition: ALL STRATEGIES FAILED (see steps above)\n")
+                    w.flush()
+                    log("[cardprobe] hostbind: service acquisition failed, failure trail written -> ${outFile.absolutePath}")
+                    return
+                }
                 val candidates = listOf(
                     "com.android.systemui",
                     "com.hihonor.android.launcher",
@@ -311,11 +369,13 @@ object CardProbe {
                             "## getAppWidgetIds($pkg) -> ${ids?.size} ids: " +
                                 "${ids?.joinToString()}\n"
                         )
+                        w.flush()
                         log("[cardprobe] hostbind: getAppWidgetIds($pkg) -> ${ids?.size} ids")
                         if (ids != null) {
                             for (id in ids) {
                                 dumpOneBinding(svc, w, pkg, id)
                             }
+                            w.flush()
                         }
                     } catch (t: Throwable) {
                         val cause = unwrap(t)
@@ -323,6 +383,7 @@ object CardProbe {
                             "## getAppWidgetIds($pkg) FAILED: " +
                                 "${cause.javaClass.name}: ${cause.message}\n"
                         )
+                        w.flush()
                         log(
                             "[cardprobe] hostbind: getAppWidgetIds($pkg) failed: " +
                                 "${cause.javaClass.name}: ${cause.message}"
@@ -333,7 +394,120 @@ object CardProbe {
             log("[cardprobe] hostbind: done -> ${outFile.absolutePath}")
         } catch (t: Throwable) {
             log("[cardprobe] hostbind: aborted: ${t.javaClass.name}: ${t.message}")
+            try {
+                outFile.appendText("## aborted: ${t.javaClass.name}: ${t.message}\n")
+            } catch (ignored: Throwable) {
+                // 文件都落不了就只剩日志这一行
+            }
         }
+    }
+
+    /**
+     * 拿到小部件服务代理，每条策略的成败都写进 [w]（hostbind 文件）
+     * 与探针日志。v2.0.35 的死因有二：一是类名写错——Stub 的真实
+     * 全名是 com.android.internal.appwidget.IAppWidgetService$Stub
+     * （AOSP AIDL 所在包），.35 写的是 android.appwidget.…，类根本
+     * 不存在；二是 Class.forName 走模块类加载器、framework 隐藏类
+     * 未必可见。本版三条策略依次试：
+     * S1 直接从 AppWidgetManager 实例的 mService 字段掏现成代理
+     *    （不需要加载任何隐藏类，最稳）；
+     * S2 用正确类名经 ServiceManager binder + asInterface，类加载
+     *    器依次试模块 / 系统 / 宿主（SystemUI）三条；
+     * S3 旧错名兜底（防个别 ROM 真把它放在 android.appwidget 下）。
+     */
+    private fun obtainAppWidgetService(
+        ctx: Context,
+        w: java.io.Writer,
+        log: (String) -> Unit,
+    ): Any? {
+        // ---- S1: AppWidgetManager.mService ----
+        try {
+            val awm = AppWidgetManager.getInstance(ctx)
+            var cls: Class<*>? = awm?.javaClass
+            var field: java.lang.reflect.Field? = null
+            while (cls != null && field == null) {
+                field = try {
+                    cls.getDeclaredField("mService")
+                } catch (nf: NoSuchFieldException) {
+                    null
+                }
+                if (field == null) cls = cls.superclass
+            }
+            if (awm != null && field != null) {
+                field.isAccessible = true
+                val svc = field.get(awm)
+                if (svc != null) {
+                    w.write("## service via S1 AppWidgetManager.mService: ${svc.javaClass.name}\n")
+                    w.flush()
+                    log("[cardprobe] hostbind: service via S1 mService ok: ${svc.javaClass.name}")
+                    return svc
+                }
+                w.write("## S1 AppWidgetManager.mService: field present but null\n")
+            } else {
+                w.write("## S1 AppWidgetManager.mService: field not found (awm=${awm?.javaClass?.name})\n")
+            }
+            w.flush()
+        } catch (t: Throwable) {
+            val cause = unwrap(t)
+            w.write("## S1 FAILED: ${cause.javaClass.name}: ${cause.message}\n")
+            w.flush()
+            log("[cardprobe] hostbind: S1 failed: ${cause.javaClass.name}: ${cause.message}")
+        }
+        // ---- binder（S2/S3 共用）----
+        val binder = try {
+            val smClass = Class.forName("android.os.ServiceManager")
+            smClass.getMethod("getService", String::class.java)
+                .invoke(null, "appwidget")
+        } catch (t: Throwable) {
+            val cause = unwrap(t)
+            w.write("## binder FAILED: ${cause.javaClass.name}: ${cause.message}\n")
+            w.flush()
+            log("[cardprobe] hostbind: binder failed: ${cause.javaClass.name}: ${cause.message}")
+            null
+        }
+        if (binder == null) return null
+        // ---- S2/S3: Stub.asInterface ----
+        val stubNames = listOf(
+            "com.android.internal.appwidget.IAppWidgetService\$Stub",
+            "android.appwidget.IAppWidgetService\$Stub",
+        )
+        val loaders = listOf<Pair<String, ClassLoader?>>(
+            "module" to CardProbe::class.java.classLoader,
+            "system" to ClassLoader.getSystemClassLoader(),
+            "host" to hostClassLoader,
+        )
+        for (name in stubNames) {
+            for ((lname, loader) in loaders) {
+                try {
+                    val stubClass = if (loader != null) {
+                        Class.forName(name, true, loader)
+                    } else {
+                        Class.forName(name)
+                    }
+                    val svc = stubClass.getMethod(
+                        "asInterface",
+                        Class.forName("android.os.IBinder"),
+                    ).invoke(null, binder)
+                    if (svc != null) {
+                        w.write("## service via Stub $name (loader=$lname): ${svc.javaClass.name}\n")
+                        w.flush()
+                        log("[cardprobe] hostbind: service via Stub $name loader=$lname ok")
+                        return svc
+                    }
+                    w.write("## Stub $name (loader=$lname): asInterface returned null\n")
+                    w.flush()
+                } catch (t: Throwable) {
+                    val cause = unwrap(t)
+                    w.write("## Stub $name (loader=$lname) FAILED: ${cause.javaClass.name}: ${cause.message}\n")
+                    w.flush()
+                    log(
+                        "[cardprobe] hostbind: Stub $name loader=$lname failed: " +
+                            "${cause.javaClass.name}"
+                    )
+                }
+            }
+        }
+        return null
     }
 
     private fun dumpOneBinding(
