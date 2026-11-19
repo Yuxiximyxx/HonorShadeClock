@@ -1,6 +1,7 @@
 package io.github.yuxiximyxx.shadeclock
 
 import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -11,6 +12,7 @@ import android.os.BatteryManager
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
@@ -709,6 +711,24 @@ object HeaderOverlay {
         var mountParent: ViewGroup? = null
         var mountBounds: IntArray? = null
         var themeView: ThemeView? = null
+        /**
+         * 头部卡片（v2.0.32）：wrapper 内的卡片槽与当前托管的
+         * AppWidgetHostView，与 themeView 互斥显示——卡片模式
+         * 下 themeView GONE、槽 VISIBLE，呈现体系（收尾门/
+         * 因子/闩/挂起）作用在 wrapper 上、对两者一视同仁。
+         */
+        var cardSlot: FrameLayout? = null
+        var cardView: View? = null
+        /** 当前槽内卡片的 provider 组件；与戳记下发的选中值比对决定是否重建。 */
+        var cardComponent: ComponentName? = null
+        /** 卡片模式当前生效（槽内有卡且正显示）。 */
+        var cardActive = false
+        /** provider 原生尺寸（px 原值）与缩放后实际占高（px，跟随高度模式的内容下缘）。 */
+        var cardNativeW = 0
+        var cardNativeH = 0
+        var cardHeightPx = 0
+        /** 卡片布局日志计数（有界）。 */
+        var cardLayoutLogCount = 0
         var originalHeight: Int = 0
         var appliedStamp: StampStore.Stamp? = null
         var loadedThemeId: String? = null
@@ -2724,6 +2744,11 @@ object HeaderOverlay {
                 buildEnv(st)?.let { env -> st.renderer.measureContentBottom(env) }
             }
             st.appliedStamp = stamp
+            // 头部卡片同步（v2.0.32）：按戳记第 11/12 行在卡片
+            // 与主题时钟簇之间互斥切换；卡片不可用时回退时钟
+            // 簇。放在高度/偏移同步之前，让本轮 applyHeight
+            // 就能按卡片高度走。
+            syncCardMode(header, st, stamp)
             st.stampMtimeSeen = StampStore.stampMtime()
             // 垂直偏移同步（v2.0.7）：先于 applyHeight，跟随高度按
             // 含偏移的内容下缘算（量不到环境时留待布局回调补）
@@ -2869,6 +2894,145 @@ object HeaderOverlay {
         // 主 hook 没装上时退回 v2.0.11 的比例换算兜底）。
         ensurePreDrawListener(header, st)
         mountOverlay(header, st)
+    }
+
+    // ---------- 头部卡片（v2.0.32） ----------
+    //
+    // 卡片槽是 wrapper 的第二个子视图，与 ThemeView 互斥：
+    // 卡片模式下槽 VISIBLE、ThemeView GONE；关掉卡片模式、
+    // 或卡片不可用（绑定被拒/provider 不存在）时回退主题
+    // 时钟簇。呈现体系（收尾门/连续因子/目的页闩/挂起）全
+    // 部作用在 wrapper 上，槽内卡片自动适用，不另起跟随。
+    //
+    // 触摸口径（小乐点名，勿改）：RemoteViews 的点击是
+    // provider 自带的 PendingIntent，宿主透传即可——槽与
+    // wrapper 都是普通 FrameLayout，不设 clickable、不加
+    // 任何触摸拦截/监听（本文件全路径零拦截，已核查），点
+    // 击原样落到 HostView 上直进对应应用；面板自身的拖拽
+    // 拦截在头部父容器层，本模块不碰、语义保持原样，从
+    // 卡片上起手上下拉与从别处起手一致。
+
+    private fun ensureCardSlot(st: State): FrameLayout? {
+        st.cardSlot?.let { return it }
+        val wrapper = st.wrapper ?: return null
+        val slot = FrameLayout(st.header.context)
+        slot.layoutParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, 0,
+        )
+        slot.visibility = View.GONE
+        wrapper.addView(slot)
+        slot.addOnLayoutChangeListener {
+                _, left, _, right, _, oldLeft, _, oldRight, _ ->
+            if (right - left != oldRight - oldLeft) layoutCard(st)
+        }
+        st.cardSlot = slot
+        return slot
+    }
+
+    private fun syncCardMode(header: ViewGroup, st: State, stamp: StampStore.Stamp) {
+        val tv = st.themeView ?: return
+        if (!stamp.cardMode) {
+            if (st.cardActive) {
+                logFn("[cardhost] card mode off, theme cluster restored")
+            }
+            st.cardSlot?.visibility = View.GONE
+            if (tv.visibility != View.VISIBLE) tv.visibility = View.VISIBLE
+            st.cardActive = false
+            CardHost.stopListening { m -> logFn(m) }
+            return
+        }
+        val component = ComponentName.unflattenFromString(stamp.cardProvider)
+            ?: ComponentName.unflattenFromString(StampStore.DEFAULT_CARD_PROVIDER)
+        if (component == null) {
+            logFn("[cardhost] bad provider string: ${stamp.cardProvider}")
+            st.cardSlot?.visibility = View.GONE
+            if (tv.visibility != View.VISIBLE) tv.visibility = View.VISIBLE
+            st.cardActive = false
+            return
+        }
+        if (st.cardComponent != component || st.cardView == null) {
+            val result = CardHost.obtainView(header.context, component) { m -> logFn(m) }
+            if (result == null) {
+                // 绑不上就回退主题时钟簇，不硬闯、不留空白
+                logFn("[cardhost] fallback to theme cluster: $component unavailable")
+                st.cardSlot?.visibility = View.GONE
+                if (tv.visibility != View.VISIBLE) tv.visibility = View.VISIBLE
+                st.cardActive = false
+                return
+            }
+            val slot = ensureCardSlot(st)
+            if (slot == null) {
+                logFn("[cardhost] fallback to theme cluster: wrapper missing")
+                if (tv.visibility != View.VISIBLE) tv.visibility = View.VISIBLE
+                st.cardActive = false
+                return
+            }
+            // 切换卡片：旧视图摘下（其 appWidgetId 与 provider
+            // 侧配置保留在 CardHost 的持久映射里），新视图走
+            // 完整 allocate/bind/createView 链后挂进槽。
+            slot.removeAllViews()
+            val view = result.view
+            (view.parent as? ViewGroup)?.removeView(view)
+            view.layoutParams = FrameLayout.LayoutParams(
+                result.nativeWidthPx, result.nativeHeightPx,
+                Gravity.CENTER_HORIZONTAL or Gravity.TOP,
+            )
+            // 等比缩小以视图中心为横轴、顶边为纵轴（见 layoutCard）
+            view.pivotX = result.nativeWidthPx / 2f
+            view.pivotY = 0f
+            slot.addView(view)
+            st.cardView = view
+            st.cardComponent = component
+            st.cardNativeW = result.nativeWidthPx
+            st.cardNativeH = result.nativeHeightPx
+            st.cardHeightPx = 0
+            logFn(
+                "[cardhost] card active: $component " +
+                    "native=${result.nativeWidthPx}x${result.nativeHeightPx}"
+            )
+        }
+        st.cardSlot?.visibility = View.VISIBLE
+        if (tv.visibility != View.GONE) tv.visibility = View.GONE
+        st.cardActive = true
+        layoutCard(st)
+    }
+
+    /**
+     * 卡片缩放布局：原生尺寸水平居中（布局参数已定）；比槽
+     * 可用宽度宽时只许等比缩小到贴合（scale ≤ 1、永不放
+     * 大），槽高与避让高度随缩放后高度走既有 applyHeight。
+     * 每次布局把原生尺寸与实际尺寸记进日志（有界）。
+     */
+    private fun layoutCard(st: State) {
+        val slot = st.cardSlot ?: return
+        val view = st.cardView ?: return
+        if (st.cardNativeW <= 0 || st.cardNativeH <= 0) return
+        val availW = slot.width.takeIf { it > 0 } ?: st.wrapper?.width ?: 0
+        if (availW <= 0) return
+        val scale = min(1f, availW.toFloat() / st.cardNativeW)
+        if (view.scaleX != scale) view.scaleX = scale
+        if (view.scaleY != scale) view.scaleY = scale
+        val h = (st.cardNativeH * scale).roundToInt().coerceAtLeast(1)
+        if (st.cardHeightPx != h) {
+            st.cardHeightPx = h
+            val lp = slot.layoutParams
+            if (lp != null && lp.height != h) {
+                lp.height = h
+                slot.layoutParams = lp
+            }
+            val stamp = st.appliedStamp
+            if (stamp != null && stamp.heightMode == StampStore.HEIGHT_FOLLOW) {
+                applyHeight(st.header, st, stamp)
+            }
+        }
+        if (st.cardLayoutLogCount < 12) {
+            st.cardLayoutLogCount++
+            logFn(
+                "[cardhost] layout: native=${st.cardNativeW}x${st.cardNativeH} " +
+                    "availW=$availW scale=$scale " +
+                    "actual=${(st.cardNativeW * scale).roundToInt()}x$h"
+            )
+        }
     }
 
     /** 预抽监听本体（职责见 ensureWrapper 里的登记点注释）。 */
@@ -3171,7 +3335,14 @@ object HeaderOverlay {
             StampStore.HEIGHT_HALF -> screenH / 2
             else -> {
                 val minH = if (st.originalHeight > 0) st.originalHeight else 280
-                val content = st.renderer.contentBottomPx.roundToInt()
+                // 卡片模式（v2.0.32）：内容下缘取卡片缩放后占高，
+                // 避让/栈顶增量随之走既有机制；其余时候取渲染器
+                // 量到的主题簇下缘。
+                val content = if (st.cardActive && st.cardHeightPx > 0) {
+                    st.cardHeightPx
+                } else {
+                    st.renderer.contentBottomPx.roundToInt()
+                }
                 content.coerceIn(minH, (screenH * 2 / 3).coerceAtLeast(minH))
             }
         }
@@ -3851,7 +4022,10 @@ object HeaderOverlay {
                     // 还没有成品时渲一帧备着（下拉第一帧就是成
                     // 品），已有成品就不空转（v2.0.5 瘦身口径）。
                     val tvTick = st.themeView
-                    if (wrapper.isShown) {
+                    if (st.cardActive) {
+                        // 卡片模式（v2.0.32）：主题簇不逐秒重渲
+                        // （省主线程）；切回时钟簇时过期判定会补渲
+                    } else if (wrapper.isShown) {
                         tvTick?.refreshContent()
                         tvTick?.invalidate()
                     } else if (tvTick != null && tvTick.contentStale() &&

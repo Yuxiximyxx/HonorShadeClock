@@ -1,6 +1,7 @@
 package io.github.yuxiximyxx.shadeclock
 
 import android.app.Activity
+import android.appwidget.AppWidgetManager
 import android.content.Context
 import android.content.SharedPreferences
 import android.os.Bundle
@@ -125,6 +126,7 @@ private const val PAGE_HOME = "home"
 private const val PAGE_THEMES = "themes"
 private const val PAGE_POSITION = "position"
 private const val PAGE_DISPLAY = "display"
+private const val PAGE_CARD = "card"
 private const val PAGE_FONTSIZE = "fontsize"
 private const val PAGE_ABOUT = "about"
 
@@ -200,6 +202,25 @@ private fun SettingsScreen() {
     }
     var hideCarrier by remember {
         mutableStateOf(prefs.getBoolean(ThemeStore.KEY_HIDE_CARRIER, true))
+    }
+    // 头部卡片（v2.0.32）：全局一份——模式开关默认开、默认
+    // 选中天气小卡；选卡列表在「头部卡片」二级页按应用分组
+    // 折叠展示，进页后在 IO 线程枚举一次全机 provider。
+    var cardMode by remember {
+        mutableStateOf(prefs.getBoolean(ThemeStore.KEY_CARD_MODE, true))
+    }
+    var cardProvider by remember {
+        mutableStateOf(
+            prefs.getString(ThemeStore.KEY_CARD_PROVIDER, StampStore.DEFAULT_CARD_PROVIDER)
+                ?: StampStore.DEFAULT_CARD_PROVIDER
+        )
+    }
+    var cardGroups by remember { mutableStateOf<List<CardAppGroup>>(emptyList()) }
+    var expandedCardPkg by remember {
+        mutableStateOf<String?>(
+            (prefs.getString(ThemeStore.KEY_CARD_PROVIDER, StampStore.DEFAULT_CARD_PROVIDER)
+                ?: StampStore.DEFAULT_CARD_PROVIDER).substringBefore('/'),
+        )
     }
     var restartStatus by remember { mutableStateOf("") }
     var themes by remember { mutableStateOf(ThemeStore.loadThemes(prefs)) }
@@ -286,6 +307,14 @@ private fun SettingsScreen() {
         syncStamp()
     }
 
+    // 头部卡片选卡列表（v2.0.32）：全机 provider 有数百个，
+    // 枚举+读 label 放 IO 线程，进设置页时备好一次即可。
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        if (cardGroups.isEmpty()) {
+            cardGroups = withContext(Dispatchers.IO) { loadCardGroups(context) }
+        }
+    }
+
     fun saveTopStyle(theme: Boolean) {
         topStyleTheme = theme
         prefs.edit()
@@ -318,6 +347,19 @@ private fun SettingsScreen() {
     fun saveHideCarrier(value: Boolean) {
         hideCarrier = value
         prefs.edit().putBoolean(ThemeStore.KEY_HIDE_CARRIER, value).apply()
+        syncStamp()
+    }
+
+    fun saveCardMode(value: Boolean) {
+        cardMode = value
+        prefs.edit().putBoolean(ThemeStore.KEY_CARD_MODE, value).apply()
+        syncStamp()
+    }
+
+    fun saveCardProvider(value: String) {
+        if (value == cardProvider) return
+        cardProvider = value
+        prefs.edit().putString(ThemeStore.KEY_CARD_PROVIDER, value).apply()
         syncStamp()
     }
 
@@ -441,6 +483,7 @@ private fun SettingsScreen() {
         PAGE_THEMES -> "主题管理"
         PAGE_POSITION -> "位置"
         PAGE_DISPLAY -> "显示与开关"
+        PAGE_CARD -> "头部卡片"
         PAGE_FONTSIZE -> "原系统头部"
         PAGE_ABOUT -> "说明"
         else -> "通知中心主题"
@@ -636,6 +679,122 @@ private fun SettingsScreen() {
                         }
                     }
 
+                    PAGE_CARD -> {
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            cornerRadius = 20.dp,
+                            insideMargin = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
+                        ) {
+                            Column {
+                                SuperSwitch(
+                                    title = "头部使用卡片",
+                                    summary = "开：通知中心头部显示下面选中的应用卡片；关：显示锁屏主题时钟（默认开）",
+                                    checked = cardMode,
+                                    onCheckedChange = { saveCardMode(it) },
+                                )
+                                Text(
+                                    "放进通知中心的是新建的卡片实例、不是桌面那张的克隆：天气、日历这类绑上就出内容；文字、联系人这类带配置的卡本版只绑不配、显示默认内容。改完开关或选完卡，下拉一次通知中心即生效（不行就用「重启系统界面」）。高度特别大的卡会把通知挤下去很多，选卡时留意尺寸。",
+                                    fontSize = 13.sp,
+                                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                    modifier = Modifier.padding(vertical = 8.dp),
+                                )
+                            }
+                        }
+                        SmallTitle(
+                            text = "选择卡片",
+                            insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
+                        )
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            cornerRadius = 20.dp,
+                            insideMargin = PaddingValues(vertical = 4.dp),
+                        ) {
+                            Column {
+                                if (cardGroups.isEmpty()) {
+                                    Text(
+                                        "正在读取本机卡片…",
+                                        fontSize = 13.sp,
+                                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                                    )
+                                }
+                                for (group in cardGroups) {
+                                    val expanded = expandedCardPkg == group.packageName
+                                    val groupHasSelected =
+                                        group.entries.any { it.component == cardProvider }
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable {
+                                                expandedCardPkg =
+                                                    if (expanded) null else group.packageName
+                                            }
+                                            .padding(horizontal = 16.dp, vertical = 10.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                group.appLabel,
+                                                fontSize = 15.sp,
+                                                color = MiuixTheme.colorScheme.onSurface,
+                                            )
+                                            Text(
+                                                "${group.entries.size} 张卡片",
+                                                fontSize = 12.sp,
+                                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                            )
+                                        }
+                                        if (groupHasSelected) {
+                                            Text(
+                                                "已选其一",
+                                                fontSize = 12.sp,
+                                                color = MiuixTheme.colorScheme.primary,
+                                            )
+                                        }
+                                    }
+                                    if (expanded) {
+                                        for (entry in group.entries) {
+                                            val selected = entry.component == cardProvider
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .clickable {
+                                                        saveCardProvider(entry.component)
+                                                    }
+                                                    .padding(
+                                                        start = 32.dp, end = 16.dp,
+                                                        top = 8.dp, bottom = 8.dp,
+                                                    ),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                            ) {
+                                                Column(modifier = Modifier.weight(1f)) {
+                                                    Text(
+                                                        entry.label.ifEmpty { entry.component },
+                                                        fontSize = 14.sp,
+                                                        color = MiuixTheme.colorScheme.onSurface,
+                                                    )
+                                                    Text(
+                                                        entry.sizeText,
+                                                        fontSize = 12.sp,
+                                                        color = MiuixTheme.colorScheme
+                                                            .onSurfaceVariantSummary,
+                                                    )
+                                                }
+                                                if (selected) {
+                                                    Text(
+                                                        "当前使用",
+                                                        fontSize = 12.sp,
+                                                        color = MiuixTheme.colorScheme.primary,
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     PAGE_FONTSIZE -> {
                         Card(
                             modifier = Modifier.fillMaxWidth(),
@@ -755,6 +914,15 @@ private fun SettingsScreen() {
                                     title = "显示与开关",
                                     summary = "顶部样式、背景图、小模块、运营商、区域高度",
                                     onClick = { page = PAGE_DISPLAY },
+                                )
+                                SuperArrow(
+                                    title = "头部卡片",
+                                    summary = if (cardMode) {
+                                        "已开启：头部显示应用卡片（点此选卡）"
+                                    } else {
+                                        "已关闭：头部显示主题时钟（点此开启/选卡）"
+                                    },
+                                    onClick = { page = PAGE_CARD },
                                 )
                                 SuperArrow(
                                     title = "原系统头部",
@@ -882,4 +1050,84 @@ private fun SizeSliderRow(
             modifier = Modifier.fillMaxWidth(),
         )
     }
+}
+
+// ---- 头部卡片选卡（v2.0.32）----
+
+/** 一个 provider 条目：组件 flatten 串、卡片名、尺寸文案。 */
+private data class CardProviderEntry(
+    val component: String,
+    val label: String,
+    val sizeText: String,
+)
+
+/** 按来源应用分组的卡片列表。 */
+private data class CardAppGroup(
+    val packageName: String,
+    val appLabel: String,
+    val entries: List<CardProviderEntry>,
+)
+
+/**
+ * 探针实测有服务卡片的来源应用（天气/日历/时钟/联系人/
+ * 图库/钱包/智慧空间/健康使用平板 + 文字/语录卡片的来源
+ * 启动器），选卡列表里排在前面；其余应用按名称排后面。
+ */
+private val CARD_KNOWN_PACKAGES = listOf(
+    "com.hihonor.android.totemweather",
+    "com.hihonor.calendar",
+    "com.hihonor.deskclock",
+    "com.hihonor.contacts",
+    "com.hihonor.photos",
+    "com.hihonor.wallet",
+    "com.hihonor.magichome",
+    "com.hihonor.parentcontrol",
+    "com.hihonor.android.launcher",
+)
+
+/**
+ * 枚举全机标准 AppWidget provider 并按应用分组（设置应用
+ * 进程内跑、无需任何权限）。尺寸文案：provider 给了格子
+ * 数就显示格子，否则把 minW×minH（px 原值）换算成 dp。
+ * 全机数百个，只在 IO 线程调用一次。
+ */
+private fun loadCardGroups(context: Context): List<CardAppGroup> {
+    val pm = context.packageManager
+    val awm = AppWidgetManager.getInstance(context) ?: return emptyList()
+    val density = context.resources.displayMetrics.density
+    val byPkg = LinkedHashMap<String, MutableList<CardProviderEntry>>()
+    val appLabels = HashMap<String, String>()
+    for (info in awm.installedProviders) {
+        val pkg = info.provider.packageName
+        if (!appLabels.containsKey(pkg)) {
+            appLabels[pkg] = try {
+                pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
+            } catch (t: Throwable) {
+                pkg
+            }
+        }
+        val label = try {
+            info.loadLabel(pm) ?: ""
+        } catch (t: Throwable) {
+            ""
+        }
+        val sizeText = if (info.targetCellWidth > 0 && info.targetCellHeight > 0) {
+            "${info.targetCellWidth}×${info.targetCellHeight} 格"
+        } else {
+            "${(info.minWidth / density).roundToInt()}×" +
+                "${(info.minHeight / density).roundToInt()} dp"
+        }
+        byPkg.getOrPut(pkg) { mutableListOf() }.add(
+            CardProviderEntry(info.provider.flattenToString(), label, sizeText),
+        )
+    }
+    val groups = byPkg.map { (pkg, entries) ->
+        CardAppGroup(pkg, appLabels[pkg] ?: pkg, entries)
+    }
+    return groups.sortedWith(
+        compareBy<CardAppGroup> {
+            val idx = CARD_KNOWN_PACKAGES.indexOf(it.packageName)
+            if (idx >= 0) idx else CARD_KNOWN_PACKAGES.size
+        }.thenBy { it.appLabel },
+    )
 }

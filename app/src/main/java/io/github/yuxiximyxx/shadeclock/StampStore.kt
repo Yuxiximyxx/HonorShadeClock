@@ -15,7 +15,7 @@ import java.util.zip.ZipFile
  * （manifest.xml + 资产 + fonts/）在设置页迁移打包前仍可经
  * [themeEntry] 兜底读取。目录根放 .nomedia 兜底防图库扫描。
  *
- * stamp.txt 格式（10 行）：themeId / stamp / heightMode / topStyle /
+ * stamp.txt 格式（12 行）：themeId / stamp / heightMode / topStyle /
  * showBackground（1=画主题整幅背景图、0=不画，v2.0.3 加；旧 4 行
  * 文件缺此行时按 0 处理，与设置页开关默认关一致）/
  * showWidgets（1=画温度/风向/电量数据小模块、0=不画，v2.0.5 加；
@@ -32,8 +32,15 @@ import java.util.zip.ZipFile
  * srcid="#day_of_week" 一句、不声明编号口径，渲染器无法
  * 自动分辨，只能按主题存一份；旧 9 行文件缺此行时按 0
  * 处理，即引擎原口径周日=1，AAA 这类周日=1 编号的主题
- * 默认即对）。前 9 行与旧版逐行同义，新行只追加在末尾
- * ——新旧两版交叉读写不串位。
+ * 默认即对）/
+ * cardMode（1=头部显示应用卡片、0=显示主题时钟簇，
+ * v2.0.32 加；全局试验开关、设置页默认开，旧 10 行文件
+ * 缺此行时按 1 处理，与默认一致；只有明确写 0 才是时钟
+ * 簇）/
+ * cardProvider（头部卡片的 provider 组件，flatten 串
+ * 「包名/类名」，v2.0.32 加；全局一份、设置页自选，
+ * 缺行/空串时按默认的天气小卡处理）。前 10 行与旧版
+ * 逐行同义，新行只追加在末尾——新旧两版交叉读写不串位。
  * SystemUI 侧每次覆盖层挂载与每秒 tick 比对文件 mtime 与内容，
  * 变了就重解析主题、重载位图——切换主题免强停系统界面。
  *
@@ -49,6 +56,17 @@ object StampStore {
 
     const val TOP_STYLE_ORIGINAL = "original"
     const val TOP_STYLE_THEME = "theme"
+
+    /**
+     * 头部卡片默认 provider（v2.0.32）：天气小卡——探针日志
+     * 实测 com.hihonor.android.totemweather 的
+     * card.small.SmallCardWeatherProvider（min 532×560 px，
+     * 无 configure 要求时绑上即出内容）。设置页没选过卡、
+     * 或戳记第 12 行缺失/损坏时按它处理。
+     */
+    const val DEFAULT_CARD_PROVIDER =
+        "com.hihonor.android.totemweather/" +
+            "com.hihonor.android.totemweather.card.small.SmallCardWeatherProvider"
 
     const val HEIGHT_FOLLOW = 0
     const val HEIGHT_THIRD = 1
@@ -100,6 +118,10 @@ object StampStore {
         val offsetXDp: Int = 0,
         /** 选中主题的星期编号是否按周一起算；默认 false=周日起算（引擎原口径，v2.0.23）。 */
         val weekdayMondayStart: Boolean = false,
+        /** 头部显示应用卡片（与主题时钟簇互斥）；默认 true（设置页开关默认开，v2.0.32）。 */
+        val cardMode: Boolean = true,
+        /** 头部卡片的 provider 组件 flatten 串；默认天气小卡（v2.0.32）。 */
+        val cardProvider: String = DEFAULT_CARD_PROVIDER,
     )
 
     fun themeDir(id: String): File = File(THEMES_DIR, id)
@@ -143,13 +165,17 @@ object StampStore {
         hideCarrier: Boolean,
         offsetXDp: Int = 0,
         weekdayMondayStart: Boolean = false,
+        cardMode: Boolean = true,
+        cardProvider: String = DEFAULT_CARD_PROVIDER,
     ): String =
         "$themeId\n$stamp\n$heightMode\n$topStyle\n" +
             "${if (showBackground) 1 else 0}\n${if (showWidgets) 1 else 0}\n" +
             "${offsetDp.coerceIn(OFFSET_DP_MIN, OFFSET_DP_MAX)}\n" +
             "${if (hideCarrier) 1 else 0}\n" +
             "${offsetXDp.coerceIn(OFFSET_X_DP_MIN, OFFSET_X_DP_MAX)}\n" +
-            "${if (weekdayMondayStart) 1 else 0}\n"
+            "${if (weekdayMondayStart) 1 else 0}\n" +
+            "${if (cardMode) 1 else 0}\n" +
+            "${cardProvider.ifEmpty { DEFAULT_CARD_PROVIDER }}\n"
 
     // ---- 戳记多候选取胜（v2.0.19）----
     // 设置 App 经 MediaStore 写 stamp.txt：应用被卸载重装后，
@@ -196,6 +222,12 @@ object StampStore {
             // 第 10 行缺失（v2.0.22 及更旧 stamp）按周日起算处理，
             // 与引擎原口径一致；只有明确写 1 才是周一起算
             weekdayMondayStart = lines.getOrNull(9) == "1",
+            // 第 11 行缺失（v2.0.31 及更旧 stamp）按开处理，与
+            // 设置页开关默认开一致；只有明确写 0 才是时钟簇
+            cardMode = lines.getOrNull(10) != "0",
+            // 第 12 行缺失/为空（同上）按默认天气小卡处理
+            cardProvider = lines.getOrNull(11)
+                ?.takeIf { it.isNotEmpty() } ?: DEFAULT_CARD_PROVIDER,
         )
     }
 

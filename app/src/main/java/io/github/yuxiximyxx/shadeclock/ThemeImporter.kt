@@ -236,6 +236,10 @@ object ThemeStore {
     const val KEY_OFFSETS_X_JSON = "offsets_x_by_theme_json"
     const val KEY_WEEKDAY_JSON = "weekday_by_theme_json"
     const val KEY_HIDE_CARRIER = "hide_carrier"
+    // 头部卡片（v2.0.32）：模式开关与选中 provider 都是全局
+    // 一份（试验功能，不按主题记）；写戳记时下发到第 11/12 行。
+    const val KEY_CARD_MODE = "card_mode"
+    const val KEY_CARD_PROVIDER = "card_provider"
 
     // ---- 垂直偏移按主题记（v2.0.21）----
     // v2.0.20 及以前偏移是全局一个值（KEY_OFFSET_DP），但各
@@ -455,10 +459,14 @@ object ThemeStore {
         // 星期编号模式同样按主题下发（v2.0.23，戳记第 10 行）
         val weekdayMondayStart = weekdayMondayStartForTheme(prefs, selected)
         val hideCarrier = prefs.getBoolean(KEY_HIDE_CARRIER, true)
+        // 头部卡片（v2.0.32）：全局一份，下发到戳记第 11/12 行
+        val cardMode = prefs.getBoolean(KEY_CARD_MODE, true)
+        val cardProvider = prefs.getString(KEY_CARD_PROVIDER, StampStore.DEFAULT_CARD_PROVIDER)
+            ?: StampStore.DEFAULT_CARD_PROVIDER
         val content = StampStore.formatStamp(
             selected, System.currentTimeMillis(), heightMode, topStyle,
             showBackground, showWidgets, offsetDp, hideCarrier, offsetXDp,
-            weekdayMondayStart,
+            weekdayMondayStart, cardMode, cardProvider,
         )
         val bytes = content.toByteArray(Charsets.UTF_8)
         deleteOwnCandidates(context, STAMP_FILE_NAME)
