@@ -71,7 +71,7 @@ jobs:
           tag_name: v2.0.31
           name: HonorShadeClock 2.0.31 — 真卡片探针版（只加日志、零行为改变）
           body: |
-## HonorShadeClock 2.0.31
+            ## HonorShadeClock 2.0.31
 
             探针版：只加日志、零行为改变。呈现体系
             （落定才出现/目的页闩/开门序列/避让）
