@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.35-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.36-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.35-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.36-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,30 +68,29 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.35
-          name: HonorShadeClock 2.0.35 — 取证第二弹（桌面宿主绑定地面真值）
+          tag_name: v2.0.36
+          name: HonorShadeClock 2.0.36 — 取证第三弹（hostbind 修复重跑）
           body: |
-            ## HonorShadeClock 2.0.35
+            ## HonorShadeClock 2.0.36
 
-            取证第二弹：托管行为与 2.0.34 完全
-            一致，只在探针里再加一路「宿主绑定
-            地面真值」dump。2.0.34 的两路取证
-            （XML 声明 dump、内容下发日志）原样
-            保留、继续有效。
+            取证第三弹：托管行为与 2.0.35 完全
+            一致，只修三件取证仪器。上一版的
+            hostbind 文件在你那边根本没生成，
+            根因已定：探针反射取服务类时类名
+            写错了一个包、且死在打开文件之前。
+            本版文件先行——无论每步成败，
+            shadeclock_hostbind.txt 都必生成、
+            失败轨迹就写在文件里。
 
-            做法：你在桌面亲手添加想要的服务
-            卡片后，启动器宿主名下就有一批已
-            成立的绑定。本版探针经小部件服务
-            枚举各宿主名下的全部绑定，逐个把
-            provider 组件与完整的 options
-            （hostName、尺寸档位、私有键全量）
-            写到 /sdcard/Download/
-            shadeclock_hostbind.txt，与我们
-            自己宿主的绑定逐项对照——桌面宿主
-            的下发条件若与我们的不同，这里会
-            现形。服务侧若按调用方身份拦下，
-            被拦的方法与异常会如实记下、退回
-            XML 路线，不硬闯。
+            另两修：内容下发后的错误视图自检
+            上一版恒失效（反射找错了方法），
+            本版改好，下次日志能把「下发了但
+            拼不出来」和「正常出内容」分开；
+            卡片声明 dump 补记每个 receiver
+            与应用的全部 meta-data 键名——
+            服务卡片的身份标记已证不在
+            provider 的 XML 里，改到这一层
+            继续找。
 
             取证动作（顺序别反）：
             1. 先在桌面添加你想要的那几张
@@ -101,13 +100,10 @@ jobs:
             3. 下拉开几次通知中心、点开一两张
                头部卡片；
             4. 回传三个文件：
-               /sdcard/Download/shadeclock_cardxml.txt
                /sdcard/Download/shadeclock_hostbind.txt
+               /sdcard/Download/shadeclock_cardxml.txt
                /sdcard/Download/shadeclock_probe.log
 
-            下一版据三份证据定案：目录只列真
-            服务卡片、尺寸用规范档位、托管参数
-            按真宿主的下发条件补齐。
             关闭办法：在 LSPosed 里停用模块再重启一次
             系统界面，即恢复原样。
           files: dist/*.apk
