@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.30-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.31-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.30-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.31-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,41 +68,37 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.30
-          name: HonorShadeClock 2.0.30 — 去掉下拉行程中那次时钟出现：只在落定打开后显示
+          tag_name: v2.0.31
+          name: HonorShadeClock 2.0.31 — 真卡片探针版（只加日志、零行为改变）
           body: |
-            ## HonorShadeClock 2.0.30
+## HonorShadeClock 2.0.31
 
-            只改一件事：去掉下拉行程中浮在桌面上的
-            那次时钟出现。小乐慢速下拉录屏定位
-            （2.0.29）：极慢地拉时，面板背景还没铺
-            到、桌面图标还露着，时钟簇就已在最终位
-            置整簇浮现——去通知中心、去控制中心各
-            出现一次；落定后反而都正常。他点名要
-            去掉的就是行程中的这一次。
+            探针版：只加日志、零行为改变。呈现体系
+            （落定才出现/目的页闩/开门序列/避让）
+            与 2.0.30 完全一致，本版唯一目的是取证
+            「荣耀桌面应用服务卡片能不能搬进通知
+            中心头部」。
 
-            定案（2.0.29 日志逐轮对位）：每一轮下
-            拉，收尾门都在展开比例约 0.31–0.47 处
-            打开（慢拉时最低见过 0.305），而面板因
-            子旧饱和点是 0.18——开门那一刻因子与通
-            道 alpha 都是 1.0，整簇在行程中段就全
-            强度在场，慢拉时长时间停在那里。目的
-            页闩治的是落定后露面，治不了行程中。
+            探针内容（触发两次、进程内只跑一次，
+            全部写 shadeclock_probe.log，前缀
+            [ShadeClock][cardprobe]）：
+            1. 枚举全机标准 AppWidget provider
+               （包/类/label/尺寸/格子数），按
+               日历/天气/时钟/联系人/图库/钱包/
+               健康/文字/语录等关键词标注；
+            2. SystemUI 进程 BIND_APPWIDGET
+               权限自检；
+            3. 在 SystemUI 上下文试建
+               AppWidgetHost 并分配一个 widget
+               id（只分配、不绑任何真卡片、不弹
+               界面，分配后即删除）；
+            4. 荣耀 form 宿主入口：静态分析未找
+               到实锤，记「无已知入口」并跳过。
 
-            修法（小乐拍板的口径，取代 v2.0.15 以
-            来的「下拉第一帧就在场」；中途试过的
-            「随比例渐入」也被慢拉录屏证伪、未采
-            用）：下拉行程中（跟手/动画未落定）时
-            钟簇完全不出现；只有面板落定打开（比
-            例到顶且不在跟手/瞬时展开/关闭行程
-            中）才出现，带一个 80ms 的短淡入。去
-            控制中心方向行程中同样不出现、落定后
-            由目的页闩继续摁住，全程零出现。收起
-            行程（已真机过关）、横滑跟随、三道门
-            控、通知避让均未动。
-
-            生效方式：覆盖安装 → 打开一次设置页 →
-            用「重启系统界面」按钮重载 → 下拉确认。
+            取证动作：覆盖安装 → 打开一次设置页
+            → 用「重启系统界面」按钮重载 → 下拉
+            开几次通知中心 → 回传
+            /sdcard/Download/shadeclock_probe.log。
             关闭办法：在 LSPosed 里停用模块再重启一次
             系统界面，即恢复原样。
           files: dist/*.apk

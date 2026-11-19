@@ -1269,6 +1269,8 @@ object HeaderOverlay {
         if (!closed) {
             // 重新出现的第一帧就要是成品：先离屏渲好（过期才真渲）
             st.themeView?.refreshContent()
+            // 真卡片探针（v2.0.31）：首次开门再触发一次（内部防重复）
+            CardProbe.runAtFirstGateOpen(st.header.context) { message -> logFn(message) }
         }
     }
 

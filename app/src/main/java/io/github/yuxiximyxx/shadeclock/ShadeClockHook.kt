@@ -158,6 +158,8 @@ class ShadeClockHook : IXposedHookLoadPackage, IXposedHookInitPackageResources {
         HeaderOverlay.install(lpparam) { message -> diag(message) }
         // 隐藏运营商文字（v2.0.8）：与覆盖层相互独立，原头部模式下同样生效
         CarrierHider.install(lpparam) { message -> diag(message) }
+        // 真卡片探针（v2.0.31）：只加日志、零行为改变，进程内只跑一次
+        CardProbe.runAtInit { message -> diag(message) }
         // 设置页「重启系统界面」按钮的看守（v2.0.12）：进程级轮询
         // restart.txt，与覆盖层是否挂载无关（原头部模式下字号改动
         // 正是最需要重启的场景）。
