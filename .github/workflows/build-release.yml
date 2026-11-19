@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.31-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.32-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.31-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.32-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,36 +68,48 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.31
-          name: HonorShadeClock 2.0.31 — 真卡片探针版（只加日志、零行为改变）
+          tag_name: v2.0.32
+          name: HonorShadeClock 2.0.32 — 头部卡片施工验证版（自选卡片）
           body: |
-            ## HonorShadeClock 2.0.31
+            ## HonorShadeClock 2.0.32
 
-            探针版：只加日志、零行为改变。呈现体系
+            施工验证版：把应用服务卡片真绑进通知
+            中心头部（与主题时钟簇互斥），呈现体系
             （落定才出现/目的页闩/开门序列/避让）
-            与 2.0.30 完全一致，本版唯一目的是取证
-            「荣耀桌面应用服务卡片能不能搬进通知
-            中心头部」。
+            与 2.0.30/2.0.31 完全一致、自动适用。
 
-            探针内容（触发两次、进程内只跑一次，
-            全部写 shadeclock_probe.log，前缀
-            [ShadeClock][cardprobe]）：
-            1. 枚举全机标准 AppWidget provider
-               （包/类/label/尺寸/格子数），按
-               日历/天气/时钟/联系人/图库/钱包/
-               健康/文字/语录等关键词标注；
-            2. SystemUI 进程 BIND_APPWIDGET
-               权限自检；
-            3. 在 SystemUI 上下文试建
-               AppWidgetHost 并分配一个 widget
-               id（只分配、不绑任何真卡片、不弹
-               界面，分配后即删除）；
-            4. 荣耀 form 宿主入口：静态分析未找
-               到实锤，记「无已知入口」并跳过。
+            本版内容：
+            1. SystemUI 侧自建标准 AppWidgetHost
+               （新类 CardHost），按选中 provider
+               走 allocate → bindAppWidgetIdIfAllowed
+               → createView 全链；appWidgetId 按
+               provider 分别持久化，来回切换复用
+               各自实例与配置；
+            2. 默认开启卡片模式、默认选中天气
+               小卡（SmallCardWeatherProvider，
+               532×560）；设置页新增二级页「头部
+               卡片」：模式开关 + 按应用分组的
+               选卡列表（全机 provider 自选）；
+            3. 卡片按原生尺寸水平居中，比头部宽
+               的只等比缩小到贴合、不放大，高度
+               随缩放后尺寸走既有避让机制；
+            4. 点击透传：覆盖层零触摸拦截，点卡
+               片应直进对应应用；面板拖拽语义
+               未动；
+            5. 带 configure 的卡本版只绑不配
+               （出默认内容）；绑定失败自动回退
+               主题时钟簇并记 [cardhost] 日志。
 
-            取证动作：覆盖安装 → 打开一次设置页
+            注意：高度特别大的卡（如 1000px+）
+            会把通知挤下去很多，选卡时留意尺寸。
+
+            验证动作：覆盖安装 → 打开一次设置页
             → 用「重启系统界面」按钮重载 → 下拉
-            开几次通知中心 → 回传
+            通知中心看天气卡是否出真数据、点卡
+            片是否进天气应用、从卡片上起手上下
+            拉是否正常、控制中心/锁屏无卡；再到
+            「头部卡片」页关开关应恢复主题时钟、
+            换选其他卡应能切换。出问题回传
             /sdcard/Download/shadeclock_probe.log。
             关闭办法：在 LSPosed 里停用模块再重启一次
             系统界面，即恢复原样。
