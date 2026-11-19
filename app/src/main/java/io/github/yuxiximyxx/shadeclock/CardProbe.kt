@@ -2,6 +2,7 @@ package io.github.yuxiximyxx.shadeclock
 
 import android.appwidget.AppWidgetHost
 import android.appwidget.AppWidgetManager
+import android.appwidget.AppWidgetProviderInfo
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Process
@@ -158,7 +159,10 @@ object CardProbe {
     private fun probeXmlDumpAsync(ctx: Context, log: (String) -> Unit) {
         try {
             val appCtx = ctx.applicationContext ?: ctx
-            val t = Thread { dumpProviderXml(appCtx, log) }
+            val t = Thread {
+                dumpProviderXml(appCtx, log)
+                dumpHostBindings(appCtx, log)
+            }
             t.name = "shadeclock-cardxml"
             t.isDaemon = true
             t.start()
@@ -251,6 +255,140 @@ object CardProbe {
             log("[cardprobe] xml-dump: done ok=$ok failed=$failed -> ${outFile.absolutePath}")
         } catch (t: Throwable) {
             log("[cardprobe] xml-dump: aborted: ${t.javaClass.name}: ${t.message}")
+        }
+    }
+
+    /**
+     * 宿主绑定地面真值 dump（v2.0.35，小乐拍板的取证捷径）：
+     * 他在桌面亲手添加想要的服务卡片后，启动器宿主名下就有一
+     * 批已成立的绑定——经 IAppWidgetService（反射）枚举各候选
+     * 宿主包名下的全部 appWidgetId，逐个把 provider 组件与
+     * getAppWidgetOptions 的完整 Bundle（hostName、尺寸档位、
+     * 私有键全量原样）写到 /sdcard/Download/
+     * shadeclock_hostbind.txt，与我们自己宿主的绑定逐项对照。
+     * 服务侧对 callingPackage 有 uid 校验，启动器那批大概率
+     * 被拦——逐法记成败、被拦就如实记异常退回 XML 路线，
+     * 不硬闯。SystemUI 自家名下（锁屏宿主 KgAppWidgetHost 与
+     * 本模块 CardHost 都在此）应可达：锁屏宿主是荣耀自家宿主、
+     * 它的 options 就是现成的对照样本。
+     */
+    private fun dumpHostBindings(ctx: Context, log: (String) -> Unit) {
+        val outFile = File("/sdcard/Download/shadeclock_hostbind.txt")
+        try {
+            val smClass = Class.forName("android.os.ServiceManager")
+            val binder = smClass.getMethod("getService", String::class.java)
+                .invoke(null, "appwidget")
+            if (binder == null) {
+                log("[cardprobe] hostbind: appwidget service binder is null")
+                return
+            }
+            val stubClass = Class.forName("android.appwidget.IAppWidgetService\$Stub")
+            val svc = stubClass.getMethod(
+                "asInterface",
+                Class.forName("android.os.IBinder"),
+            ).invoke(null, binder)
+            if (svc == null) {
+                log("[cardprobe] hostbind: IAppWidgetService.asInterface returned null")
+                return
+            }
+            log("[cardprobe] hostbind: IAppWidgetService proxy ok: ${svc.javaClass.name}")
+            outFile.bufferedWriter().use { w ->
+                w.write("# HonorShadeClock hostbind dump v2.0.35\n")
+                val candidates = listOf(
+                    "com.android.systemui",
+                    "com.hihonor.android.launcher",
+                    "com.android.launcher3",
+                    ctx.packageName,
+                )
+                for (pkg in candidates) {
+                    try {
+                        val m = svc.javaClass.getMethod(
+                            "getAppWidgetIds",
+                            String::class.java,
+                        )
+                        val ids = m.invoke(svc, pkg) as? IntArray
+                        w.write(
+                            "## getAppWidgetIds($pkg) -> ${ids?.size} ids: " +
+                                "${ids?.joinToString()}\n"
+                        )
+                        log("[cardprobe] hostbind: getAppWidgetIds($pkg) -> ${ids?.size} ids")
+                        if (ids != null) {
+                            for (id in ids) {
+                                dumpOneBinding(svc, w, pkg, id)
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        val cause = unwrap(t)
+                        w.write(
+                            "## getAppWidgetIds($pkg) FAILED: " +
+                                "${cause.javaClass.name}: ${cause.message}\n"
+                        )
+                        log(
+                            "[cardprobe] hostbind: getAppWidgetIds($pkg) failed: " +
+                                "${cause.javaClass.name}: ${cause.message}"
+                        )
+                    }
+                }
+            }
+            log("[cardprobe] hostbind: done -> ${outFile.absolutePath}")
+        } catch (t: Throwable) {
+            log("[cardprobe] hostbind: aborted: ${t.javaClass.name}: ${t.message}")
+        }
+    }
+
+    private fun dumpOneBinding(
+        svc: Any,
+        w: java.io.Writer,
+        callingPackage: String,
+        id: Int,
+    ) {
+        w.write("=== id=$id via callingPackage=$callingPackage\n")
+        try {
+            val m = svc.javaClass.getMethod(
+                "getAppWidgetInfo",
+                String::class.java,
+                Int::class.javaPrimitiveType,
+            )
+            val info = m.invoke(svc, callingPackage, id) as? AppWidgetProviderInfo
+            w.write(
+                "  provider=${info?.provider} minW=${info?.minWidth} " +
+                    "minH=${info?.minHeight} updatePeriod=${info?.updatePeriodMillis} " +
+                    "configure=${info?.configure}\n"
+            )
+        } catch (t: Throwable) {
+            val cause = unwrap(t)
+            w.write("  getAppWidgetInfo FAILED: ${cause.javaClass.name}: ${cause.message}\n")
+        }
+        try {
+            val m = svc.javaClass.getMethod(
+                "getAppWidgetOptions",
+                String::class.java,
+                Int::class.javaPrimitiveType,
+            )
+            val opts = m.invoke(svc, callingPackage, id) as? android.os.Bundle
+            if (opts == null) {
+                w.write("  options=null\n")
+            } else {
+                for (k in opts.keySet()) {
+                    val v = try {
+                        opts.get(k)
+                    } catch (t: Throwable) {
+                        null
+                    }
+                    w.write("  opt $k = $v (${v?.javaClass?.name})\n")
+                }
+            }
+        } catch (t: Throwable) {
+            val cause = unwrap(t)
+            w.write("  getAppWidgetOptions FAILED: ${cause.javaClass.name}: ${cause.message}\n")
+        }
+    }
+
+    private fun unwrap(t: Throwable): Throwable {
+        return if (t is java.lang.reflect.InvocationTargetException) {
+            t.targetException ?: t
+        } else {
+            t
         }
     }
 
