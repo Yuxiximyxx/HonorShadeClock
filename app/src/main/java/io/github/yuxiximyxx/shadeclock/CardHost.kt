@@ -308,7 +308,7 @@ private class LoggingHostView(
         try {
             logFn(
                 "[cardhost] updateAppWidget id=$appWidgetId " +
-                    "pkg=${views?.package} layout=${views?.layoutId}"
+                    "pkg=${views?.`package`} layout=${views?.layoutId}"
             )
         } catch (t: Throwable) {
             // 只记日志，异常不许影响下发本体
