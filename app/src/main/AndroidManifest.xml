@@ -1,6 +1,28 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- 选卡枚举可见性（v2.0.33）：设置进程枚举全机 AppWidget
+         provider 时，天气/日历/时钟/智慧空间四组曾整组缺失
+         （同一 API 在 SystemUI 进程探针里能看到全量 554 个，
+         差别只在调用方身份）——按包可见性口径声明查询范围：
+         十个服务卡片来源应用逐个列名，另加 APPWIDGET_UPDATE
+         意图兜底其余带小部件的应用。 -->
+    <queries>
+        <intent>
+            <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+        </intent>
+        <package android:name="com.hihonor.android.totemweather" />
+        <package android:name="com.hihonor.calendar" />
+        <package android:name="com.hihonor.deskclock" />
+        <package android:name="com.hihonor.contacts" />
+        <package android:name="com.hihonor.photos" />
+        <package android:name="com.hihonor.wallet" />
+        <package android:name="com.hihonor.magichome" />
+        <package android:name="com.hihonor.parentcontrol" />
+        <package android:name="com.hihonor.android.launcher" />
+        <package android:name="com.hihonor.notepad" />
+    </queries>
+
     <application
         android:label="@string/app_name"
         android:description="@string/app_subtitle"

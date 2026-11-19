@@ -2,14 +2,19 @@ package io.github.yuxiximyxx.shadeclock
 
 import android.app.Activity
 import android.appwidget.AppWidgetManager
+import android.appwidget.AppWidgetProviderInfo
 import android.content.Context
 import android.content.SharedPreferences
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.drawable.Drawable
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Column
@@ -19,7 +24,9 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
@@ -31,7 +38,10 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
@@ -53,6 +63,7 @@ import top.yukonga.miuix.kmp.basic.Slider
 import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.basic.SmallTopAppBar
 import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.extra.SuperArrow
 import top.yukonga.miuix.kmp.extra.SuperSwitch
 import top.yukonga.miuix.kmp.icon.MiuixIcons
@@ -216,6 +227,9 @@ private fun SettingsScreen() {
         )
     }
     var cardGroups by remember { mutableStateOf<List<CardAppGroup>>(emptyList()) }
+    // 选卡搜索（v2.0.33）：按应用名/卡片名过滤，与系统
+    // 卡片目录同款交互；非空时命中分组自动展开。
+    var cardQuery by remember { mutableStateOf("") }
     var expandedCardPkg by remember {
         mutableStateOf<String?>(
             (prefs.getString(ThemeStore.KEY_CARD_PROVIDER, StampStore.DEFAULT_CARD_PROVIDER)
@@ -312,6 +326,18 @@ private fun SettingsScreen() {
     androidx.compose.runtime.LaunchedEffect(Unit) {
         if (cardGroups.isEmpty()) {
             cardGroups = withContext(Dispatchers.IO) { loadCardGroups(context) }
+        }
+    }
+
+    // 选卡目录 dump（v2.0.33）：进「头部卡片」页时在 IO 线程
+    // 生成一次 /sdcard/Download/shadeclock_carddump.txt，
+    // 记录设置进程视角下全量 provider 的可读字段与 receiver
+    // metaData 键名——定案两件事：设置侧枚举被调用方过滤的
+    // 范围（.32 里天气/日历/时钟/智慧空间四组整组缺失）、
+    // 系统「服务卡片」目录的精选标记。本进程只跑一次。
+    androidx.compose.runtime.LaunchedEffect(page) {
+        if (page == PAGE_CARD) {
+            withContext(Dispatchers.IO) { CardDump.writeOnce(context) }
         }
     }
 
@@ -506,8 +532,14 @@ private fun SettingsScreen() {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(innerPadding),
+                // padding 必须排在 verticalScroll 前面（v2.0.33
+                // 修顶部重叠）：反过来写时顶栏 inset 是滚动内容
+                // 的一部分，一滚动就被卷走，列表行会滑到状态
+                // 栏/顶栏底下与标题、时间重叠（.32 选卡页截图
+                // 实证）；先 padding 则视口本身被 inset 框住，
+                // 内容永远不进顶栏区域。
+                .padding(innerPadding)
+                .verticalScroll(rememberScrollState()),
         ) {
             Column(
                 modifier = Modifier
@@ -704,12 +736,52 @@ private fun SettingsScreen() {
                             text = "选择卡片",
                             insideMargin = PaddingValues(start = 4.dp, top = 16.dp),
                         )
+                        // 搜索（v2.0.33）：按应用名/卡片名过滤，
+                        // 与系统卡片目录同款交互；搜索时命中
+                        // 分组自动展开、只列命中的卡（应用名
+                        // 本身命中则列全组）。
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            TextField(
+                                value = cardQuery,
+                                onValueChange = { cardQuery = it },
+                                label = "搜索卡片",
+                                useLabelAsPlaceholder = true,
+                                singleLine = true,
+                                modifier = Modifier.weight(1f),
+                            )
+                            if (cardQuery.isNotEmpty()) {
+                                Text(
+                                    "清除",
+                                    fontSize = 14.sp,
+                                    color = MiuixTheme.colorScheme.primary,
+                                    modifier = Modifier
+                                        .clickable { cardQuery = "" }
+                                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                                )
+                            }
+                        }
                         Card(
                             modifier = Modifier.fillMaxWidth(),
                             cornerRadius = 20.dp,
                             insideMargin = PaddingValues(vertical = 4.dp),
                         ) {
                             Column {
+                                val query = cardQuery.trim()
+                                val visibleGroups = if (query.isEmpty()) {
+                                    cardGroups
+                                } else {
+                                    cardGroups.filter { g ->
+                                        g.appLabel.contains(query, ignoreCase = true) ||
+                                            g.entries.any {
+                                                it.label.contains(query, ignoreCase = true)
+                                            }
+                                    }
+                                }
                                 if (cardGroups.isEmpty()) {
                                     Text(
                                         "正在读取本机卡片…",
@@ -717,9 +789,27 @@ private fun SettingsScreen() {
                                         color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                                     )
+                                } else if (visibleGroups.isEmpty()) {
+                                    Text(
+                                        "没有匹配「$query」的卡片",
+                                        fontSize = 13.sp,
+                                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                                    )
                                 }
-                                for (group in cardGroups) {
-                                    val expanded = expandedCardPkg == group.packageName
+                                for (group in visibleGroups) {
+                                    val searching = query.isNotEmpty()
+                                    val expanded = searching ||
+                                        expandedCardPkg == group.packageName
+                                    val shownEntries = if (searching &&
+                                        !group.appLabel.contains(query, ignoreCase = true)
+                                    ) {
+                                        group.entries.filter {
+                                            it.label.contains(query, ignoreCase = true)
+                                        }
+                                    } else {
+                                        group.entries
+                                    }
                                     val groupHasSelected =
                                         group.entries.any { it.component == cardProvider }
                                     Row(
@@ -727,11 +817,29 @@ private fun SettingsScreen() {
                                             .fillMaxWidth()
                                             .clickable {
                                                 expandedCardPkg =
-                                                    if (expanded) null else group.packageName
+                                                    if (expandedCardPkg == group.packageName) {
+                                                        null
+                                                    } else {
+                                                        group.packageName
+                                                    }
                                             }
                                             .padding(horizontal = 16.dp, vertical = 10.dp),
                                         verticalAlignment = Alignment.CenterVertically,
                                     ) {
+                                        // 应用图标（v2.0.33）：向系统
+                                        // 卡片目录的形态靠（图标+应用
+                                        // 名+卡数）；图标取不到就只
+                                        // 显示文字，不留空位。
+                                        group.icon?.let { icon ->
+                                            Image(
+                                                bitmap = icon,
+                                                contentDescription = null,
+                                                modifier = Modifier
+                                                    .size(36.dp)
+                                                    .clip(RoundedCornerShape(9.dp)),
+                                            )
+                                            Spacer(modifier = Modifier.size(12.dp))
+                                        }
                                         Column(modifier = Modifier.weight(1f)) {
                                             Text(
                                                 group.appLabel,
@@ -753,7 +861,7 @@ private fun SettingsScreen() {
                                         }
                                     }
                                     if (expanded) {
-                                        for (entry in group.entries) {
+                                        for (entry in shownEntries) {
                                             val selected = entry.component == cardProvider
                                             Row(
                                                 modifier = Modifier
@@ -1061,17 +1169,19 @@ private data class CardProviderEntry(
     val sizeText: String,
 )
 
-/** 按来源应用分组的卡片列表。 */
+/** 按来源应用分组的卡片列表（icon 为应用图标位图，取不到为 null）。 */
 private data class CardAppGroup(
     val packageName: String,
     val appLabel: String,
+    val icon: ImageBitmap?,
     val entries: List<CardProviderEntry>,
 )
 
 /**
  * 探针实测有服务卡片的来源应用（天气/日历/时钟/联系人/
  * 图库/钱包/智慧空间/健康使用平板 + 文字/语录卡片的来源
- * 启动器），选卡列表里排在前面；其余应用按名称排后面。
+ * 启动器 + 笔记），选卡列表里按探针包名钉在最前；其余
+ * 应用按名称排后面。
  */
 private val CARD_KNOWN_PACKAGES = listOf(
     "com.hihonor.android.totemweather",
@@ -1083,20 +1193,67 @@ private val CARD_KNOWN_PACKAGES = listOf(
     "com.hihonor.magichome",
     "com.hihonor.parentcontrol",
     "com.hihonor.android.launcher",
+    "com.hihonor.notepad",
 )
 
 /**
+ * 选卡页尺寸文案（v2.0.33 改口径）：provider 原始 minW×minH
+ * 千奇百怪（0×0、3584×805、3150×140 都有），直接换算 dp
+ * 标出来对用户毫无意义。优先级：声明了格子数就显示
+ * 「W×H 格」；否则显示这张卡按 CardHost 现行布局规则放进
+ * 头部后的实际占用——原生尺寸取 minW×minH（任一为 0 走
+ * CardHost 同款兜底 700×350px，与 [CardHost] 的
+ * FALLBACK_NATIVE_W/H 一致）、比头部可用宽更宽时等比
+ * 缩小（scale≤1、永不放大），换算 dp 后标注「实际占用」。
+ * 可用宽在设置侧以屏幕宽 px 近似（通知面板全宽、卡片槽
+ * 与头部同宽）。
+ */
+private fun cardSizeText(
+    info: AppWidgetProviderInfo,
+    density: Float,
+    availWidthPx: Int,
+): String {
+    if (info.targetCellWidth > 0 && info.targetCellHeight > 0) {
+        return "${info.targetCellWidth}×${info.targetCellHeight} 格"
+    }
+    val nativeW = if (info.minWidth > 0) info.minWidth else 700
+    val nativeH = if (info.minHeight > 0) info.minHeight else 350
+    val scale = if (availWidthPx > 0) {
+        minOf(1f, availWidthPx.toFloat() / nativeW)
+    } else {
+        1f
+    }
+    val wDp = (nativeW * scale / density).roundToInt()
+    val hDp = (nativeH * scale / density).roundToInt()
+    return "实际占用约 $wDp×$hDp dp"
+}
+
+/** 应用图标 Drawable -> 位图（选卡页分组行左侧图标用）。 */
+private fun drawableToBitmap(drawable: Drawable, sizePx: Int): ImageBitmap? {
+    return try {
+        val bmp = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        drawable.setBounds(0, 0, sizePx, sizePx)
+        drawable.draw(canvas)
+        bmp.asImageBitmap()
+    } catch (t: Throwable) {
+        null
+    }
+}
+
+/**
  * 枚举全机标准 AppWidget provider 并按应用分组（设置应用
- * 进程内跑、无需任何权限）。尺寸文案：provider 给了格子
- * 数就显示格子，否则把 minW×minH（px 原值）换算成 dp。
- * 全机数百个，只在 IO 线程调用一次。
+ * 进程内跑、无需任何权限）。全机数百个，只在 IO 线程
+ * 调用一次。
  */
 private fun loadCardGroups(context: Context): List<CardAppGroup> {
     val pm = context.packageManager
     val awm = AppWidgetManager.getInstance(context) ?: return emptyList()
     val density = context.resources.displayMetrics.density
+    val availWidthPx = context.resources.displayMetrics.widthPixels
     val byPkg = LinkedHashMap<String, MutableList<CardProviderEntry>>()
     val appLabels = HashMap<String, String>()
+    val appIcons = HashMap<String, ImageBitmap?>()
     for (info in awm.installedProviders) {
         val pkg = info.provider.packageName
         if (!appLabels.containsKey(pkg)) {
@@ -1105,24 +1262,27 @@ private fun loadCardGroups(context: Context): List<CardAppGroup> {
             } catch (t: Throwable) {
                 pkg
             }
+            appIcons[pkg] = try {
+                drawableToBitmap(pm.getApplicationIcon(pkg), 96)
+            } catch (t: Throwable) {
+                null
+            }
         }
         val label = try {
             info.loadLabel(pm) ?: ""
         } catch (t: Throwable) {
             ""
         }
-        val sizeText = if (info.targetCellWidth > 0 && info.targetCellHeight > 0) {
-            "${info.targetCellWidth}×${info.targetCellHeight} 格"
-        } else {
-            "${(info.minWidth / density).roundToInt()}×" +
-                "${(info.minHeight / density).roundToInt()} dp"
-        }
         byPkg.getOrPut(pkg) { mutableListOf() }.add(
-            CardProviderEntry(info.provider.flattenToString(), label, sizeText),
+            CardProviderEntry(
+                info.provider.flattenToString(),
+                label,
+                cardSizeText(info, density, availWidthPx),
+            ),
         )
     }
     val groups = byPkg.map { (pkg, entries) ->
-        CardAppGroup(pkg, appLabels[pkg] ?: pkg, entries)
+        CardAppGroup(pkg, appLabels[pkg] ?: pkg, appIcons[pkg], entries)
     }
     return groups.sortedWith(
         compareBy<CardAppGroup> {
