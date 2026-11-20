@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.36-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.37-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.36-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.37-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,37 +68,46 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.36
-          name: HonorShadeClock 2.0.36 — 取证第三弹（hostbind 修复重跑）
+          tag_name: v2.0.37
+          name: HonorShadeClock 2.0.37 — 卡片线定案施工（目录只列真服务卡片）
           body: |
-            ## HonorShadeClock 2.0.36
+            ## HonorShadeClock 2.0.37
 
-            取证第三弹：托管行为与 2.0.35 完全
-            一致，只修三件取证仪器。上一版的
-            hostbind 文件在你那边根本没生成，
-            根因已定：探针反射取服务类时类名
-            写错了一个包、且死在打开文件之前。
-            本版文件先行——无论每步成败，
-            shadeclock_hostbind.txt 都必生成、
-            失败轨迹就写在文件里。
+            卡片线定案 + 据证施工：
 
-            另两修：内容下发后的错误视图自检
-            上一版恒失效（反射找错了方法），
-            本版改好，下次日志能把「下发了但
-            拼不出来」和「正常出内容」分开；
-            卡片声明 dump 补记每个 receiver
-            与应用的全部 meta-data 键名——
-            服务卡片的身份标记已证不在
-            provider 的 XML 里，改到这一层
-            继续找。
+            1. 服务卡片的身份标记找到了——不在
+               provider 的 XML 里，在 receiver 的
+               meta-data 里：带
+               com.hihonor.android.launcher.card_*
+               任一键的才是荣耀服务卡片（全量 554
+               张中 112 张命中，经典小工具对照组
+               全不带、服务卡片对照组全带）。
+               选卡目录本版起只列这 112 张，
+               经典小工具整段去掉。
+            2. 尺寸文案优先用卡片自己声明的
+               card_size 规范档位，读不到才退回
+               「实际占用约 WxH dp」。
+            3. 内容自检换法：旧的错误视图自检
+               已证恒失真（对每张卡都报 true），
+               改记子视图摘要，下发分型靠日志
+               人读定案。
+
+            还差一份证据、本版没动的部分（说清）：
+            托管参数（hostName 等）要对齐真宿主，
+            必须先拿到桌面/锁屏宿主的绑定记录。
+            上一版代理已拿到、但枚举方法被本机
+            ROM 改了签名、调不通；本版探针已升级
+            为「先发现真签名再调用」，装本版后
+            回传 shadeclock_hostbind.txt，下一轮
+            补齐托管对齐。
 
             取证动作（顺序别反）：
             1. 先在桌面添加你想要的那几张
                服务卡片；
             2. 覆盖安装本版 → 打开一次设置页
                → 点「重启系统界面」；
-            3. 下拉开几次通知中心、点开一两张
-               头部卡片；
+            3. 下拉开几次通知中心、把头部卡片
+               点开一两张（天气小卡也选一次）；
             4. 回传三个文件：
                /sdcard/Download/shadeclock_hostbind.txt
                /sdcard/Download/shadeclock_cardxml.txt
