@@ -125,7 +125,7 @@ object CardHost {
         if (!hostListening) {
             h.startListening()
             hostListening = true
-            log("[cardhost] host startListening (hostId=$HOST_ID)")
+            log("[cardhost] host startListening (hostId=$HOST_ID host=${h.javaClass.name})")
         }
         val density = ctx.resources.displayMetrics.density
         val options = Bundle().apply {
@@ -196,6 +196,22 @@ object CardHost {
             log("[cardhost] updateAppWidgetOptions failed: ${t.javaClass.name}: ${t.message}")
         }
         val view = h.createView(ctx, id, info)
+        // 视图类自检（v2.0.38）：创建点全仓唯一（只有这里调
+        // createView）、宿主恒为 LoggingHost，正常必得
+        // LoggingHostView。若某 ROM 的 createView 不走
+        // onCreateView，返回的就是普通 AppWidgetHostView、
+        // 下发证据会悄悄丢光——这里显式校验、偏离记 WARN，
+        // 不静默。背景纠正：.32 会话里天气卡 id=19101 的
+        // 普通视图是 LoggingHost 尚未诞生（.34 才引入）所致，
+        // 且当时是 fresh allocate、不是持久化恢复路径绕过；
+        // .35/.36 日志里每次 createView 都是 LoggingHostView，
+        // 本就不存在第二条创建路径，此校验是防回归的护栏。
+        if (view !is LoggingHostView) {
+            log(
+                "[cardhost] WARN createView returned ${view.javaClass.name}, " +
+                    "expected LoggingHostView — update evidence will be missing"
+            )
+        }
         log("[cardhost] createView ok id=$id view=${view.javaClass.name}")
         failedAtMs.remove(key)
         val nativeW = if (info.minWidth > 0) info.minWidth else FALLBACK_NATIVE_W
@@ -295,13 +311,32 @@ private class LoggingHost(
         appWidget: AppWidgetProviderInfo?,
     ): AppWidgetHostView {
         logFn("[cardhost] hostView created id=$appWidgetId provider=${appWidget?.provider}")
-        return LoggingHostView(context, logFn)
+        return LoggingHostView(context, logFn, this)
+    }
+
+    /**
+     * 宿主层下发记录（v2.0.38）：同一份下发在视图层之外、
+     * 宿主层再留一行，与视图层那行互为佐证。为什么绕这一
+     * 道：API 36 的 AppWidgetHost 没有可覆写的 update 回调
+     * （只有 onCreateView / onProviderChanged 可覆写，下发
+     * 只能经视图的 updateAppWidget 到达），宿主层这一笔
+     * 只能由视图回调时顺带记。两行对不上（只有宿主行没有
+     * 视图行、或反之）即说明视图不是 LoggingHostView，
+     * 与 obtainViewInner 的类校验互相印证。
+     */
+    fun noteUpdate(appWidgetId: Int, pkg: String?, layoutId: Int?) {
+        logFn("[cardhost] host-update id=$appWidgetId pkg=$pkg layout=$layoutId")
+    }
+
+    override fun onProviderChanged(appWidgetId: Int, appWidget: AppWidgetProviderInfo?) {
+        logFn("[cardhost] host provider-changed id=$appWidgetId provider=${appWidget?.provider}")
     }
 }
 
 private class LoggingHostView(
     context: Context,
     private val logFn: (String) -> Unit,
+    private val host: LoggingHost? = null,
 ) : AppWidgetHostView(context) {
 
     /**
@@ -313,6 +348,11 @@ private class LoggingHostView(
      * n/a、.36 恒 true，两代自检都白设）。子视图摘要不做
      * 真假断言：错误视图是系统布局（类名/系统文案认得出），
      * 真卡片是 provider 自己的布局，人读日志即可分型。
+     * v2.0.38 证据归属再钉死：全日志 74 条 n/a
+     * (NoSuchMethodException) 全在 .35 会话（当时用
+     * getMethod 公共查找、够不到 protected 方法）；.36
+     * 改 declared 查找后 15 条检查 0 条 n/a、全部成功返回
+     * ——查找没失败，是方法本身恒非空。自检已删、不复活。
      */
     private fun contentSummary(): String {
         val sb = StringBuilder("children=[")
@@ -356,6 +396,9 @@ private class LoggingHostView(
                 "[cardhost] updateAppWidget id=$appWidgetId " +
                     "pkg=${views?.`package`} layout=${views?.layoutId}"
             )
+            // 宿主层再记一笔（v2.0.38）：同一份下发双留痕，
+            // 理由见 LoggingHost.noteUpdate。
+            host?.noteUpdate(appWidgetId, views?.`package`, views?.layoutId)
         } catch (t: Throwable) {
             // 只记日志，异常不许影响下发本体
         }

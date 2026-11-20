@@ -43,13 +43,16 @@ import kotlin.math.roundToInt
  * 系统界面生效）；覆盖层设置走 StampStore 的 stamp.txt，不经此路。
  *
  * 诊断写 /sdcard/Download/shadeclock_probe.log（+ LSPosed 日志）。
- * 作用域只有 com.android.systemui（见 AndroidManifest 的 xposedscope）。
+ * 作用域：com.android.systemui（主体）+ com.hihonor.android.
+ * launcher（v2.0.38 起仅只读探针 LauncherProbe，抓桌面宿主
+ * 地面真值，零行为改变；见 AndroidManifest 的 xposedscope）。
  */
 class ShadeClockHook : IXposedHookLoadPackage, IXposedHookInitPackageResources {
 
     companion object {
         private const val TAG = "[ShadeClock]"
         private const val TARGET_PACKAGE = "com.android.systemui"
+        private const val LAUNCHER_PACKAGE = "com.hihonor.android.launcher"
         private val LOG_FILE = File("/sdcard/Download/shadeclock_probe.log")
 
         private const val CLOCK_DIMEN = "notif_center_header_clock_text_size"
@@ -152,6 +155,14 @@ class ShadeClockHook : IXposedHookLoadPackage, IXposedHookInitPackageResources {
     // ================= hook 安装 =================
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
+        // 启动器进程（v2.0.38）：只装只读探针抓桌面宿主地面
+        // 真值，不挂任何 UI、不改桌面行为；主体功能仍只在
+        // SystemUI 进程。
+        if (lpparam.packageName == LAUNCHER_PACKAGE) {
+            diag("=== HonorShadeClock v${BuildConfig.VERSION_NAME} launcher probe loaded in $LAUNCHER_PACKAGE ===")
+            LauncherProbe.install { message -> diag(message) }
+            return
+        }
         if (lpparam.packageName != TARGET_PACKAGE) return
         diag("=== HonorShadeClock v${BuildConfig.VERSION_NAME} loaded in $TARGET_PACKAGE ===")
         installDimenDiagnostic(lpparam)

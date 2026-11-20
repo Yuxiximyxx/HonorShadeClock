@@ -50,13 +50,13 @@ jobs:
           mkdir -p dist
           SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "release apk: $SRC"
-          cp "$SRC" dist/HonorShadeClock-2.0.37-release.apk
+          cp "$SRC" dist/HonorShadeClock-2.0.38-release.apk
           ls -lh dist
 
       - name: Verify signature
         run: |
           SDK=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.37-release.apk
+          "$SDK/apksigner" verify --print-certs dist/HonorShadeClock-2.0.38-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,50 +68,59 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.37
-          name: HonorShadeClock 2.0.37 — 卡片线定案施工（目录只列真服务卡片）
+          tag_name: v2.0.38
+          name: HonorShadeClock 2.0.38 — 仪器与目录修正（+启动器只读探针）
           body: |
-            ## HonorShadeClock 2.0.37
+            ## HonorShadeClock 2.0.38
 
-            卡片线定案 + 据证施工：
+            仪器与目录修正版：托管参数与呈现体系
+            一律没动，只修证据链与目录口径。
 
-            1. 服务卡片的身份标记找到了——不在
-               provider 的 XML 里，在 receiver 的
-               meta-data 里：带
-               com.hihonor.android.launcher.card_*
-               任一键的才是荣耀服务卡片（全量 554
-               张中 112 张命中，经典小工具对照组
-               全不带、服务卡片对照组全带）。
-               选卡目录本版起只列这 112 张，
-               经典小工具整段去掉。
-            2. 尺寸文案优先用卡片自己声明的
-               card_size 规范档位，读不到才退回
-               「实际占用约 WxH dp」。
-            3. 内容自检换法：旧的错误视图自检
-               已证恒失真（对每张卡都报 true），
-               改记子视图摘要，下发分型靠日志
-               人读定案。
+            1. 下发取证双留痕：宿主层再记一笔
+               host-update（与视图层那行互证）；
+               视图创建加类校验，偏离预期当场
+               WARN，不再静默丢证据。
+            2. hostbind 改全量签名发现：代理接口
+               的全部方法名+签名先写进文件，再按
+               真签名逐个试调，不再按名字过滤、
+               不再写死签名猜。
+            3. cardxml/carddump 补记 card_size、
+               card_category、widget_type、
+               widgetType 四类键的取值（资源引用
+               回源解成文本），供下轮定尺寸档位。
+            4. 目录计数对账完成：card_* 命中
+               112 张两视角一致；122 的差额是
+               9 个 vivo + 1 个 auto 跨厂商标记、
+               不是荣耀服务卡，不采纳；另补进
+               3 张只带 widgetType 的天气卡，
+               目录最终 115 张。
+            5. 新增启动器侧只读探针（小乐点名
+               「抓桌面」）：在启动器进程内读它
+               自己宿主的绑定与 options（hostName、
+               尺寸键全量），写
+               shadeclock_launcherbind.txt；
+               只记日志、零行为改变。
 
-            还差一份证据、本版没动的部分（说清）：
-            托管参数（hostName 等）要对齐真宿主，
-            必须先拿到桌面/锁屏宿主的绑定记录。
-            上一版代理已拿到、但枚举方法被本机
-            ROM 改了签名、调不通；本版探针已升级
-            为「先发现真签名再调用」，装本版后
-            回传 shadeclock_hostbind.txt，下一轮
-            补齐托管对齐。
-
-            取证动作（顺序别反）：
-            1. 先在桌面添加你想要的那几张
-               服务卡片；
-            2. 覆盖安装本版 → 打开一次设置页
-               → 点「重启系统界面」；
-            3. 下拉开几次通知中心、把头部卡片
-               点开一两张（天气小卡也选一次）；
+            取证动作（本版多一步勾选）：
+            1. 覆盖安装本版；
+            2. LSPosed 里给本模块多勾上
+               「系统桌面/启动器」
+               （com.hihonor.android.launcher），
+               然后强停一次启动器（或重启桌面），
+               桌面卡片会重走一遍绑定、探针即
+               记录；系统界面那边照旧点一次
+               「重启系统界面」；
+            3. 下拉通知中心，在选卡页选一次
+               天气小卡
+               （com.hihonor.android.totemweather
+               的 SmallCardWeatherProvider），
+               停留片刻；
             4. 回传三个文件：
-               /sdcard/Download/shadeclock_hostbind.txt
-               /sdcard/Download/shadeclock_cardxml.txt
                /sdcard/Download/shadeclock_probe.log
+               /sdcard/Download/shadeclock_hostbind.txt
+               /sdcard/Download/shadeclock_launcherbind.txt
+               前两个定案 SystemUI 侧，第三个是
+               桌面宿主的地面真值。
 
             关闭办法：在 LSPosed 里停用模块再重启一次
             系统界面，即恢复原样。

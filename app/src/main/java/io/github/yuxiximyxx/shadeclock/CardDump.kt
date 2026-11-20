@@ -73,7 +73,7 @@ object CardDump {
         val dm = context.resources.displayMetrics
         val sb = StringBuilder()
         val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
-        sb.appendLine("HonorShadeClock card dump (settings-process view, v2.0.37)")
+        sb.appendLine("HonorShadeClock card dump (settings-process view, v${BuildConfig.VERSION_NAME})")
         sb.appendLine(
             "time=${sdf.format(Date())} pid=${Process.myPid()} uid=${Process.myUid()}",
         )
@@ -130,6 +130,9 @@ object CardDump {
                 // 这些键的原始值一并记下——card_size 的值形态
                 // （字符串/资源引用/整数代码）决定选卡页尺寸
                 // 文案能不能直接用它，留证供下一轮核对。
+                // v2.0.38：Int 资源引用（>=0x7f000000）再回源
+                // 应用资源解成文本一并记下，与 cardxml 的
+                // meta-values 同口径。
                 if (bundle != null) {
                     val parts = mutableListOf<String>()
                     for (k in bundle.keySet().sorted()) {
@@ -142,7 +145,23 @@ object CardDump {
                         }
                         parts.add(
                             when (v) {
-                                is Int -> "$k=$v(0x${Integer.toHexString(v)})"
+                                is Int -> {
+                                    if (v >= 0x7f000000) {
+                                        val resolved = try {
+                                            pm.getResourcesForApplication(comp.packageName)
+                                                .getString(v)
+                                        } catch (t: Throwable) {
+                                            null
+                                        }
+                                        if (resolved != null) {
+                                            "$k=$v(0x${Integer.toHexString(v)})->\"$resolved\""
+                                        } else {
+                                            "$k=$v(0x${Integer.toHexString(v)})-><unresolved>"
+                                        }
+                                    } else {
+                                        "$k=$v(0x${Integer.toHexString(v)})"
+                                    }
+                                }
                                 else -> "$k=$v"
                             },
                         )

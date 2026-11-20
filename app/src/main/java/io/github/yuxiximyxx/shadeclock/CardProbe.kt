@@ -220,7 +220,7 @@ object CardProbe {
             val providers = awm.installedProviders
             val seenPkgs = HashSet<String>()
             outFile.bufferedWriter().use { w ->
-                w.write("# HonorShadeClock cardxml dump v2.0.36 providers=${providers.size}\n")
+                w.write("# HonorShadeClock cardxml dump v${BuildConfig.VERSION_NAME} providers=${providers.size}\n")
                 for (info in providers) {
                     val comp = info.provider
                     val label = try {
@@ -238,6 +238,10 @@ object CardProbe {
                             )
                             val keys = ai.metaData?.keySet()?.sorted()?.joinToString(", ")
                             w.write("### app-meta pkg=${comp.packageName} keys=[$keys]\n")
+                            val mv = metaValuesText(pm, comp.packageName, ai.metaData)
+                            if (mv.isNotEmpty()) {
+                                w.write("### app-meta-values pkg=${comp.packageName} $mv\n")
+                            }
                         } catch (t: Throwable) {
                             w.write("### app-meta pkg=${comp.packageName} FAILED: ${t.javaClass.name}: ${t.message}\n")
                         }
@@ -249,6 +253,16 @@ object CardProbe {
                         val ri0 = pm.getReceiverInfo(comp, PackageManager.GET_META_DATA)
                         val keys = ri0.metaData?.keySet()?.sorted()?.joinToString(", ")
                         w.write("  meta-keys: [$keys]\n")
+                        // v2.0.38：目标键取值一并记（card_size /
+                        // card_category / card_widget_type /
+                        // card_widgetType / widget_type / widgetType，
+                        // 均为 launcher 前缀；实测真实键名是
+                        // widget_type / widgetType，card_widget_*
+                        // 并不存在——两种拼写都覆盖免得漏）：
+                        // 字符串直记，资源引用记原始值并回源
+                        // 应用资源解文本，供定尺寸档位文案。
+                        val mv = metaValuesText(pm, comp.packageName, ri0.metaData)
+                        if (mv.isNotEmpty()) w.write("  meta-values: $mv\n")
                     } catch (t: Throwable) {
                         w.write("  meta-keys: FAILED ${t.javaClass.name}: ${t.message}\n")
                     }
@@ -317,6 +331,64 @@ object CardProbe {
     }
 
     /**
+     * 目标 meta 键取值渲染（v2.0.38）：card_size / card_category /
+     * card_widget_type / card_widgetType / widget_type / widgetType
+     * （com.hihonor.android.launcher 前缀；实测 card_widget_* 键
+     * 不存在，真实键是 widget_type / widgetType，两种拼写都覆盖）。
+     * 字符串直记；Int 资源引用（>=0x7f000000）记原始值并回源
+     * 应用资源解成文本、解不出记 <unresolved>；小整数原样记。
+     * 没有任一目标键时返回空串（调用方不写行）。
+     */
+    private fun metaValuesText(
+        pm: PackageManager,
+        pkg: String,
+        meta: android.os.Bundle?,
+    ): String {
+        if (meta == null) return ""
+        val keys = listOf(
+            "com.hihonor.android.launcher.card_size",
+            "com.hihonor.android.launcher.card_category",
+            "com.hihonor.android.launcher.card_widget_type",
+            "com.hihonor.android.launcher.card_widgetType",
+            "com.hihonor.android.launcher.widget_type",
+            "com.hihonor.android.launcher.widgetType",
+        )
+        val parts = mutableListOf<String>()
+        for (k in keys) {
+            if (!meta.containsKey(k)) continue
+            @Suppress("DEPRECATION")
+            val v = try {
+                meta.get(k)
+            } catch (t: Throwable) {
+                null
+            }
+            val rendered = when (v) {
+                null -> "null"
+                is String -> "\"$v\""
+                is Int -> {
+                    if (v >= 0x7f000000) {
+                        val resolved = try {
+                            pm.getResourcesForApplication(pkg).getString(v)
+                        } catch (t: Throwable) {
+                            null
+                        }
+                        if (resolved != null) {
+                            "$v(0x${Integer.toHexString(v)})->\"$resolved\""
+                        } else {
+                            "$v(0x${Integer.toHexString(v)})-><unresolved>"
+                        }
+                    } else {
+                        "$v"
+                    }
+                }
+                else -> v.toString()
+            }
+            parts.add("$k=$rendered")
+        }
+        return parts.joinToString("; ")
+    }
+
+    /**
      * 宿主绑定地面真值 dump（v2.0.35，小乐拍板的取证捷径）：
      * 他在桌面亲手添加想要的服务卡片后，启动器宿主名下就有一
      * 批已成立的绑定——经 IAppWidgetService（反射）枚举各候选
@@ -343,7 +415,7 @@ object CardProbe {
         // 全灭也有一份带失败轨迹的文件落地。
         try {
             outFile.bufferedWriter().use { w ->
-                w.write("# HonorShadeClock hostbind dump v2.0.37\n")
+                w.write("# HonorShadeClock hostbind dump v${BuildConfig.VERSION_NAME}\n")
                 w.flush()
                 val svc = obtainAppWidgetService(ctx, w, log)
                 if (svc == null) {
@@ -352,7 +424,7 @@ object CardProbe {
                     log("[cardprobe] hostbind: service acquisition failed, failure trail written -> ${outFile.absolutePath}")
                     return
                 }
-                discoverServiceMethods(svc, w, log)
+                val methods = discoverServiceMethods(svc, w, log)
                 val candidates = listOf(
                     "com.android.systemui",
                     "com.hihonor.android.launcher",
@@ -360,13 +432,13 @@ object CardProbe {
                     ctx.packageName,
                 )
                 for (pkg in candidates) {
-                    // v2.0.37：不再写死 (String) 签名——.36 真机上
-                    // 代理拿到了、方法却 NoSuchMethod（ROM 改了
-                    // AIDL 签名，疑似多 userId 参数）。改走
-                    // invokeService 按参数类型逐候选试调，
-                    // secondInt 对 getAppWidgetIds 是 userId=0。
-                    val ids = invokeService(
-                        svc, w, "getAppWidgetIds", pkg, 0,
+                    // v2.0.38：按真签名调——候选来自签名发现的
+                    // 全量方法表（名字含 AppWidgetIds 的都试，
+                    // 精确名优先），参数按类型填（secondInt 对
+                    // getAppWidgetIds 是 userId=0）。不再写死
+                    // 任何签名（.36 写死 (String) 全灭的教训）。
+                    val ids = invokeServiceByNamePart(
+                        svc, w, methods, "AppWidgetIds", pkg, 0,
                     ) as? IntArray
                     w.write(
                         "## getAppWidgetIds($pkg) -> ${ids?.size} ids: " +
@@ -376,7 +448,7 @@ object CardProbe {
                     log("[cardprobe] hostbind: getAppWidgetIds($pkg) -> ${ids?.size} ids")
                     if (ids != null) {
                         for (id in ids) {
-                            dumpOneBinding(svc, w, pkg, id)
+                            dumpOneBinding(svc, w, methods, pkg, id)
                         }
                         w.flush()
                     }
@@ -504,20 +576,21 @@ object CardProbe {
     private fun dumpOneBinding(
         svc: Any,
         w: java.io.Writer,
+        methods: List<java.lang.reflect.Method>,
         callingPackage: String,
         id: Int,
     ) {
         w.write("=== id=$id via callingPackage=$callingPackage\n")
-        val info = invokeService(
-            svc, w, "getAppWidgetInfo", callingPackage, id,
+        val info = invokeServiceByNamePart(
+            svc, w, methods, "AppWidgetInfo", callingPackage, id,
         ) as? AppWidgetProviderInfo
         w.write(
             "  provider=${info?.provider} minW=${info?.minWidth} " +
                 "minH=${info?.minHeight} updatePeriod=${info?.updatePeriodMillis} " +
                 "configure=${info?.configure}\n"
         )
-        val opts = invokeService(
-            svc, w, "getAppWidgetOptions", callingPackage, id,
+        val opts = invokeServiceByNamePart(
+            svc, w, methods, "AppWidgetOptions", callingPackage, id,
         ) as? android.os.Bundle
         if (opts == null) {
             w.write("  options=null\n")
@@ -536,16 +609,20 @@ object CardProbe {
     }
 
     /**
-     * 服务方法签名发现（v2.0.37）：把代理所实现接口里名字含
-     * AppWidgetIds/AppWidgetOptions/AppWidgetInfo/AppWidgetViews
-     * 的方法签名全量写进 hostbind 文件——.36 的教训是签名被
-     * ROM 改过、写死必死，先把真签名亮出来再调。
+     * 服务方法签名全量发现（v2.0.38 改全量）：把代理所实现
+     * 接口的**全部**方法（名 + 参数类型全名 + 返回类型）
+     * 原样写进 hostbind 文件并返回方法表供按真签名调用。
+     * .36 的教训是签名被 ROM 改过、写死必死；.37 只 dump
+     * 名字含 AppWidgetIds/Options/Info/Views 的方法——真
+     * 方法名若落在过滤词之外（如 getAppWidgetIdsForHost）
+     * 就会漏掉，本版不再过滤。接口方法之外再并入代理类
+     * 自身的 public 方法（去重），防接口枚举不全。
      */
     private fun discoverServiceMethods(
         svc: Any,
         w: java.io.Writer,
         log: (String) -> Unit,
-    ) {
+    ): List<java.lang.reflect.Method> {
         val ifaces = mutableListOf<Class<*>>()
         var c: Class<*>? = svc.javaClass
         while (c != null) {
@@ -558,6 +635,10 @@ object CardProbe {
             }
             c = c.superclass
         }
+        val all = mutableListOf<java.lang.reflect.Method>()
+        val seen = HashSet<String>()
+        fun sigOf(m: java.lang.reflect.Method): String =
+            m.name + "(" + m.parameterTypes.joinToString { it.name } + ")"
         for (iface in ifaces) {
             w.write("## interface ${iface.name}\n")
             val ms = try {
@@ -565,50 +646,57 @@ object CardProbe {
             } catch (t: Throwable) {
                 emptyArray()
             }
-            for (m in ms) {
-                if (m.name.contains("AppWidgetIds") ||
-                    m.name.contains("AppWidgetOptions") ||
-                    m.name.contains("AppWidgetInfo") ||
-                    m.name.contains("AppWidgetViews")
-                ) {
-                    w.write(
-                        "  method ${m.name}(" +
-                            m.parameterTypes.joinToString { it.name } +
-                            ") -> ${m.returnType.name}\n"
-                    )
-                }
+            for (m in ms.sortedBy { it.name }) {
+                w.write(
+                    "  method ${m.name}(" +
+                        m.parameterTypes.joinToString { it.name } +
+                        ") -> ${m.returnType.name}\n"
+                )
+                if (seen.add(sigOf(m))) all.add(m)
             }
         }
+        try {
+            for (m in svc.javaClass.methods) {
+                if (seen.add(sigOf(m))) all.add(m)
+            }
+        } catch (t: Throwable) {
+            // 代理类方法收不全不致命，接口表已在手
+        }
         w.flush()
-        log("[cardprobe] hostbind: signature discovery done (${ifaces.size} interfaces)")
+        log(
+            "[cardprobe] hostbind: signature discovery done " +
+                "(${ifaces.size} interfaces, ${all.size} methods)"
+        )
+        return all
     }
 
     /**
-     * 按名字+参数类型试调服务方法：候选是代理类的全部 public
-     * 同名方法（AIDL Proxy 实现接口方法、均为 public）。参数
-     * 按类型填：String->[pkg]、int->[secondInt]、UserHandle->
-     * 当前用户，其余类型放弃该候选。每个候选的成败都写进
-     * [w] 并记日志；全灭返回 null。
+     * 按名字子串 + 真签名试调（v2.0.38）：候选是签名发现
+     * 拿到的方法表里名字含 [namePart] 的全部方法（精确名
+     * get<namePart> 优先、其余按名排序）；参数按类型填：
+     * String->[pkg]、int->[secondInt]、UserHandle->当前用户，
+     * 其余类型放弃该候选。每个候选的成败都写进 [w]；全灭
+     * 返回 null。不再按写死签名 getMethod（.36 全灭教训）。
      */
-    private fun invokeService(
+    private fun invokeServiceByNamePart(
         svc: Any,
         w: java.io.Writer,
-        name: String,
+        methods: List<java.lang.reflect.Method>,
+        namePart: String,
         pkg: String,
         secondInt: Int,
     ): Any? {
-        val candidates = try {
-            svc.javaClass.methods.filter { it.name == name }
-        } catch (t: Throwable) {
-            emptyList()
-        }
+        val exactName = "get$namePart"
+        val candidates = methods
+            .filter { it.name.contains(namePart) }
+            .sortedWith(compareBy({ it.name != exactName }, { it.name }))
         if (candidates.isEmpty()) {
-            w.write("## $name: no public method with this name on ${svc.javaClass.name}\n")
+            w.write("## *$namePart*: no method with this name part on ${svc.javaClass.name}\n")
             w.flush()
             return null
         }
         for (m in candidates) {
-            val sig = m.parameterTypes.joinToString { it.simpleName }
+            val sig = m.name + "(" + m.parameterTypes.joinToString { it.simpleName } + ")"
             val args = arrayOfNulls<Any>(m.parameterTypes.size)
             var fillable = true
             for (i in m.parameterTypes.indices) {
@@ -623,19 +711,19 @@ object CardProbe {
                 }
             }
             if (!fillable) {
-                w.write("## $name($sig): skipped (unsupported param type)\n")
+                w.write("## $sig: skipped (unsupported param type)\n")
                 w.flush()
                 continue
             }
             try {
                 val r = m.invoke(svc, *args)
-                w.write("## $name($sig) -> ok: ${describeResult(r)}\n")
+                w.write("## $sig -> ok: ${describeResult(r)}\n")
                 w.flush()
                 return r
             } catch (t: Throwable) {
                 val cause = unwrap(t)
                 w.write(
-                    "## $name($sig) FAILED: " +
+                    "## $sig FAILED: " +
                         "${cause.javaClass.name}: ${cause.message}\n"
                 )
                 w.flush()

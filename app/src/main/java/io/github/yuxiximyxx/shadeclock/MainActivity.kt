@@ -1254,21 +1254,48 @@ private fun receiverMetaData(
 }
 
 /**
- * 荣耀服务卡片身份标记（v2.0.37 定案）：receiver 的
- * meta-data 带 com.hihonor.android.launcher.card_* 任一键
- * 的才是服务卡片。证据：.36 cardxml 全量比对——身份标记
- * 不在 provider 的 XML 里（523 份 XML 全是标准 android
- * 命名空间、零自定义属性），在 meta-data 这一层：SystemUI
- * 全量 554 张中 112 张命中；经典小工具对照组（数字时钟/
- * 模拟时钟/日历经典版/天气经典版等 7 张）全不带，服务
- * 卡片对照组（天气/时钟/日历/联系人/文字/语录/图库的
- * card 系列 12 张）全带。设置进程视角经 carddump 互证
- * 同样能看到全部 112 张，本进程过滤不会漏。
+ * 荣耀服务卡片身份标记（v2.0.37 定案、v2.0.38 计数校准）：
+ * receiver 的 meta-data 带 com.hihonor.android.launcher.
+ * card_* 任一键的才是服务卡片。证据：.36 cardxml 全量
+ * 比对——身份标记不在 provider 的 XML 里（523 份 XML 全
+ * 是标准 android 命名空间、零自定义属性），在 meta-data
+ * 这一层。设置进程视角经 carddump 互证同样能看到全部，
+ * 本进程过滤不会漏。
+ *
+ * v2.0.38 独立复核对账（cardxml 与 carddump 两份文件
+ * 分别统计、数字一致）：card_* 命中 **112** 张（15 个包；
+ * card_size 103、card_category 97、仅 card_* 无尺寸档位
+ * 4 张）。另一路统计的 122 = 112 + 9 个 com.vivo.
+ * widget_type + 1 个 com.hihonor.auto.widget_type——那是
+ * 跨厂商宽口径（vivo/汽车渠道的标记），不是荣耀服务卡，
+ * 不采纳。校准项：另有 3 张天气卡只带 launcher 的
+ * widgetType / widget_type 键、没有 card_* 键
+ * （totemweather 的 HonorCardProvider、
+ * HonorImmersionProvider、CarMinCardWeatherProvider，
+ * 都是卡片形态 provider）；widget_type 持有者 90 张里
+ * 87 张本来就带 card_*，该标记与服务卡高度重合——本版
+ * 把它作次级接受条件，最终目录 **115** 张。com.hihonor.
+ * widget.type（107 张、仅 34 张与 card_* 重叠）与
+ * android.appwidget.honor.provider（31 张、仅 4 张重叠）
+ * 都是宽标记，不作判据。这 3 张的 widget_type 取值由
+ * .38 的 meta-values dump 回传后再核对。
+ *
+ * 只留真服务卡的理由有二：一是身份标记（本函数）；二是
+ * 材质——小乐点明真服务卡的材质是与系统其他地方一致的
+ * 液态玻璃，通用小部件大小材质都不合规范、观感不对。
  */
-private fun isHonorServiceCard(meta: Bundle?): Boolean =
-    meta != null && meta.keySet().any {
-        it.startsWith("com.hihonor.android.launcher.card_")
+private fun isHonorServiceCard(meta: Bundle?): Boolean {
+    if (meta == null) return false
+    val keys = meta.keySet()
+    if (keys.any { it.startsWith("com.hihonor.android.launcher.card_") }) return true
+    // v2.0.38 校准：3 张天气卡只有 launcher 的 widgetType /
+    // widget_type 键（见上方对账），作次级接受条件补进来；
+    // vivo / auto 等跨厂商前缀不接受。
+    return keys.any {
+        it == "com.hihonor.android.launcher.widgetType" ||
+            it == "com.hihonor.android.launcher.widget_type"
     }
+}
 
 /**
  * 规范尺寸文案：card_size 是服务卡片自己声明的规范档位。
