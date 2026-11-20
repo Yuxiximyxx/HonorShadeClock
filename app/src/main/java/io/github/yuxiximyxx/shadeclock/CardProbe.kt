@@ -343,7 +343,7 @@ object CardProbe {
         // 全灭也有一份带失败轨迹的文件落地。
         try {
             outFile.bufferedWriter().use { w ->
-                w.write("# HonorShadeClock hostbind dump v2.0.36\n")
+                w.write("# HonorShadeClock hostbind dump v2.0.37\n")
                 w.flush()
                 val svc = obtainAppWidgetService(ctx, w, log)
                 if (svc == null) {
@@ -352,6 +352,7 @@ object CardProbe {
                     log("[cardprobe] hostbind: service acquisition failed, failure trail written -> ${outFile.absolutePath}")
                     return
                 }
+                discoverServiceMethods(svc, w, log)
                 val candidates = listOf(
                     "com.android.systemui",
                     "com.hihonor.android.launcher",
@@ -359,35 +360,25 @@ object CardProbe {
                     ctx.packageName,
                 )
                 for (pkg in candidates) {
-                    try {
-                        val m = svc.javaClass.getMethod(
-                            "getAppWidgetIds",
-                            String::class.java,
-                        )
-                        val ids = m.invoke(svc, pkg) as? IntArray
-                        w.write(
-                            "## getAppWidgetIds($pkg) -> ${ids?.size} ids: " +
-                                "${ids?.joinToString()}\n"
-                        )
-                        w.flush()
-                        log("[cardprobe] hostbind: getAppWidgetIds($pkg) -> ${ids?.size} ids")
-                        if (ids != null) {
-                            for (id in ids) {
-                                dumpOneBinding(svc, w, pkg, id)
-                            }
-                            w.flush()
+                    // v2.0.37：不再写死 (String) 签名——.36 真机上
+                    // 代理拿到了、方法却 NoSuchMethod（ROM 改了
+                    // AIDL 签名，疑似多 userId 参数）。改走
+                    // invokeService 按参数类型逐候选试调，
+                    // secondInt 对 getAppWidgetIds 是 userId=0。
+                    val ids = invokeService(
+                        svc, w, "getAppWidgetIds", pkg, 0,
+                    ) as? IntArray
+                    w.write(
+                        "## getAppWidgetIds($pkg) -> ${ids?.size} ids: " +
+                            "${ids?.joinToString()}\n"
+                    )
+                    w.flush()
+                    log("[cardprobe] hostbind: getAppWidgetIds($pkg) -> ${ids?.size} ids")
+                    if (ids != null) {
+                        for (id in ids) {
+                            dumpOneBinding(svc, w, pkg, id)
                         }
-                    } catch (t: Throwable) {
-                        val cause = unwrap(t)
-                        w.write(
-                            "## getAppWidgetIds($pkg) FAILED: " +
-                                "${cause.javaClass.name}: ${cause.message}\n"
-                        )
                         w.flush()
-                        log(
-                            "[cardprobe] hostbind: getAppWidgetIds($pkg) failed: " +
-                                "${cause.javaClass.name}: ${cause.message}"
-                        )
                     }
                 }
             }
@@ -517,45 +508,147 @@ object CardProbe {
         id: Int,
     ) {
         w.write("=== id=$id via callingPackage=$callingPackage\n")
-        try {
-            val m = svc.javaClass.getMethod(
-                "getAppWidgetInfo",
-                String::class.java,
-                Int::class.javaPrimitiveType,
-            )
-            val info = m.invoke(svc, callingPackage, id) as? AppWidgetProviderInfo
-            w.write(
-                "  provider=${info?.provider} minW=${info?.minWidth} " +
-                    "minH=${info?.minHeight} updatePeriod=${info?.updatePeriodMillis} " +
-                    "configure=${info?.configure}\n"
-            )
-        } catch (t: Throwable) {
-            val cause = unwrap(t)
-            w.write("  getAppWidgetInfo FAILED: ${cause.javaClass.name}: ${cause.message}\n")
+        val info = invokeService(
+            svc, w, "getAppWidgetInfo", callingPackage, id,
+        ) as? AppWidgetProviderInfo
+        w.write(
+            "  provider=${info?.provider} minW=${info?.minWidth} " +
+                "minH=${info?.minHeight} updatePeriod=${info?.updatePeriodMillis} " +
+                "configure=${info?.configure}\n"
+        )
+        val opts = invokeService(
+            svc, w, "getAppWidgetOptions", callingPackage, id,
+        ) as? android.os.Bundle
+        if (opts == null) {
+            w.write("  options=null\n")
+        } else {
+            for (k in opts.keySet()) {
+                val v = try {
+                    @Suppress("DEPRECATION")
+                    opts.get(k)
+                } catch (t: Throwable) {
+                    null
+                }
+                w.write("  opt $k = $v (${v?.javaClass?.name})\n")
+            }
         }
-        try {
-            val m = svc.javaClass.getMethod(
-                "getAppWidgetOptions",
-                String::class.java,
-                Int::class.javaPrimitiveType,
-            )
-            val opts = m.invoke(svc, callingPackage, id) as? android.os.Bundle
-            if (opts == null) {
-                w.write("  options=null\n")
-            } else {
-                for (k in opts.keySet()) {
-                    val v = try {
-                        opts.get(k)
-                    } catch (t: Throwable) {
-                        null
-                    }
-                    w.write("  opt $k = $v (${v?.javaClass?.name})\n")
+        w.flush()
+    }
+
+    /**
+     * 服务方法签名发现（v2.0.37）：把代理所实现接口里名字含
+     * AppWidgetIds/AppWidgetOptions/AppWidgetInfo/AppWidgetViews
+     * 的方法签名全量写进 hostbind 文件——.36 的教训是签名被
+     * ROM 改过、写死必死，先把真签名亮出来再调。
+     */
+    private fun discoverServiceMethods(
+        svc: Any,
+        w: java.io.Writer,
+        log: (String) -> Unit,
+    ) {
+        val ifaces = mutableListOf<Class<*>>()
+        var c: Class<*>? = svc.javaClass
+        while (c != null) {
+            try {
+                for (i in c.interfaces) {
+                    if (i !in ifaces) ifaces.add(i)
+                }
+            } catch (t: Throwable) {
+                // 收接口失败不致命
+            }
+            c = c.superclass
+        }
+        for (iface in ifaces) {
+            w.write("## interface ${iface.name}\n")
+            val ms = try {
+                iface.declaredMethods
+            } catch (t: Throwable) {
+                emptyArray()
+            }
+            for (m in ms) {
+                if (m.name.contains("AppWidgetIds") ||
+                    m.name.contains("AppWidgetOptions") ||
+                    m.name.contains("AppWidgetInfo") ||
+                    m.name.contains("AppWidgetViews")
+                ) {
+                    w.write(
+                        "  method ${m.name}(" +
+                            m.parameterTypes.joinToString { it.name } +
+                            ") -> ${m.returnType.name}\n"
+                    )
                 }
             }
-        } catch (t: Throwable) {
-            val cause = unwrap(t)
-            w.write("  getAppWidgetOptions FAILED: ${cause.javaClass.name}: ${cause.message}\n")
         }
+        w.flush()
+        log("[cardprobe] hostbind: signature discovery done (${ifaces.size} interfaces)")
+    }
+
+    /**
+     * 按名字+参数类型试调服务方法：候选是代理类的全部 public
+     * 同名方法（AIDL Proxy 实现接口方法、均为 public）。参数
+     * 按类型填：String->[pkg]、int->[secondInt]、UserHandle->
+     * 当前用户，其余类型放弃该候选。每个候选的成败都写进
+     * [w] 并记日志；全灭返回 null。
+     */
+    private fun invokeService(
+        svc: Any,
+        w: java.io.Writer,
+        name: String,
+        pkg: String,
+        secondInt: Int,
+    ): Any? {
+        val candidates = try {
+            svc.javaClass.methods.filter { it.name == name }
+        } catch (t: Throwable) {
+            emptyList()
+        }
+        if (candidates.isEmpty()) {
+            w.write("## $name: no public method with this name on ${svc.javaClass.name}\n")
+            w.flush()
+            return null
+        }
+        for (m in candidates) {
+            val sig = m.parameterTypes.joinToString { it.simpleName }
+            val args = arrayOfNulls<Any>(m.parameterTypes.size)
+            var fillable = true
+            for (i in m.parameterTypes.indices) {
+                val t = m.parameterTypes[i]
+                when {
+                    t == String::class.java -> args[i] = pkg
+                    t == Int::class.javaPrimitiveType || t == Int::class.java ->
+                        args[i] = secondInt
+                    t.name == "android.os.UserHandle" ->
+                        args[i] = android.os.Process.myUserHandle()
+                    else -> fillable = false
+                }
+            }
+            if (!fillable) {
+                w.write("## $name($sig): skipped (unsupported param type)\n")
+                w.flush()
+                continue
+            }
+            try {
+                val r = m.invoke(svc, *args)
+                w.write("## $name($sig) -> ok: ${describeResult(r)}\n")
+                w.flush()
+                return r
+            } catch (t: Throwable) {
+                val cause = unwrap(t)
+                w.write(
+                    "## $name($sig) FAILED: " +
+                        "${cause.javaClass.name}: ${cause.message}\n"
+                )
+                w.flush()
+            }
+        }
+        return null
+    }
+
+    private fun describeResult(r: Any?): String = when (r) {
+        null -> "null"
+        is IntArray -> "int[${r.size}] ${r.joinToString()}"
+        is android.os.Bundle -> "Bundle keys=${r.keySet()}"
+        else -> "${r.javaClass.name}: $r"
     }
 
     private fun unwrap(t: Throwable): Throwable {

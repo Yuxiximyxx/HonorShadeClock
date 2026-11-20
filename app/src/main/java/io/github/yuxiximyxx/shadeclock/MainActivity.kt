@@ -3,8 +3,10 @@ package io.github.yuxiximyxx.shadeclock
 import android.app.Activity
 import android.appwidget.AppWidgetManager
 import android.appwidget.AppWidgetProviderInfo
+import android.content.ComponentName
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.Drawable
@@ -1241,10 +1243,73 @@ private fun drawableToBitmap(drawable: Drawable, sizePx: Int): ImageBitmap? {
     }
 }
 
+/** receiver 的 meta-data（服务卡片身份标记与规范尺寸都挂在这里）。 */
+private fun receiverMetaData(
+    pm: PackageManager,
+    component: ComponentName,
+): Bundle? = try {
+    pm.getReceiverInfo(component, PackageManager.GET_META_DATA).metaData
+} catch (t: Throwable) {
+    null
+}
+
 /**
- * 枚举全机标准 AppWidget provider 并按应用分组（设置应用
- * 进程内跑、无需任何权限）。全机数百个，只在 IO 线程
- * 调用一次。
+ * 荣耀服务卡片身份标记（v2.0.37 定案）：receiver 的
+ * meta-data 带 com.hihonor.android.launcher.card_* 任一键
+ * 的才是服务卡片。证据：.36 cardxml 全量比对——身份标记
+ * 不在 provider 的 XML 里（523 份 XML 全是标准 android
+ * 命名空间、零自定义属性），在 meta-data 这一层：SystemUI
+ * 全量 554 张中 112 张命中；经典小工具对照组（数字时钟/
+ * 模拟时钟/日历经典版/天气经典版等 7 张）全不带，服务
+ * 卡片对照组（天气/时钟/日历/联系人/文字/语录/图库的
+ * card 系列 12 张）全带。设置进程视角经 carddump 互证
+ * 同样能看到全部 112 张，本进程过滤不会漏。
+ */
+private fun isHonorServiceCard(meta: Bundle?): Boolean =
+    meta != null && meta.keySet().any {
+        it.startsWith("com.hihonor.android.launcher.card_")
+    }
+
+/**
+ * 规范尺寸文案：card_size 是服务卡片自己声明的规范档位。
+ * 值是字符串就直接用；是资源引用（>=0x7f000000）就到该
+ * 应用自己的资源里解成字符串；解不出或是小整数代码就
+ * 返回 null、由调用方退回「实际占用」口径。原始值由
+ * CardDump 记进 shadeclock_carddump.txt 留证。
+ */
+private fun cardSizeLabel(
+    meta: Bundle?,
+    pm: PackageManager,
+    pkg: String,
+): String? {
+    val v = try {
+        @Suppress("DEPRECATION")
+        meta?.get("com.hihonor.android.launcher.card_size")
+    } catch (t: Throwable) {
+        null
+    } ?: return null
+    return when (v) {
+        is String -> v.trim().takeIf { it.isNotEmpty() && it.length <= 16 }
+        is Int -> {
+            if (v >= 0x7f000000) {
+                try {
+                    pm.getResourcesForApplication(pkg).getString(v)
+                        .trim().takeIf { it.isNotEmpty() && it.length <= 16 }
+                } catch (t: Throwable) {
+                    null
+                }
+            } else {
+                null
+            }
+        }
+        else -> null
+    }
+}
+
+/**
+ * 枚举服务卡片并按应用分组（v2.0.37 起只列真服务卡片，
+ * 经典小工具整段去掉——定案见 [isHonorServiceCard]）。
+ * 设置应用进程内跑、无需任何权限；只在 IO 线程调用一次。
  */
 private fun loadCardGroups(context: Context): List<CardAppGroup> {
     val pm = context.packageManager
@@ -1255,6 +1320,8 @@ private fun loadCardGroups(context: Context): List<CardAppGroup> {
     val appLabels = HashMap<String, String>()
     val appIcons = HashMap<String, ImageBitmap?>()
     for (info in awm.installedProviders) {
+        val meta = receiverMetaData(pm, info.provider)
+        if (!isHonorServiceCard(meta)) continue
         val pkg = info.provider.packageName
         if (!appLabels.containsKey(pkg)) {
             appLabels[pkg] = try {
@@ -1277,7 +1344,8 @@ private fun loadCardGroups(context: Context): List<CardAppGroup> {
             CardProviderEntry(
                 info.provider.flattenToString(),
                 label,
-                cardSizeText(info, density, availWidthPx),
+                cardSizeLabel(meta, pm, pkg)
+                    ?: cardSizeText(info, density, availWidthPx),
             ),
         )
     }

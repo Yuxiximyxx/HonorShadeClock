@@ -305,36 +305,48 @@ private class LoggingHostView(
 ) : AppWidgetHostView(context) {
 
     /**
-     * 错误视图自检（v2.0.36 修好）：沿 AppWidgetHostView 类层级
-     * 找 declared 的 getErrorView 并放开访问，检出返回
-     * "errorView=true/false (via getErrorView)"；方法在该 ROM
-     * 上真不存在时退而拼子视图摘要
-     * "children=[类名('文本'), ...]"（错误视图是系统文案的
-     * TextView，摘要里认得出）。两种结果都比 .35 的恒 n/a 强。
+     * 内容自检（v2.0.37 换法）：拼当前子视图摘要留证。
+     * 为什么不用 getErrorView：.36 真机实测它对 7 张卡全回
+     * true——包括已收到真 RemoteViews 的日历/时钟卡。根因
+     * 是 getErrorView() 在 AOSP 里是懒工厂：调用即现造一个
+     * 错误视图返回、恒非空，根本不是状态查询（.34/.35 恒
+     * n/a、.36 恒 true，两代自检都白设）。子视图摘要不做
+     * 真假断言：错误视图是系统布局（类名/系统文案认得出），
+     * 真卡片是 provider 自己的布局，人读日志即可分型。
      */
-    private fun errorViewState(): String {
-        var cls: Class<*>? = AppWidgetHostView::class.java
-        while (cls != null) {
-            try {
-                val m = cls.getDeclaredMethod("getErrorView")
-                m.isAccessible = true
-                val ev = m.invoke(this)
-                return "errorView=${ev != null} (via getErrorView on ${cls.simpleName})"
-            } catch (nf: NoSuchMethodException) {
-                cls = cls.superclass
-            }
-        }
+    private fun contentSummary(): String {
         val sb = StringBuilder("children=[")
         for (i in 0 until childCount) {
             val c = getChildAt(i)
             if (i > 0) sb.append(", ")
-            sb.append(c.javaClass.simpleName)
-            if (c is android.widget.TextView) {
-                val t = c.text?.toString()?.replace('\n', ' ') ?: ""
-                sb.append("('").append(t.take(24)).append("')")
-            }
+            sb.append(describeView(c))
         }
         sb.append("]")
+        return sb.toString()
+    }
+
+    /** 单个视图的一层摘要：类名 + TextView 文本 + 一层子视图类名。 */
+    private fun describeView(v: android.view.View): String {
+        val sb = StringBuilder(v.javaClass.simpleName)
+        if (v is android.widget.TextView) {
+            val t = v.text?.toString()?.replace('\n', ' ') ?: ""
+            sb.append("('").append(t.take(24)).append("')")
+        }
+        if (v is android.view.ViewGroup && v.childCount > 0) {
+            sb.append(">[")
+            val n = minOf(v.childCount, 6)
+            for (i in 0 until n) {
+                val c = v.getChildAt(i)
+                if (i > 0) sb.append(",")
+                sb.append(c.javaClass.simpleName)
+                if (c is android.widget.TextView) {
+                    val t = c.text?.toString()?.replace('\n', ' ') ?: ""
+                    sb.append("('").append(t.take(16)).append("')")
+                }
+            }
+            if (v.childCount > n) sb.append(",+").append(v.childCount - n)
+            sb.append("]")
+        }
         return sb.toString()
     }
 
@@ -349,18 +361,14 @@ private class LoggingHostView(
         }
         super.updateAppWidget(views)
         // 下发应用是同步 inflate、失败当场落 error view；延后
-        // 500ms 反射检一次。v2.0.36 修：.34/.35 这检恒回 n/a——
-        // getErrorView 在 AOSP 里是 protected，getMethod 只找
-        // public 方法、必然 NoSuchMethodException，自检从没真跑
-        // 过。改沿类层级找 declared 方法并放开访问；仍找不到时
-        // 退而记子视图摘要（类名+TextView 文本），错误视图的
-        // 文案在摘要里同样认得出。
+        // 500ms 记一次子视图摘要留证（v2.0.37：getErrorView
+        // 自检废弃，理由见 contentSummary 注释）。
         try {
             postDelayed({
                 try {
-                    logFn("[cardhost] errorView check id=$appWidgetId -> ${errorViewState()}")
+                    logFn("[cardhost] content check id=$appWidgetId -> ${contentSummary()}")
                 } catch (t: Throwable) {
-                    logFn("[cardhost] errorView check id=$appWidgetId -> n/a (${t.javaClass.simpleName})")
+                    logFn("[cardhost] content check id=$appWidgetId -> n/a (${t.javaClass.simpleName})")
                 }
             }, 500L)
         } catch (t: Throwable) {

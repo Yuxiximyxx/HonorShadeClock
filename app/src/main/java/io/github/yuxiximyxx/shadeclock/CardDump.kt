@@ -25,11 +25,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  *    身份。本 dump 开头就记本进程看到的总数，并交叉用
  *    queryBroadcastReceivers(APPWIDGET_UPDATE) 再数一遍，
  *    两条路的差就是调用方过滤的实锤范围。
- * 2. 系统「服务卡片」目录的精选标记。逐个 provider 记录
- *    可读字段（格子/min 尺寸/widgetCategory/descriptionRes/
- *    previewLayout/previewImage/configure）与所属 receiver
- *    的 metaData 全部键名，拿系统目录里有的应用与明显不
- *    在目录里的应用逐字段比对找判别标记。
+ * 2. 系统「服务卡片」目录的精选标记（v2.0.37 已定案：
+ *    receiver meta-data 的 com.hihonor.android.launcher.
+ *    card_* 键，见 MainActivity.isHonorServiceCard）。本
+ *    dump 继续逐个记录可读字段与 metaData 全部键名，并
+ *    补记 card_* 键的原始值，供核对 card_size 的值形态。
  *
  * 本进程只写一次；全程尽力而为、异常全吞，诊断件不许
  * 影响设置页本身。
@@ -73,7 +73,7 @@ object CardDump {
         val dm = context.resources.displayMetrics
         val sb = StringBuilder()
         val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
-        sb.appendLine("HonorShadeClock card dump (settings-process view, v2.0.33)")
+        sb.appendLine("HonorShadeClock card dump (settings-process view, v2.0.37)")
         sb.appendLine(
             "time=${sdf.format(Date())} pid=${Process.myPid()} uid=${Process.myUid()}",
         )
@@ -119,11 +119,40 @@ object CardDump {
             } catch (t: Throwable) {
                 ""
             }
-            val metaKeys = try {
+            var metaKeys = ""
+            var cardMeta = ""
+            try {
                 val ri = pm.getReceiverInfo(comp, PackageManager.GET_META_DATA)
-                ri.metaData?.keySet()?.sorted()?.joinToString(",") ?: ""
+                val bundle = ri.metaData
+                metaKeys = bundle?.keySet()?.sorted()?.joinToString(",") ?: ""
+                // v2.0.37：服务卡片身份标记已定案在 card_* 键
+                // （见 MainActivity.isHonorServiceCard）；本版把
+                // 这些键的原始值一并记下——card_size 的值形态
+                // （字符串/资源引用/整数代码）决定选卡页尺寸
+                // 文案能不能直接用它，留证供下一轮核对。
+                if (bundle != null) {
+                    val parts = mutableListOf<String>()
+                    for (k in bundle.keySet().sorted()) {
+                        if (!k.startsWith("com.hihonor.android.launcher.")) continue
+                        @Suppress("DEPRECATION")
+                        val v = try {
+                            bundle.get(k)
+                        } catch (t: Throwable) {
+                            null
+                        }
+                        parts.add(
+                            when (v) {
+                                is Int -> "$k=$v(0x${Integer.toHexString(v)})"
+                                else -> "$k=$v"
+                            },
+                        )
+                    }
+                    if (parts.isNotEmpty()) {
+                        cardMeta = " cardMeta=[${parts.joinToString(";")}]"
+                    }
+                }
             } catch (t: Throwable) {
-                "ERR:${t.javaClass.simpleName}"
+                metaKeys = "ERR:${t.javaClass.simpleName}"
             }
             sb.appendLine(
                 "pkg=${comp.packageName} cls=${comp.className} label=$label " +
@@ -135,7 +164,7 @@ object CardDump {
                     "previewImage=${info.previewImage} " +
                     "configure=${info.configure?.flattenToString() ?: "-"} " +
                     "updatePeriod=${info.updatePeriodMillis} " +
-                    "metaKeys=[$metaKeys]",
+                    "metaKeys=[$metaKeys]$cardMeta",
             )
         }
         return sb.toString()
